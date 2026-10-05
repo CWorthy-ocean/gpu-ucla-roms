@@ -1,0 +1,22 @@
+# build products and binaries
+build/
+build_gpu*/
+*.o
+*.mod
+*.cubin
+*.fatbin
+*.log
+# editor / port-time backups kept beside the sources
+*.pre_*
+*.structs
+*.host_slot_copy
+*~
+# data, profiles, job logs
+*.nc
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+*.o[0-9]*
+__pycache__/
+# one-off variant copies of sources (name.F90.<tag>)
+*.F90.*

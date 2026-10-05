@@ -1,0 +1,482 @@
+module nc_io
+  ! Serial NetCDF-Fortran helpers. Host memory only. PIO later.
+  use kinds
+  use netcdf
+  implicit none
+  private
+
+  public :: nc_open_read
+  public :: nc_open_write
+  public :: nc_create
+  public :: nc_sync
+  public :: nc_def_var_f
+  public :: nc_put_2d_rec_f
+  public :: nc_put_3d_rec_f
+  public :: nc_close
+  public :: nc_dim_len
+  public :: nc_has_dim
+  public :: nc_has_var
+  public :: nc_var_nrecs
+  public :: nc_read_2d
+  public :: nc_read_3d
+  public :: nc_def_dim
+  public :: nc_def_var
+  public :: nc_enddef
+  public :: nc_put_2d
+  public :: nc_put_3d
+  public :: nc_put_1d
+  public :: nc_put_1d_rec
+  public :: nc_put_2d_rec
+  public :: nc_put_3d_rec
+  public :: nc_put_att_text
+  public :: nc_get_1d
+  public :: nc_get_ints
+  public :: nc_get_att_text
+  public :: nc_var_shape
+  public :: nc_forcing_layout
+  public :: nc_read_forcing_2d
+  public :: nc_check
+
+contains
+
+  subroutine nc_check(ierr, where)
+    integer, intent(in) :: ierr
+    character(len=*), intent(in) :: where
+    if (ierr /= nf90_noerr) then
+      write(*,*) 'netcdf error in ', trim(where), ': ', trim(nf90_strerror(ierr))
+      error stop 'nc_io'
+    endif
+  end subroutine nc_check
+
+  subroutine nc_open_read(path, ncid)
+    character(len=*), intent(in)  :: path
+    integer,          intent(out) :: ncid
+    call nc_check(nf90_open(trim(path), nf90_nowrite, ncid), 'open '//trim(path))
+  end subroutine nc_open_read
+
+  subroutine nc_open_write(path, ncid)
+    character(len=*), intent(in)  :: path
+    integer,          intent(out) :: ncid
+    call nc_check(nf90_open(trim(path), nf90_write, ncid), 'openw '//trim(path))
+  end subroutine nc_open_write
+
+  subroutine nc_create(path, ncid)
+    character(len=*), intent(in)  :: path
+    integer,          intent(out) :: ncid
+    call nc_check(nf90_create(trim(path), ior(nf90_clobber, nf90_netcdf4), ncid), &
+                  'create '//trim(path))
+  end subroutine nc_create
+
+  subroutine nc_close(ncid)
+    integer, intent(in) :: ncid
+    call nc_check(nf90_close(ncid), 'close')
+  end subroutine nc_close
+
+  integer function nc_dim_len(ncid, name) result(n)
+    integer,          intent(in) :: ncid
+    character(len=*), intent(in) :: name
+    integer :: dimid
+    call nc_check(nf90_inq_dimid(ncid, trim(name), dimid), 'inq_dim '//trim(name))
+    call nc_check(nf90_inquire_dimension(ncid, dimid, len=n), 'dimlen '//trim(name))
+  end function nc_dim_len
+
+  logical function nc_has_dim(ncid, name) result(ok)
+    integer,          intent(in) :: ncid
+    character(len=*), intent(in) :: name
+    integer :: dimid, ierr
+    ierr = nf90_inq_dimid(ncid, trim(name), dimid)
+    ok = (ierr == nf90_noerr)
+  end function nc_has_dim
+
+  logical function nc_has_var(ncid, name) result(ok)
+    integer,          intent(in) :: ncid
+    character(len=*), intent(in) :: name
+    integer :: varid, ierr
+    ierr = nf90_inq_varid(ncid, trim(name), varid)
+    ok = (ierr == nf90_noerr)
+  end function nc_has_var
+
+  integer function nc_var_nrecs(ncid, name) result(n)
+    ! Length of the last dimension of a variable (time on UCLA files).
+    integer,          intent(in) :: ncid
+    character(len=*), intent(in) :: name
+    integer :: varid, ndims, dimids(nf90_max_var_dims)
+    n = 1
+    if (.not. nc_has_var(ncid, name)) return
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'var '//trim(name))
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims, dimids=dimids), &
+                  'ndims '//trim(name))
+    if (ndims >= 1) then
+      call nc_check(nf90_inquire_dimension(ncid, dimids(ndims), len=n), &
+                    'var dim '//trim(name))
+    endif
+    if (n < 1) n = 1
+  end function nc_var_nrecs
+
+  subroutine nc_read_2d(ncid, name, dest, nxi, neta, rec)
+    ! dest is the model slice that receives file(1:nxi,1:neta).
+    integer,          intent(in)    :: ncid, nxi, neta
+    character(len=*), intent(in)    :: name
+    real(rp),         intent(inout) :: dest(nxi, neta)
+    integer,          intent(in), optional :: rec
+    integer :: varid, ndims, xtype
+    integer, allocatable :: start(:), cnt(:), ibuf(:,:)
+
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'var '//trim(name))
+    call nc_check(nf90_inquire_variable(ncid, varid, xtype=xtype, ndims=ndims), 'ndims '//trim(name))
+    if (present(rec) .and. ndims >= 3) then
+      allocate(start(3), cnt(3))
+      start = (/1, 1, rec/)
+      cnt   = (/nxi, neta, 1/)
+    elseif (present(rec) .and. ndims == 2 .and. neta == 1) then
+      allocate(start(2), cnt(2))
+      start = (/1, rec/)
+      cnt   = (/nxi, 1/)
+    else
+      allocate(start(2), cnt(2))
+      start = (/1, 1/)
+      cnt   = (/nxi, neta/)
+    endif
+    if (xtype == nf90_int .or. xtype == nf90_short .or. xtype == nf90_byte) then
+      allocate(ibuf(nxi, neta))
+      call nc_check(nf90_get_var(ncid, varid, ibuf, start=start, count=cnt), 'get '//trim(name))
+      dest = real(ibuf, rp)
+      deallocate(ibuf)
+    else
+      call nc_check(nf90_get_var(ncid, varid, dest, start=start, count=cnt), 'get '//trim(name))
+    endif
+    deallocate(start, cnt)
+  end subroutine nc_read_2d
+
+  subroutine nc_read_3d(ncid, name, dest, nxi, neta, nz, rec)
+    integer,          intent(in)    :: ncid, nxi, neta, nz
+    character(len=*), intent(in)    :: name
+    real(rp),         intent(inout) :: dest(nxi, neta, nz)
+    integer,          intent(in), optional :: rec
+    integer :: varid, ndims
+    integer, allocatable :: start(:), cnt(:)
+
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'var '//trim(name))
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims), 'ndims '//trim(name))
+    if (present(rec) .and. ndims >= 4) then
+      allocate(start(4), cnt(4))
+      start = (/1, 1, 1, rec/)
+      cnt   = (/nxi, neta, nz, 1/)
+    else
+      allocate(start(3), cnt(3))
+      start = (/1, 1, 1/)
+      cnt   = (/nxi, neta, nz/)
+    endif
+    call nc_check(nf90_get_var(ncid, varid, dest, start=start, count=cnt), 'get '//trim(name))
+    deallocate(start, cnt)
+  end subroutine nc_read_3d
+
+  integer function nc_def_dim(ncid, name, n) result(dimid)
+    integer,          intent(in) :: ncid, n
+    character(len=*), intent(in) :: name
+    integer :: nlen
+    nlen = n
+    if (nlen <= 0) nlen = nf90_unlimited
+    call nc_check(nf90_def_dim(ncid, trim(name), nlen, dimid), 'def_dim '//trim(name))
+  end function nc_def_dim
+
+  integer function nc_def_var(ncid, name, dimids) result(varid)
+    integer,          intent(in) :: ncid, dimids(:)
+    character(len=*), intent(in) :: name
+    call nc_check(nf90_def_var(ncid, trim(name), nf90_double, dimids, varid), 'def_var '//trim(name))
+  end function nc_def_var
+
+  integer function nc_def_var_f(ncid, name, dimids) result(varid)
+    ! Single-precision variable (history output), chunked as one record:
+    ! the full spatial extents and 1 along the unlimited dimension, so a
+    ! record append is a single contiguous HDF5 write.
+    integer,          intent(in) :: ncid, dimids(:)
+    character(len=*), intent(in) :: name
+    integer :: i, n, chunks(size(dimids))
+    logical :: unlim
+    call nc_check(nf90_def_var(ncid, trim(name), nf90_float, dimids, varid), 'def_var '//trim(name))
+    unlim = .false.
+    do i = 1, size(dimids)
+      call nc_check(nf90_inquire_dimension(ncid, dimids(i), len=n), 'inq_dim')
+      if (n <= 0) then
+        chunks(i) = 1
+        unlim = .true.
+      else
+        chunks(i) = n
+      endif
+    enddo
+    if (unlim .and. size(dimids) >= 3) &
+         call nc_check(nf90_def_var_chunking(ncid, varid, nf90_chunked, chunks), 'chunking '//trim(name))
+  end function nc_def_var_f
+
+  subroutine nc_sync(ncid)
+    integer, intent(in) :: ncid
+    call nc_check(nf90_sync(ncid), 'sync')
+  end subroutine nc_sync
+
+  subroutine nc_put_2d_rec_f(ncid, name, arr, n1, n2, rec)
+    ! arr is the first element of a contiguous (n1, n2) float32 block.
+    integer,          intent(in) :: ncid, n1, n2, rec
+    character(len=*), intent(in) :: name
+    real(4),          intent(in) :: arr(n1, n2)
+    integer :: varid
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, arr, start=(/1, 1, rec/), &
+                  count=(/n1, n2, 1/)), 'putrec '//trim(name))
+  end subroutine nc_put_2d_rec_f
+
+  subroutine nc_put_3d_rec_f(ncid, name, arr, n1, n2, n3, rec)
+    integer,          intent(in) :: ncid, n1, n2, n3, rec
+    character(len=*), intent(in) :: name
+    real(4),          intent(in) :: arr(n1, n2, n3)
+    integer :: varid
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, arr, start=(/1, 1, 1, rec/), &
+                  count=(/n1, n2, n3, 1/)), 'putrec '//trim(name))
+  end subroutine nc_put_3d_rec_f
+
+  subroutine nc_enddef(ncid)
+    integer, intent(in) :: ncid
+    call nc_check(nf90_enddef(ncid), 'enddef')
+  end subroutine nc_enddef
+
+  subroutine nc_put_2d(ncid, name, arr)
+    integer,          intent(in) :: ncid
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: arr(:, :)
+    integer :: varid
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, arr), 'put '//trim(name))
+  end subroutine nc_put_2d
+
+  subroutine nc_put_3d(ncid, name, arr)
+    integer,          intent(in) :: ncid
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: arr(:, :, :)
+    integer :: varid
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, arr), 'put '//trim(name))
+  end subroutine nc_put_3d
+
+  subroutine nc_put_1d(ncid, name, arr)
+    integer,          intent(in) :: ncid
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: arr(:)
+    integer :: varid
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, arr), 'put '//trim(name))
+  end subroutine nc_put_1d
+
+  subroutine nc_put_1d_rec(ncid, name, val, rec)
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: val
+    integer :: varid
+    real(rp) :: buf(1)
+    buf(1) = val
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, buf, start=(/rec/), count=(/1/)), &
+                  'putrec '//trim(name))
+  end subroutine nc_put_1d_rec
+
+  subroutine nc_put_2d_rec(ncid, name, arr, rec)
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: arr(:, :)
+    integer :: varid
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, arr, start=(/1, 1, rec/), &
+                  count=(/size(arr,1), size(arr,2), 1/)), 'putrec '//trim(name))
+  end subroutine nc_put_2d_rec
+
+  subroutine nc_put_3d_rec(ncid, name, arr, rec)
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: arr(:, :, :)
+    integer :: varid
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, arr, start=(/1, 1, 1, rec/), &
+                  count=(/size(arr,1), size(arr,2), size(arr,3), 1/)), &
+                  'putrec '//trim(name))
+  end subroutine nc_put_3d_rec
+
+  subroutine nc_put_att_text(ncid, name, att, val)
+    integer,          intent(in) :: ncid
+    character(len=*), intent(in) :: name, att, val
+    integer :: varid
+    if (len_trim(name) == 0) then
+      varid = nf90_global
+    else
+      call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    endif
+    call nc_check(nf90_put_att(ncid, varid, trim(att), trim(val)), &
+                  'att '//trim(att))
+  end subroutine nc_put_att_text
+
+  subroutine nc_get_att_text(ncid, name, att, val)
+    integer,          intent(in)  :: ncid
+    character(len=*), intent(in)  :: name, att
+    character(len=*), intent(out) :: val
+    integer :: varid, ierr
+    val = ''
+    if (len_trim(name) == 0) then
+      varid = nf90_global
+    else
+      ierr = nf90_inq_varid(ncid, trim(name), varid)
+      if (ierr /= nf90_noerr) return
+    endif
+    ierr = nf90_get_att(ncid, varid, trim(att), val)
+    if (ierr /= nf90_noerr) val = ''
+  end subroutine nc_get_att_text
+
+  subroutine nc_get_ints(ncid, name, vals, rec)
+    ! Integer vector. Optional rec indexes the last dimension (time).
+    integer,          intent(in)  :: ncid
+    character(len=*), intent(in)  :: name
+    integer,          intent(out) :: vals(:)
+    integer,          intent(in), optional :: rec
+    integer :: varid, ndims, n1, ntake
+    integer :: dimids(nf90_max_var_dims)
+    integer, allocatable :: start(:), cnt(:)
+    vals = 0
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'var '//trim(name))
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims, dimids=dimids), &
+                  'ndims '//trim(name))
+    if (present(rec) .and. ndims >= 2) then
+      call nc_check(nf90_inquire_dimension(ncid, dimids(1), len=n1), 'dim1 '//trim(name))
+      ntake = min(size(vals), n1)
+      allocate(start(ndims), cnt(ndims))
+      start = 1
+      cnt = 1
+      start(ndims) = rec
+      cnt(1) = ntake
+      call nc_check(nf90_get_var(ncid, varid, vals(1:ntake), start=start, count=cnt), &
+                    'get '//trim(name))
+      deallocate(start, cnt)
+    else
+      ntake = size(vals)
+      call nc_check(nf90_get_var(ncid, varid, vals), 'get '//trim(name))
+    endif
+  end subroutine nc_get_ints
+
+  subroutine nc_get_1d(ncid, name, arr, rec)
+    integer,          intent(in)  :: ncid
+    character(len=*), intent(in)  :: name
+    real(rp),         intent(out) :: arr(:)
+    integer,          intent(in), optional :: rec
+    integer :: varid, ndims
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'var '//trim(name))
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims), 'ndims '//trim(name))
+    if (present(rec) .and. ndims >= 1 .and. size(arr) == 1) then
+      call nc_check(nf90_get_var(ncid, varid, arr, start=(/rec/), count=(/1/)), 'get '//trim(name))
+    else
+      call nc_check(nf90_get_var(ncid, varid, arr), 'get '//trim(name))
+    endif
+  end subroutine nc_get_1d
+
+  subroutine nc_var_shape(ncid, name, n1, n2, n3, nrec)
+    integer,          intent(in)  :: ncid
+    character(len=*), intent(in)  :: name
+    integer,          intent(out) :: n1, n2, n3, nrec
+    integer :: varid, ndims, dimids(nf90_max_var_dims), k, len
+    n1 = 1; n2 = 1; n3 = 1; nrec = 1
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'var '//trim(name))
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims, dimids=dimids), &
+                  'shape '//trim(name))
+    if (ndims < 1) return
+    call nc_check(nf90_inquire_dimension(ncid, dimids(ndims), len=nrec), 'nrec '//trim(name))
+    do k = 1, ndims - 1
+      call nc_check(nf90_inquire_dimension(ncid, dimids(k), len=len), 'dim '//trim(name))
+      if (k == 1) n1 = len
+      if (k == 2) n2 = len
+      if (k == 3) n3 = len
+    enddo
+    if (ndims == 1) then
+      n1 = nrec
+      nrec = 1
+    endif
+  end subroutine nc_var_shape
+
+  subroutine nc_forcing_layout(ncid, vname, tname, nxi, neta, nrec, time_axis)
+    ! MiniPac bulk is (time, eta, xi). Toy / some flux files are (xi, eta, time).
+    ! time_axis: 1 = first file dim, 3 = last file dim, 0 = no time dim.
+    integer,          intent(in)  :: ncid
+    character(len=*), intent(in)  :: vname, tname
+    integer,          intent(out) :: nxi, neta, nrec, time_axis
+    integer :: varid, ndims, dimids(nf90_max_var_dims), dlen(3), k, nt
+    nxi = 1; neta = 1; nrec = 1; time_axis = 0
+    dlen = 1
+    call nc_check(nf90_inq_varid(ncid, trim(vname), varid), 'var '//trim(vname))
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims, dimids=dimids), &
+                  'layout '//trim(vname))
+    do k = 1, min(ndims, 3)
+      call nc_check(nf90_inquire_dimension(ncid, dimids(k), len=dlen(k)), &
+                    'dim '//trim(vname))
+    enddo
+    nt = 0
+    if (nc_has_var(ncid, tname)) nt = nc_var_nrecs(ncid, tname)
+    if (ndims >= 3 .and. nt > 0 .and. dlen(1) == nt) then
+      time_axis = 1
+      nrec = dlen(1)
+      neta = dlen(2)
+      nxi = dlen(3)
+    elseif (ndims >= 3 .and. nt > 0 .and. dlen(ndims) == nt) then
+      time_axis = 3
+      nxi = dlen(1)
+      neta = dlen(2)
+      nrec = dlen(ndims)
+    elseif (ndims >= 3) then
+      time_axis = 3
+      nxi = dlen(1)
+      neta = dlen(2)
+      nrec = dlen(3)
+    elseif (ndims == 2) then
+      nxi = dlen(1)
+      neta = dlen(2)
+      nrec = 1
+    else
+      nxi = dlen(1)
+      nrec = 1
+    endif
+  end subroutine nc_forcing_layout
+
+  subroutine nc_read_forcing_2d(ncid, name, dest, nxi, neta, rec, time_axis)
+    integer,          intent(in)    :: ncid, nxi, neta, rec, time_axis
+    character(len=*), intent(in)    :: name
+    real(rp),         intent(inout) :: dest(nxi, neta)
+    integer :: varid, ndims, i, j
+    integer, allocatable :: start(:), cnt(:)
+    real(rp), allocatable :: tmp3(:,:,:)
+
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'var '//trim(name))
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims), 'ndims '//trim(name))
+    if (ndims >= 3 .and. time_axis == 1) then
+      ! CDL (time, eta, xi) -> dest(xi, eta)
+      allocate(start(3), cnt(3), tmp3(1, neta, nxi))
+      start = (/rec, 1, 1/)
+      cnt   = (/1, neta, nxi/)
+      call nc_check(nf90_get_var(ncid, varid, tmp3, start=start, count=cnt), &
+                    'get frc '//trim(name))
+      do j = 1, neta
+        do i = 1, nxi
+          dest(i, j) = tmp3(1, j, i)
+        enddo
+      enddo
+      deallocate(tmp3)
+    else
+      if (ndims >= 3) then
+        allocate(start(3), cnt(3))
+        start = (/1, 1, rec/)
+        cnt   = (/nxi, neta, 1/)
+      else
+        allocate(start(2), cnt(2))
+        start = (/1, 1/)
+        cnt   = (/nxi, neta/)
+      endif
+      call nc_check(nf90_get_var(ncid, varid, dest, start=start, count=cnt), &
+                    'get frc '//trim(name))
+    endif
+    deallocate(start, cnt)
+  end subroutine nc_read_forcing_2d
+
+end module nc_io

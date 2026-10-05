@@ -1,0 +1,523 @@
+module his_io
+  ! Serial history / restart writer. Namelist keys match UCLA
+  ! BASIC_OUTPUT_SETTINGS / TS_OUTPUT_SETTINGS. No averages, no
+  ! monthly calendar, no true w (wvlcty is not ported).
+  use kinds
+  use decomp_mod
+  use gpu_state
+  use time_state
+  use nc_io
+  use io_server
+  use passive_mod, only: ntp, tp, wrt_passive, passive_name
+  implicit none
+  private
+
+  logical, public :: wrt_file_his = .false.
+  logical, public :: wrt_file_rst = .false.
+  real(rp) :: output_period_his = 100.0_rp
+  real(rp) :: output_period_rst = 2000.0_rp
+  integer  :: nrpf_his = 20
+  integer  :: nrpf_rst = 2
+  logical  :: monthly_restarts = .false.
+  logical  :: wrt_Z = .true., wrt_Ub = .true., wrt_Vb = .true.
+  logical  :: wrt_U = .true., wrt_V = .true., wrt_R = .true.
+  logical  :: wrt_O = .true., wrt_W = .false.
+  logical  :: wrt_Akv = .true., wrt_Akt = .true., wrt_Aks = .true.
+  logical  :: wrt_Hbls = .true., wrt_Hbbl = .true.
+  logical  :: wrt_temp = .true., wrt_salt = .true.
+
+  character(len=512) :: output_root = './output'
+  character(len=256) :: output_title = 'roms_gpu'
+  character(len=512) :: fname_his = '', fname_rst = ''
+  integer :: rec_his = 0, rec_rst = 0
+  integer :: nfile_his = 0, nfile_rst = 0
+  real(rp) :: output_time_his = 0.0_rp
+  real(rp) :: output_time_rst = 0.0_rp
+  logical  :: output_ready = .false.
+  logical  :: warned_w = .false.
+
+  integer :: ir0, ir1, jr0, jr1, iu0, iu1, jv0, jv1
+  integer :: nxi, neta, nxi_u, neta_v
+
+  public :: read_output_namelist
+  public :: set_output_root
+  public :: init_output
+  public :: wrt_his
+  public :: wrt_rst
+  public :: maybe_wrt_output
+
+contains
+
+  subroutine read_output_namelist(unit)
+    integer, intent(in) :: unit
+    integer :: ios
+    real(rp) :: output_period_his, output_period_rst, output_period_avg
+    integer :: nrpf_his, nrpf_avg
+    logical :: wrt_file_his, wrt_file_rst, wrt_file_avg, monthly_restarts
+    logical :: wrt_Z, wrt_Ub, wrt_Vb, wrt_U, wrt_V, wrt_R, wrt_O, wrt_W
+    logical :: wrt_Akv, wrt_Akt, wrt_Aks, wrt_Hbls, wrt_Hbbl
+    logical :: wrt_avg_Z, wrt_avg_Ub, wrt_avg_Vb, wrt_avg_U, wrt_avg_V
+    logical :: wrt_avg_R, wrt_avg_O, wrt_avg_W, wrt_avg_Akv, wrt_avg_Akt
+    logical :: wrt_avg_Aks, wrt_avg_Hbls, wrt_avg_Hbbl
+    logical :: wrt_temp, wrt_salt, wrt_temp_dia, wrt_salt_dia
+    namelist /basic_output_settings/ output_period_rst, output_period_his, &
+         nrpf_his, output_period_avg, nrpf_avg, wrt_file_rst, wrt_file_avg, &
+         wrt_file_his, monthly_restarts, wrt_Z, wrt_Ub, wrt_Vb, wrt_U, wrt_V, &
+         wrt_R, wrt_O, wrt_W, wrt_Akv, wrt_Akt, wrt_Aks, wrt_Hbls, wrt_Hbbl, &
+         wrt_avg_Z, wrt_avg_Ub, wrt_avg_Vb, wrt_avg_U, wrt_avg_V, wrt_avg_R, &
+         wrt_avg_O, wrt_avg_W, wrt_avg_Akv, wrt_avg_Akt, wrt_avg_Aks, &
+         wrt_avg_Hbls, wrt_avg_Hbbl
+    namelist /ts_output_settings/ wrt_temp, wrt_salt, wrt_temp_dia, wrt_salt_dia
+
+    output_period_his = 100.0_rp
+    output_period_rst = 2000.0_rp
+    output_period_avg = 100.0_rp
+    nrpf_his = 20
+    nrpf_avg = 20
+    wrt_file_his = .false.
+    wrt_file_rst = .false.
+    wrt_file_avg = .false.
+    monthly_restarts = .false.
+    wrt_Z = .true.; wrt_Ub = .true.; wrt_Vb = .true.
+    wrt_U = .true.; wrt_V = .true.; wrt_R = .true.
+    wrt_O = .true.; wrt_W = .false.
+    wrt_Akv = .true.; wrt_Akt = .true.; wrt_Aks = .true.
+    wrt_Hbls = .true.; wrt_Hbbl = .true.
+    wrt_avg_Z = .true.; wrt_avg_Ub = .true.; wrt_avg_Vb = .true.
+    wrt_avg_U = .true.; wrt_avg_V = .true.; wrt_avg_R = .true.
+    wrt_avg_O = .true.; wrt_avg_W = .true.; wrt_avg_Akv = .true.
+    wrt_avg_Akt = .true.; wrt_avg_Aks = .true.
+    wrt_avg_Hbls = .true.; wrt_avg_Hbbl = .true.
+    wrt_temp = .true.; wrt_salt = .true.
+    wrt_temp_dia = .false.; wrt_salt_dia = .false.
+
+    rewind(unit)
+    read(unit, nml=basic_output_settings, iostat=ios)
+    rewind(unit)
+    read(unit, nml=ts_output_settings, iostat=ios)
+    call apply_output_flags(output_period_his, output_period_rst, nrpf_his, &
+         wrt_file_his, wrt_file_rst, monthly_restarts, wrt_Z, wrt_Ub, wrt_Vb, &
+         wrt_U, wrt_V, wrt_R, wrt_O, wrt_W, wrt_Akv, wrt_Akt, wrt_Aks, &
+         wrt_Hbls, wrt_Hbbl, wrt_temp, wrt_salt)
+  end subroutine read_output_namelist
+
+  subroutine apply_output_flags(p_his, p_rst, nrec, his, rst, monthly, &
+       z, ub, vb, u, v, r, o, w, akv, akt, aks, hbls, hbbl, temp, salt)
+    real(rp), intent(in) :: p_his, p_rst
+    integer,  intent(in) :: nrec
+    logical,  intent(in) :: his, rst, monthly
+    logical,  intent(in) :: z, ub, vb, u, v, r, o, w
+    logical,  intent(in) :: akv, akt, aks, hbls, hbbl, temp, salt
+    output_period_his = p_his
+    output_period_rst = p_rst
+    if (nrec > 0) nrpf_his = nrec
+    wrt_file_his = his
+    wrt_file_rst = rst
+    monthly_restarts = monthly
+    wrt_Z = z; wrt_Ub = ub; wrt_Vb = vb
+    wrt_U = u; wrt_V = v; wrt_R = r
+    wrt_O = o; wrt_W = w
+    wrt_Akv = akv; wrt_Akt = akt; wrt_Aks = aks
+    wrt_Hbls = hbls; wrt_Hbbl = hbbl
+    wrt_temp = temp; wrt_salt = salt
+  end subroutine apply_output_flags
+
+  subroutine set_output_root(root, title)
+    character(len=*), intent(in) :: root, title
+    output_root = trim(root)
+    if (len_trim(output_root) == 0) output_root = './output'
+    output_title = trim(title)
+  end subroutine set_output_root
+
+  subroutine init_output()
+    output_ready = .false.
+    rec_his = 0; rec_rst = 0
+    nfile_his = 0; nfile_rst = 0
+    output_time_his = 0.0_rp
+    output_time_rst = 0.0_rp
+    fname_his = ''; fname_rst = ''
+    call set_write_bounds()
+    call init_staging()
+    output_ready = .true.
+    if (monthly_restarts) write(*,*) 'monthly_restarts is not implemented; using output_period_rst'
+    if (wrt_file_his) then
+      write(*,'(a,es12.4,a)') 'history: initial write, period = ', output_period_his, ' s'
+      call wrt_his(.true.)
+    endif
+  end subroutine init_output
+
+  subroutine maybe_wrt_output()
+    if (.not. output_ready) return
+    call io_poll()
+    if (wrt_file_his) then
+      output_time_his = output_time_his + dt
+      if (output_time_his + 1.0e-8_rp >= output_period_his) then
+        call wrt_his(.false.)
+        output_time_his = 0.0_rp
+      endif
+    endif
+    if (wrt_file_rst) then
+      output_time_rst = output_time_rst + dt
+      if (output_time_rst + 1.0e-8_rp >= output_period_rst) then
+        call wrt_rst()
+        output_time_rst = 0.0_rp
+      endif
+    endif
+  end subroutine maybe_wrt_output
+
+  subroutine wrt_his(initial)
+    logical, intent(in), optional :: initial
+    logical :: is_init
+    integer :: n2, n3, nz, is, js, itp
+    real(rp) :: twrite
+    character(len=512) :: open_path
+    if (.not. wrt_file_his) return
+    if (.not. output_ready) call init_output()
+    is_init = .false.
+    if (present(initial)) is_init = initial
+    if (is_init) then
+      twrite = start_time
+      n2 = max(knew, 1)
+      n3 = 1
+    else
+      twrite = start_time + dt * real(iic - ntstart + 1, rp)
+      n2 = knew
+      n3 = nnew
+    endif
+    ! Fields are gathered on the GPU and copied asynchronously into
+    ! pinned host buffers (io_server); the file is written later by the
+    ! I/O rank, or by this rank once the copies land. Nothing here reads
+    ! managed memory from the host.
+    open_path = ''
+    if (rec_his == 0 .or. rec_his >= nrpf_his) then
+      nfile_his = nfile_his + 1
+      rec_his = 0
+      call make_fname(output_root, 'his', nfile_his, fname_his)
+      call create_his_file(fname_his)
+      open_path = fname_his
+    endif
+    rec_his = rec_his + 1
+    nz = decomp%nz
+    is = decomp%is
+    js = decomp%js
+    call io_stage_begin(IO_KIND_HIS, rec_his, nfile_his, twrite, open_path)
+    if (wrt_Z)  call io_stage_2d('zeta', zeta(is, js, n2), ir0, ir1, jr0, jr1)
+    if (wrt_Ub) call io_stage_2d('ubar', ubar(is, js, n2), iu0, iu1, jr0, jr1)
+    if (wrt_Vb) call io_stage_2d('vbar', vbar(is, js, n2), ir0, ir1, jv0, jv1)
+    if (wrt_U)  call io_stage_3d('u', u(is, js, 1, n3), 1, nz, iu0, iu1, jr0, jr1)
+    if (wrt_V)  call io_stage_3d('v', v(is, js, 1, n3), 1, nz, ir0, ir1, jv0, jv1)
+    if (wrt_temp) call io_stage_3d('temp', t(is, js, 1, n3, itemp), 1, nz, ir0, ir1, jr0, jr1)
+    if (wrt_salt) call io_stage_3d('salt', t(is, js, 1, n3, isalt), 1, nz, ir0, ir1, jr0, jr1)
+    if (wrt_passive) then
+      do itp = 1, ntp
+        call io_stage_3d_p(trim(passive_name(itp)), tp(is, js, 1, n3, itp), 1, nz, ir0, ir1, jr0, jr1)
+      enddo
+    endif
+    if (wrt_R)    call io_stage_3d('rho', rho1(is, js, 1), 1, nz, ir0, ir1, jr0, jr1)
+    if (wrt_O)    call io_stage_omega('omega', ir0, ir1, jr0, jr1)
+    if (wrt_W .and. .not. warned_w) then
+      write(*,*) 'wrt_W requested but wvlcty is not ported; skipping w'
+      warned_w = .true.
+    endif
+    if (wrt_Akv)  call io_stage_3d('Akv', Akv(is, js, 0), 0, nz, ir0, ir1, jr0, jr1)
+    if (wrt_Akt)  call io_stage_3d('Akt', Akt(is, js, 0, itemp), 0, nz, ir0, ir1, jr0, jr1)
+    if (wrt_Aks)  call io_stage_3d('Aks', Akt(is, js, 0, isalt), 0, nz, ir0, ir1, jr0, jr1)
+    if (wrt_Hbls) call io_stage_2d('hbls', hbls(is, js), ir0, ir1, jr0, jr1)
+    if (wrt_Hbbl) call io_stage_2d('hbbl', hbbl(is, js), ir0, ir1, jr0, jr1)
+    call io_stage_end()
+    write(*,'(a,es14.6,a,i0,a,i0)') 'staged history t = ', twrite, &
+         '  rec = ', rec_his, '  file ', nfile_his
+  end subroutine wrt_his
+
+  subroutine wrt_rst()
+    integer :: ncid, n2, n3, itp
+    real(rp) :: twrite
+    if (.not. wrt_file_rst) return
+    if (.not. output_ready) call init_output()
+    twrite = start_time + dt * real(max(iic - ntstart + 1, 0), rp)
+    if (iic < ntstart) twrite = start_time
+    n2 = knew
+    n3 = nnew
+    if (n3 < 1) n3 = 1
+    if (n2 < 1) n2 = 1
+    if (rec_rst == 0 .or. rec_rst >= nrpf_rst) then
+      nfile_rst = nfile_rst + 1
+      rec_rst = 0
+      call make_fname(output_root, 'rst', nfile_rst, fname_rst)
+      call create_rst_file(fname_rst)
+    endif
+    rec_rst = rec_rst + 1
+    call nc_open_write(fname_rst, ncid)
+    call nc_put_1d_rec(ncid, 'ocean_time', twrite, rec_rst)
+    call put_r2(ncid, 'zeta', zeta(:,:,n2), rec_rst)
+    call put_u2(ncid, 'ubar', ubar(:,:,n2), rec_rst)
+    call put_v2(ncid, 'vbar', vbar(:,:,n2), rec_rst)
+    call put_u3(ncid, 'u', u(:,:,:,n3), rec_rst)
+    call put_v3(ncid, 'v', v(:,:,:,n3), rec_rst)
+    call put_r3(ncid, 'temp', t(:,:,:,n3,itemp), rec_rst)
+    call put_r3(ncid, 'salt', t(:,:,:,n3,isalt), rec_rst)
+    do itp = 1, ntp
+      call put_r3_p(ncid, trim(passive_name(itp)), tp(:,:,:,n3,itp), rec_rst)
+    enddo
+    call put_r2(ncid, 'hbls', hbls, rec_rst)
+    call put_r2(ncid, 'hbbl', hbbl, rec_rst)
+    call put_u2(ncid, 'DU_avg1', DU_avg1, rec_rst)
+    call put_v2(ncid, 'DV_avg1', DV_avg1, rec_rst)
+    call put_u2(ncid, 'DU_avg2', DU_avg2, rec_rst)
+    call put_v2(ncid, 'DV_avg2', DV_avg2, rec_rst)
+    call put_u2(ncid, 'DU_avg_bak', DU_avg_bak, rec_rst)
+    call put_v2(ncid, 'DV_avg_bak', DV_avg_bak, rec_rst)
+    call put_u2(ncid, 'rufrc', rufrc_bak(:,:,max(nstp,1)), rec_rst)
+    call put_v2(ncid, 'rvfrc', rvfrc_bak(:,:,max(nstp,1)), rec_rst)
+    call nc_close(ncid)
+    write(*,'(a,es14.6,a,i0,a,i0)') 'wrote restart t = ', twrite, &
+         '  rec = ', rec_rst, '  file ', nfile_rst
+  end subroutine wrt_rst
+
+  subroutine create_his_file(path)
+    character(len=*), intent(in) :: path
+    integer :: itp, ncid, d_t, d_xi, d_eta, d_xiu, d_etav, d_s, d_w, id
+    call ensure_parent(path)
+    call nc_create(trim(path), ncid)
+    d_t = nc_def_dim(ncid, 'ocean_time', 0)
+    d_xi = nc_def_dim(ncid, 'xi_rho', nxi)
+    d_eta = nc_def_dim(ncid, 'eta_rho', neta)
+    d_xiu = nc_def_dim(ncid, 'xi_u', nxi_u)
+    d_etav = nc_def_dim(ncid, 'eta_v', neta_v)
+    d_s = nc_def_dim(ncid, 's_rho', decomp%nz)
+    d_w = nc_def_dim(ncid, 's_w', decomp%nz + 1)
+    id = nc_def_var(ncid, 'ocean_time', (/d_t/))
+    if (wrt_Z)  id = nc_def_var_f(ncid, 'zeta', (/d_xi, d_eta, d_t/))
+    if (wrt_Ub) id = nc_def_var_f(ncid, 'ubar', (/d_xiu, d_eta, d_t/))
+    if (wrt_Vb) id = nc_def_var_f(ncid, 'vbar', (/d_xi, d_etav, d_t/))
+    if (wrt_U)  id = nc_def_var_f(ncid, 'u', (/d_xiu, d_eta, d_s, d_t/))
+    if (wrt_V)  id = nc_def_var_f(ncid, 'v', (/d_xi, d_etav, d_s, d_t/))
+    if (wrt_temp) id = nc_def_var_f(ncid, 'temp', (/d_xi, d_eta, d_s, d_t/))
+    if (wrt_salt) id = nc_def_var_f(ncid, 'salt', (/d_xi, d_eta, d_s, d_t/))
+    if (wrt_passive) then
+      do itp = 1, ntp
+        id = nc_def_var_f(ncid, trim(passive_name(itp)), (/d_xi, d_eta, d_s, d_t/))
+      enddo
+    endif
+    if (wrt_R)    id = nc_def_var_f(ncid, 'rho', (/d_xi, d_eta, d_s, d_t/))
+    if (wrt_O)    id = nc_def_var_f(ncid, 'omega', (/d_xi, d_eta, d_w, d_t/))
+    if (wrt_Akv)  id = nc_def_var_f(ncid, 'Akv', (/d_xi, d_eta, d_w, d_t/))
+    if (wrt_Akt)  id = nc_def_var_f(ncid, 'Akt', (/d_xi, d_eta, d_w, d_t/))
+    if (wrt_Aks)  id = nc_def_var_f(ncid, 'Aks', (/d_xi, d_eta, d_w, d_t/))
+    if (wrt_Hbls) id = nc_def_var_f(ncid, 'hbls', (/d_xi, d_eta, d_t/))
+    if (wrt_Hbbl) id = nc_def_var_f(ncid, 'hbbl', (/d_xi, d_eta, d_t/))
+    call nc_put_att_text(ncid, '', 'title', output_title)
+    call nc_put_att_text(ncid, '', 'history_precision', 'float32 (staged on the GPU)')
+    call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
+    call nc_enddef(ncid)
+    call nc_close(ncid)
+    write(*,'(a,a)') 'created history file: ', trim(path)
+  end subroutine create_his_file
+
+  subroutine create_rst_file(path)
+    character(len=*), intent(in) :: path
+    integer :: itp, ncid, d_t, d_xi, d_eta, d_xiu, d_etav, d_s, id
+    call ensure_parent(path)
+    call nc_create(trim(path), ncid)
+    d_t = nc_def_dim(ncid, 'ocean_time', 0)
+    d_xi = nc_def_dim(ncid, 'xi_rho', nxi)
+    d_eta = nc_def_dim(ncid, 'eta_rho', neta)
+    d_xiu = nc_def_dim(ncid, 'xi_u', nxi_u)
+    d_etav = nc_def_dim(ncid, 'eta_v', neta_v)
+    d_s = nc_def_dim(ncid, 's_rho', decomp%nz)
+    id = nc_def_var(ncid, 'ocean_time', (/d_t/))
+    id = nc_def_var(ncid, 'zeta', (/d_xi, d_eta, d_t/))
+    id = nc_def_var(ncid, 'ubar', (/d_xiu, d_eta, d_t/))
+    id = nc_def_var(ncid, 'vbar', (/d_xi, d_etav, d_t/))
+    id = nc_def_var(ncid, 'u', (/d_xiu, d_eta, d_s, d_t/))
+    id = nc_def_var(ncid, 'v', (/d_xi, d_etav, d_s, d_t/))
+    id = nc_def_var(ncid, 'temp', (/d_xi, d_eta, d_s, d_t/))
+    id = nc_def_var(ncid, 'salt', (/d_xi, d_eta, d_s, d_t/))
+    do itp = 1, ntp
+      id = nc_def_var_f(ncid, trim(passive_name(itp)), (/d_xi, d_eta, d_s, d_t/))
+    enddo
+    id = nc_def_var(ncid, 'hbls', (/d_xi, d_eta, d_t/))
+    id = nc_def_var(ncid, 'hbbl', (/d_xi, d_eta, d_t/))
+    id = nc_def_var(ncid, 'DU_avg1', (/d_xiu, d_eta, d_t/))
+    id = nc_def_var(ncid, 'DV_avg1', (/d_xi, d_etav, d_t/))
+    id = nc_def_var(ncid, 'DU_avg2', (/d_xiu, d_eta, d_t/))
+    id = nc_def_var(ncid, 'DV_avg2', (/d_xi, d_etav, d_t/))
+    id = nc_def_var(ncid, 'DU_avg_bak', (/d_xiu, d_eta, d_t/))
+    id = nc_def_var(ncid, 'DV_avg_bak', (/d_xi, d_etav, d_t/))
+    id = nc_def_var(ncid, 'rufrc', (/d_xiu, d_eta, d_t/))
+    id = nc_def_var(ncid, 'rvfrc', (/d_xi, d_etav, d_t/))
+    call nc_put_att_text(ncid, '', 'title', output_title)
+    call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
+    call nc_enddef(ncid)
+    call nc_close(ncid)
+    write(*,'(a,a)') 'created restart file: ', trim(path)
+  end subroutine create_rst_file
+
+  subroutine init_staging()
+    ! Pinned staging capacity: one history record of float32 fields.
+    integer :: n2d, n3d, n3w, nh, nhw, nxy, cap_rec, cap_field
+    nxy = max(nxi, nxi_u) * max(neta, neta_v)
+    nh = decomp%nz
+    nhw = decomp%nz + 1
+    n2d = count((/wrt_Z, wrt_Ub, wrt_Vb, wrt_Hbls, wrt_Hbbl/))
+    n3d = count((/wrt_U, wrt_V, wrt_temp, wrt_salt, wrt_R/))
+    if (wrt_passive) n3d = n3d + ntp
+    n3w = count((/wrt_O, wrt_Akv, wrt_Akt, wrt_Aks/))
+    cap_rec = n2d * nxy + n3d * nxy * nh + n3w * nxy * nhw
+    cap_field = nxy * nhw
+    if (wrt_file_his) call io_init(cap_rec, cap_field)
+  end subroutine init_staging
+
+  subroutine set_write_bounds()
+    if (decomp%periodic_x) then
+      ir0 = 1; ir1 = decomp%nx
+      iu0 = 1; iu1 = decomp%nx
+    else
+      ir0 = 0; ir1 = decomp%nx + 1
+      iu0 = 1; iu1 = decomp%nx + 1
+    endif
+    if (decomp%periodic_y) then
+      jr0 = 1; jr1 = decomp%ny
+      jv0 = 1; jv1 = decomp%ny
+    else
+      jr0 = 0; jr1 = decomp%ny + 1
+      jv0 = 1; jv1 = decomp%ny + 1
+    endif
+    nxi = ir1 - ir0 + 1
+    neta = jr1 - jr0 + 1
+    nxi_u = iu1 - iu0 + 1
+    neta_v = jv1 - jv0 + 1
+  end subroutine set_write_bounds
+
+  subroutine put_r2(ncid, name, src, rec)
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: src(decomp%is:, decomp%js:)
+    real(rp), allocatable :: tmp(:,:)
+    allocate(tmp(nxi, neta))
+    tmp = src(ir0:ir1, jr0:jr1)
+    call nc_put_2d_rec(ncid, name, tmp, rec)
+    deallocate(tmp)
+  end subroutine put_r2
+
+  subroutine put_u2(ncid, name, src, rec)
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: src(decomp%is:, decomp%js:)
+    real(rp), allocatable :: tmp(:,:)
+    allocate(tmp(nxi_u, neta))
+    tmp = src(iu0:iu1, jr0:jr1)
+    call nc_put_2d_rec(ncid, name, tmp, rec)
+    deallocate(tmp)
+  end subroutine put_u2
+
+  subroutine put_v2(ncid, name, src, rec)
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: src(decomp%is:, decomp%js:)
+    real(rp), allocatable :: tmp(:,:)
+    allocate(tmp(nxi, neta_v))
+    tmp = src(ir0:ir1, jv0:jv1)
+    call nc_put_2d_rec(ncid, name, tmp, rec)
+    deallocate(tmp)
+  end subroutine put_v2
+
+  subroutine put_r3(ncid, name, src, rec)
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: src(decomp%is:, decomp%js:, :)
+    real(rp), allocatable :: tmp(:,:,:)
+    allocate(tmp(nxi, neta, decomp%nz))
+    tmp = src(ir0:ir1, jr0:jr1, 1:decomp%nz)
+    call nc_put_3d_rec(ncid, name, tmp, rec)
+    deallocate(tmp)
+  end subroutine put_r3
+
+  subroutine put_r3_p(ncid, name, src, rec)
+    ! Passive tracer (real(pp) storage) into a float32 restart variable.
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(pp),         intent(in) :: src(decomp%is:, decomp%js:, :)
+    real(4), allocatable :: tmp(:,:,:)
+    allocate(tmp(nxi, neta, decomp%nz))
+    tmp = real(src(ir0:ir1, jr0:jr1, 1:decomp%nz), 4)
+    call nc_put_3d_rec_f(ncid, name, tmp, nxi, neta, decomp%nz, rec)
+    deallocate(tmp)
+  end subroutine put_r3_p
+
+  subroutine put_u3(ncid, name, src, rec)
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: src(decomp%is:, decomp%js:, :)
+    real(rp), allocatable :: tmp(:,:,:)
+    allocate(tmp(nxi_u, neta, decomp%nz))
+    tmp = src(iu0:iu1, jr0:jr1, 1:decomp%nz)
+    call nc_put_3d_rec(ncid, name, tmp, rec)
+    deallocate(tmp)
+  end subroutine put_u3
+
+  subroutine put_v3(ncid, name, src, rec)
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: src(decomp%is:, decomp%js:, :)
+    real(rp), allocatable :: tmp(:,:,:)
+    allocate(tmp(nxi, neta_v, decomp%nz))
+    tmp = src(ir0:ir1, jv0:jv1, 1:decomp%nz)
+    call nc_put_3d_rec(ncid, name, tmp, rec)
+    deallocate(tmp)
+  end subroutine put_v3
+
+  subroutine put_rw(ncid, name, src, rec)
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    real(rp),         intent(in) :: src(decomp%is:, decomp%js:, 0:)
+    real(rp), allocatable :: tmp(:,:,:)
+    integer :: nz
+    nz = decomp%nz
+    allocate(tmp(nxi, neta, nz + 1))
+    tmp = src(ir0:ir1, jr0:jr1, 0:nz)
+    call nc_put_3d_rec(ncid, name, tmp, rec)
+    deallocate(tmp)
+  end subroutine put_rw
+
+  subroutine put_omega(ncid, rec)
+    integer, intent(in) :: ncid, rec
+    real(rp), allocatable :: tmp(:,:,:)
+    integer :: i, j, k, nz
+    nz = decomp%nz
+    allocate(tmp(nxi, neta, nz + 1))
+    do k = 0, nz
+      do j = jr0, jr1
+        do i = ir0, ir1
+          tmp(i - ir0 + 1, j - jr0 + 1, k + 1) = &
+               pm(i, j) * pn(i, j) * (We(i, j, k) + Wi(i, j, k))
+        enddo
+      enddo
+    enddo
+    call nc_put_3d_rec(ncid, 'omega', tmp, rec)
+    deallocate(tmp)
+  end subroutine put_omega
+
+  subroutine make_fname(root, tag, nfile, path)
+    character(len=*), intent(in)  :: root, tag
+    integer,          intent(in)  :: nfile
+    character(len=*), intent(out) :: path
+    if (nfile <= 1) then
+      path = trim(root)//'_'//trim(tag)//'.nc'
+    else
+      write(path, '(a,"_",a,"_",i4.4,a)') trim(root), trim(tag), nfile, '.nc'
+    endif
+  end subroutine make_fname
+
+  subroutine ensure_parent(path)
+    character(len=*), intent(in) :: path
+    integer :: n
+    character(len=512) :: dir
+    n = index(path, '/', back=.true.)
+    if (n <= 1) return
+    dir = path(1:n-1)
+    if (len_trim(dir) == 0 .or. trim(dir) == '.') return
+    call execute_command_line('mkdir -p "'//trim(dir)//'"', wait=.true.)
+  end subroutine ensure_parent
+
+end module his_io
