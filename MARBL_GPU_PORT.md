@@ -80,6 +80,46 @@ Cost: a step with 32 FP64 tracers takes 0.42 s (0.15 s for the dycore
 with T/S only), and the step that includes the hourly MARBL call 0.72 s,
 so MARBL itself costs about 0.3 s per hour of simulation.
 
+## Passive-tracer transport performance (2026-10-05)
+
+Profile of the 32-FP64-tracer step before this work (nsys, steady state,
+per step): passive kernels 268 ms (predictor horizontal 41, vertical 40,
+implicit 38; corrector horizontal 42, vertical 42, implicit 38; t3dmix 27),
+dycore + T/S 153 ms, MARBL 118 ms on the hourly step. All passive kernels
+are fused over the 32 tracers already; each ran at ~1.2 ms per tracer,
+20-70% of memory bandwidth, at 25% occupancy (128 registers).
+
+Changes (all bit-identical to the previous output in the FP64 build,
+verified on the 3-day run `minipac_gpu_marbl3dv3` vs `3dv2`):
+
+- `src/device/passive_column.F90` (new module): vertical advection and
+  the implicit solve fused into one column kernel, one thread per
+  (block of NTB = 2 tracers, column); the Thomas intermediate is kept in
+  place in `tp(nn)`, the column factors come from a separate small
+  factorization kernel (`passive_factor`, 1 ms). NTB = 2 (50 ms per call)
+  beat 1 (55), 4 (59) and 8 (81): occupancy matters more than reuse.
+  Replaces `passive_vertical` + `passive_implicit` (78 ms per call).
+- Corrector horizontal kernel: masks and fluxes loaded once per cell and
+  the shared face differences reused (42 -> 38 ms). The same change made
+  the C4 predictor slower (41 -> 45 ms) and was reverted there.
+- Net: passive kernels 268 -> 209 ms per step; mean step 0.500 -> 0.441 s
+  on the 3-day MiniPac run (pre_step3d 154 -> 128 ms, step3d_t bracket
+  201 -> 167 ms).
+
+Not done / next candidates: float32 storage for the passives would halve
+their traffic (a precision decision for the carbonate tracers); the C4/UP3
+horizontal kernels (~1.3 ms per tracer) and t3dmix (27 ms) are at the
+same per-tracer cost as the T/S path; MARBL's K2 (255 registers) costs
+~100 ms per hourly call; the per-step passive boundary fills are small
+(kernels < 1 ms, `set_bry` 1.7 ms) and not worth moving.
+
+Pitfalls met: nvfortran inlined the explicit `<<<>>>` launch into
+`passive_predictor` and the host segfaulted in `cuLaunchKernel`
+(compute-sanitizer clean); keeping the kernel + launcher in their own
+module fixed it. CUF kernel bodies cannot hold local arrays (per-thread
+tracer blocks need an explicit kernel). Never run two makes concurrently
+in `build_gpu`.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

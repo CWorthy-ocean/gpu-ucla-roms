@@ -73,7 +73,7 @@ Halo pack/unpack and the interiors of `set_depth`, `rho_eos`, `prsgrd`, LMD (`sw
 
 ## MARBL
 
-MARBL (git submodule `MARBL`, CWorthy-ocean/MARBL @ 6e6b2f7, the version the
+MARBL (git submodule `MARBL`, CWorthy-ocean/MARBL @ 6e6b2f7 = tag marbl0.45.0, the version the
 CPU model uses) runs on the GPU: MARBL's own sources are compiled as host
 code for settings/initialisation (`src/host/marbl_host.F90`), and the surface
 flux and interior tendency paths are ported to CUDA Fortran kernels

@@ -18,6 +18,7 @@ module passive_mod
   use gpu_state
   use formulas
   use time_state
+  use passive_column_mod, only: passive_column_run
   implicit none
   private
 
@@ -271,140 +272,6 @@ contains
   end function pup3_fe
 
   ! ------------------------------------------------------ vertical pass
-  subroutine passive_vertical(ts, nn, dtp, ctr)
-    ! Column kernel with a sliding window (advect's vert_column_fused for tp).
-    integer(ip), intent(in) :: ts, nn, ctr
-    real(rp), intent(in) :: dtp
-    integer(ip) :: i, j, k, itr, nx, ny, nz, ntr
-    real(rp) :: dtpp, fz_lo, fz_k, tplus, tminus, rm, w
-    real(rp) :: t_km1, t_k, t_kp1, t_kp2, Hz_km1, Hz_k, Hz_kp1, Hz_kp2
-    logical :: at_bottom, at_surface
-    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = ntp
-#ifdef USE_CUDA
-    !$cuf kernel do(2) <<<*,*>>>
-#endif
-    do j = 1, ny
-      do i = 1, nx
-        dtpp = dtp * pm(i, j) * pn(i, j)
-        rm = rmask(i, j)
-        do itr = 1, ntr
-          fz_lo = 0.0_rp
-          t_k = real(tp(i, j, 1, ts, itr), rp)
-          t_kp1 = real(tp(i, j, 2, ts, itr), rp)
-          Hz_k = Hz(i, j, 1)
-          Hz_kp1 = Hz(i, j, 2)
-          t_km1 = t_k
-          Hz_km1 = Hz_k
-          do k = 1, nz - 1
-            at_bottom = (k == 1)
-            at_surface = (k == nz - 1)
-            if (at_surface) then
-              t_kp2 = t_kp1
-              Hz_kp2 = Hz_kp1
-            else
-              t_kp2 = real(tp(i, j, k + 2, ts, itr), rp)
-              Hz_kp2 = Hz(i, j, k + 2)
-            endif
-            tplus = thickness_tplus(t_km1, t_k, t_kp1, Hz_km1, Hz_k, Hz_kp1, at_bottom)
-            tminus = thickness_tminus(t_km1, t_k, t_kp1, t_kp2, Hz_km1, Hz_k, Hz_kp1, Hz_kp2, &
-                                      at_bottom, at_surface)
-            w = We(i, j, k)
-            if (ctr == 1) then
-              fz_k = 0.5_rp * (tplus + tminus) * w
-            else
-              fz_k = tplus * max(w, 0.0_rp) + tminus * min(w, 0.0_rp)
-            endif
-            fz_k = apply_mask(fz_k, rm)
-            tp(i, j, k, nn, itr) = real(real(tp(i, j, k, nn, itr), rp) - dtpp * (fz_k - fz_lo), pp)
-            fz_lo = fz_k
-            t_km1 = t_k; t_k = t_kp1; t_kp1 = t_kp2
-            Hz_km1 = Hz_k; Hz_k = Hz_kp1; Hz_kp1 = Hz_kp2
-          enddo
-          tp(i, j, nz, nn, itr) = real(real(tp(i, j, nz, nn, itr), rp) - dtpp * (0.0_rp - fz_lo), pp)
-        enddo
-      enddo
-    enddo
-  end subroutine passive_vertical
-
-  ! --------------------------------------------- batched implicit solve
-  subroutine passive_implicit(nn, dtau, use_fwd)
-    ! Thomas solve of every passive column with the salinity diffusivity.
-    ! The matrix (col_fc = 1/diag, col_cf = upper factor, col_wc =
-    ! fc + max(wc,0)) is built once per column; each tracer then sweeps
-    ! its own right-hand side through col_dc. Same arithmetic as
-    ! implicit_tracer_columns. On entry tp(nn) is Hz*tp; on exit tp.
-    integer(ip), intent(in) :: nn
-    real(rp), intent(in) :: dtau
-    logical, intent(in) :: use_fwd
-    integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, iAkt
-    real(rp) :: cff, dc0, hz_k, hz_kp, fck, wck, cfk, fcm, wcm, cfm, dck, dcm, rm, tt
-    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = ntp
-    iAkt = min(2_ip, int(size(Akt, 4), ip))
-#ifdef USE_CUDA
-    !$cuf kernel do(2) <<<*,*>>>
-#endif
-    do j = 1, ny
-      do i = 1, nx
-        rm = rmask(i, j)
-        dc0 = dtau * pm(i, j) * pn(i, j)
-        ! --- factorization
-        if (use_fwd) then
-          hz_k = Hz_fwd(i, j, 1); hz_kp = Hz_fwd(i, j, 2)
-        else
-          hz_k = Hz(i, j, 1); hz_kp = Hz(i, j, 2)
-        endif
-        fck = 2.0_rp * dtau * Akt(i, j, 1, iAkt) / (hz_kp + hz_k)
-        wck = dc0 * Wi(i, j, 1)
-        cff = 1.0_rp / (hz_k + fck + max(wck, 0.0_rp))
-        cfk = cff * (fck - min(wck, 0.0_rp))
-        col_fc(i, j, 1) = cff
-        col_cf(i, j, 1) = cfk
-        col_wc(i, j, 1) = fck + max(wck, 0.0_rp)
-        do k = 2, nz - 1
-          fcm = fck; wcm = wck; cfm = cfk
-          if (use_fwd) then
-            hz_k = Hz_fwd(i, j, k); hz_kp = Hz_fwd(i, j, k + 1)
-          else
-            hz_k = Hz(i, j, k); hz_kp = Hz(i, j, k + 1)
-          endif
-          fck = 2.0_rp * dtau * Akt(i, j, k, iAkt) / (hz_k + hz_kp)
-          wck = dc0 * Wi(i, j, k)
-          cff = 1.0_rp / (hz_k + fck + max(wck, 0.0_rp) + &
-                          fcm - min(wcm, 0.0_rp) - &
-                          cfm * (fcm + max(wcm, 0.0_rp)))
-          cfk = cff * (fck - min(wck, 0.0_rp))
-          col_fc(i, j, k) = cff
-          col_cf(i, j, k) = cfk
-          col_wc(i, j, k) = fck + max(wck, 0.0_rp)
-        enddo
-        if (use_fwd) then
-          hz_k = Hz_fwd(i, j, nz)
-        else
-          hz_k = Hz(i, j, nz)
-        endif
-        ! top: 1 / (hz + fc(nz-1) - min(wc(nz-1),0) - cf(nz-1)*(fc+max(wc,0))(nz-1))
-        col_fc(i, j, nz) = 1.0_rp / (hz_k + fck - min(wck, 0.0_rp) - cfk * (fck + max(wck, 0.0_rp)))
-        col_wc(i, j, nz) = fck + max(wck, 0.0_rp)
-        ! --- sweeps, one tracer at a time
-        do itr = 1, ntr
-          dck = col_fc(i, j, 1) * real(tp(i, j, 1, nn, itr), rp)
-          col_dc(i, j, 1) = dck
-          do k = 2, nz - 1
-            dcm = dck
-            dck = col_fc(i, j, k) * (real(tp(i, j, k, nn, itr), rp) + dcm * col_wc(i, j, k - 1))
-            col_dc(i, j, k) = dck
-          enddo
-          tt = apply_mask((real(tp(i, j, nz, nn, itr), rp) + dck * col_wc(i, j, nz - 1)) * col_fc(i, j, nz), rm)
-          tp(i, j, nz, nn, itr) = real(tt, pp)
-          do k = nz - 1, 1, -1
-            tt = apply_mask(col_dc(i, j, k) + col_cf(i, j, k) * tt, rm)
-            tp(i, j, k, nn, itr) = real(tt, pp)
-          enddo
-        enddo
-      enddo
-    enddo
-  end subroutine passive_implicit
-
   ! --------------------------------------------------------- predictor
   subroutine passive_predictor(dtau, cf_stp, cf_bak, n_stp, n_new, indx)
     ! Called from pre_step3d after the T/S predictor: LF-AM3 interpolant
@@ -446,19 +313,24 @@ contains
         enddo
       enddo
     enddo
-    call passive_vertical(ts, nn, dtau, 1_ip)
-    call passive_implicit(nn, dtau, .true.)
+    call passive_column_run(tp, ntp, ts, nn, dtau, 1_ip, .true., passive_mirror)
   end subroutine passive_predictor
 
   ! --------------------------------------------------------- corrector
   subroutine passive_corrector(dt_in)
     ! Called from step3d_t after the T/S corrector: UP3 horizontal from
-    ! slot nrhs (= 3), U3 vertical, (mirror: salinity forcing), implicit
-    ! solve, open boundaries.
+    ! slot nrhs (= 3), then U3 vertical + (mirror: salinity forcing) +
+    ! implicit solve in one column kernel, open boundaries.
+    ! Faces as pup3_fx/pup3_fe (bit-identical), masks/fluxes loaded once
+    ! per cell, shared differences reused between adjacent faces.
     real(rp), intent(in) :: dt_in
     integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, nn
     integer(ip) :: west, east, south, north
-    real(rp) :: dtpp, dtl, cff
+    real(rp) :: dtpp, dtl
+    real(rp) :: um0, um1, um2, um3, vm0, vm1, vm2, vm3, fu1, fu2, fv1, fv2
+    real(rp) :: rmw, rmc, rme, rms, rmn, fu1p, fu1m, fu2p, fu2m, fv1p, fv1m, fv2p, fv2m
+    real(rp) :: tm2, tm1, t0, tp1, tp2, dcw, dlw, drw, dre, fxw, fxe, fes, fen, face_t
+    logical :: wedge, eedge, sedge, nedge
     if (ntp <= 0) return
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = ntp
     ts = nrhs; nn = nnew; dtl = dt_in
@@ -473,34 +345,104 @@ contains
       do j = 1, ny
         do i = 1, nx
           dtpp = dtl * pm(i, j) * pn(i, j)
+          um0 = umask(i - 1, j); um1 = umask(i, j); um2 = umask(i + 1, j); um3 = umask(i + 2, j)
+          vm0 = vmask(i, j - 1); vm1 = vmask(i, j); vm2 = vmask(i, j + 1); vm3 = vmask(i, j + 2)
+          fu1 = FlxU(i, j, k); fu2 = FlxU(i + 1, j, k)
+          fv1 = FlxV(i, j, k); fv2 = FlxV(i, j + 1, k)
+          fu1p = max(fu1, 0.0_rp); fu1m = min(fu1, 0.0_rp); fu2p = max(fu2, 0.0_rp); fu2m = min(fu2, 0.0_rp)
+          fv1p = max(fv1, 0.0_rp); fv1m = min(fv1, 0.0_rp); fv2p = max(fv2, 0.0_rp); fv2m = min(fv2, 0.0_rp)
+          wedge = (west == 1 .and. i == 1)
+          eedge = (east == 1 .and. i == nx)
+          sedge = (south == 1 .and. j == 1)
+          nedge = (north == 1 .and. j == ny)
+          rmw = rmask(i - 1, j); rmc = rmask(i, j); rme = rmask(i + 1, j)
+          rms = rmask(i, j - 1); rmn = rmask(i, j + 1)
           do itr = 1, ntr
-            tp(i, j, k, nn, itr) = real(real(tp(i, j, k, nn, itr), rp) - dtpp * &
-                 (pup3_fx(i + 1, j, k, ts, itr, west, east, nx) - &
-                  pup3_fx(i, j, k, ts, itr, west, east, nx) + &
-                  pup3_fe(i, j + 1, k, ts, itr, south, north, ny) - &
-                  pup3_fe(i, j, k, ts, itr, south, north, ny)), pp)
+            ! --- x faces i (west: cells i-1,i) and i+1 (east: cells i,i+1)
+            t0 = real(tp(i, j, k, ts, itr), rp)
+            tm1 = real(tp(i - 1, j, k, ts, itr), rp)
+            tp1 = real(tp(i + 1, j, k, ts, itr), rp)
+            dcw = apply_mask(t0 - tm1, um1)
+            if (wedge) then
+              dlw = dcw
+            else
+              tm2 = real(tp(i - 2, j, k, ts, itr), rp)
+              dlw = apply_mask(tm1 - tm2, um0)
+            endif
+            drw = apply_mask(tp1 - t0, um2)
+            if (rmw > 0.5_rp .and. rmc > 0.5_rp) then
+              face_t = 0.5_rp * (tm1 + t0)
+            elseif (rmw > 0.5_rp) then
+              face_t = tm1
+            elseif (rmc > 0.5_rp) then
+              face_t = t0
+            else
+              face_t = 0.0_rp
+            endif
+            fxw = apply_mask(face_t * fu1 - coef_up3 * ( &
+                  (dcw - dlw) * um0 * um1 * fu1p + (drw - dcw) * um1 * um2 * fu1m), um1)
+            if (eedge) then
+              dre = drw
+            else
+              tp2 = real(tp(i + 2, j, k, ts, itr), rp)
+              dre = apply_mask(tp2 - tp1, um3)
+            endif
+            if (rmc > 0.5_rp .and. rme > 0.5_rp) then
+              face_t = 0.5_rp * (t0 + tp1)
+            elseif (rmc > 0.5_rp) then
+              face_t = t0
+            elseif (rme > 0.5_rp) then
+              face_t = tp1
+            else
+              face_t = 0.0_rp
+            endif
+            fxe = apply_mask(face_t * fu2 - coef_up3 * ( &
+                  (drw - dcw) * um1 * um2 * fu2p + (dre - drw) * um2 * um3 * fu2m), um2)
+            ! --- y faces j (south) and j+1 (north)
+            tm1 = real(tp(i, j - 1, k, ts, itr), rp)
+            tp1 = real(tp(i, j + 1, k, ts, itr), rp)
+            dcw = apply_mask(t0 - tm1, vm1)
+            if (sedge) then
+              dlw = dcw
+            else
+              tm2 = real(tp(i, j - 2, k, ts, itr), rp)
+              dlw = apply_mask(tm1 - tm2, vm0)
+            endif
+            drw = apply_mask(tp1 - t0, vm2)
+            if (rms > 0.5_rp .and. rmc > 0.5_rp) then
+              face_t = 0.5_rp * (tm1 + t0)
+            elseif (rms > 0.5_rp) then
+              face_t = tm1
+            elseif (rmc > 0.5_rp) then
+              face_t = t0
+            else
+              face_t = 0.0_rp
+            endif
+            fes = apply_mask(face_t * fv1 - coef_up3 * ( &
+                  (dcw - dlw) * vm0 * vm1 * fv1p + (drw - dcw) * vm1 * vm2 * fv1m), vm1)
+            if (nedge) then
+              dre = drw
+            else
+              tp2 = real(tp(i, j + 2, k, ts, itr), rp)
+              dre = apply_mask(tp2 - tp1, vm3)
+            endif
+            if (rmc > 0.5_rp .and. rmn > 0.5_rp) then
+              face_t = 0.5_rp * (t0 + tp1)
+            elseif (rmc > 0.5_rp) then
+              face_t = t0
+            elseif (rmn > 0.5_rp) then
+              face_t = tp1
+            else
+              face_t = 0.0_rp
+            endif
+            fen = apply_mask(face_t * fv2 - coef_up3 * ( &
+                  (drw - dcw) * vm1 * vm2 * fv2p + (dre - drw) * vm2 * vm3 * fv2m), vm2)
+            tp(i, j, k, nn, itr) = real(real(tp(i, j, k, nn, itr), rp) - dtpp * (fxe - fxw + fen - fes), pp)
           enddo
         enddo
       enddo
     enddo
-    call passive_vertical(ts, nn, dtl, 0_ip)
-    if (passive_mirror) then
-      ! Salinity's surface flux and KPP nonlocal transport for tracer 1.
-#ifdef USE_CUDA
-      !$cuf kernel do(2) <<<*,*>>>
-#endif
-      do j = 1, ny
-        do i = 1, nx
-          tp(i, j, nz, nn, 1) = real(real(tp(i, j, nz, nn, 1), rp) + dtl * stflx(i, j, isalt), pp)
-          do k = nz - 1, 1, -1
-            cff = -dtl * ghat(i, j, k) * stflx(i, j, isalt)
-            tp(i, j, k + 1, nn, 1) = real(real(tp(i, j, k + 1, nn, 1), rp) - cff, pp)
-            tp(i, j, k, nn, 1) = real(real(tp(i, j, k, nn, 1), rp) + cff, pp)
-          enddo
-        enddo
-      enddo
-    endif
-    call passive_implicit(nn, dtl, .false.)
+    call passive_column_run(tp, ntp, ts, nn, dtl, 0_ip, .false., passive_mirror)
     call passive_t3dbc()
   end subroutine passive_corrector
 
