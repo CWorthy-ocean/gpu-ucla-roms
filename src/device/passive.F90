@@ -26,6 +26,13 @@ module passive_mod
   character(len=16), public :: passive_init = 'zero'           ! zero | blob | mirror_salt
   logical, public :: passive_mirror = .false.
   logical, public :: wrt_passive = .true.
+  ! MARBL mode: the passives are the MARBL tracers (names from MARBL, read
+  ! from the initial file by name, external boundary values from the
+  ! boundary data below instead of 0). Set by marbl_gpu before alloc_passive.
+  logical, public :: passive_marbl = .false.
+  character(len=32), allocatable, public :: passive_names(:)
+  real(rp), WORK_ATTR public, allocatable :: tb_west(:,:,:), tb_east(:,:,:)    ! (js:je, nz, ntp)
+  real(rp), WORK_ATTR public, allocatable :: tb_south(:,:,:), tb_north(:,:,:)  ! (is:ie, nz, ntp)
 
   public :: read_passive_namelist
   public :: alloc_passive
@@ -35,6 +42,7 @@ module passive_mod
   public :: passive_t3dmix
   public :: passive_t3dbc
   public :: passive_name
+  public :: set_passive_marbl
 
 contains
 
@@ -65,9 +73,29 @@ contains
 
   function passive_name(itp) result(name)
     integer(ip), intent(in) :: itp
-    character(len=8) :: name
-    write(name, '(a,i2.2)') 'tp', itp
+    character(len=32) :: name
+    if (passive_marbl) then
+      name = trim(passive_names(itp))
+    else
+      write(name, '(a,i2.2)') 'tp', itp
+    endif
   end function passive_name
+
+  subroutine set_passive_marbl(names)
+    character(len=*), intent(in) :: names(:)
+    integer(ip) :: m
+    ntp = size(names)
+    if (allocated(passive_names)) deallocate(passive_names)
+    allocate(passive_names(ntp))
+    do m = 1, ntp
+      passive_names(m) = trim(names(m))
+    enddo
+    passive_marbl = .true.
+    passive_mirror = .false.
+    passive_init = 'zero'
+    write(*,'(a,i0,a,i0,a)') 'passive tracers: MARBL mode, ', ntp, ' tracers (', &
+         int(storage_size(1.0_pp)), '-bit storage)'
+  end subroutine set_passive_marbl
 
   subroutine alloc_passive()
     integer(ip) :: is, ie, js, je, nz
@@ -76,6 +104,12 @@ contains
     if (allocated(tp)) deallocate(tp)
     allocate(tp(is:ie, js:je, nz, 3, ntp))
     tp = 0.0_pp
+    if (passive_marbl) then
+      if (allocated(tb_west)) deallocate(tb_west, tb_east, tb_south, tb_north)
+      allocate(tb_west(js:je, nz, ntp), tb_east(js:je, nz, ntp))
+      allocate(tb_south(is:ie, nz, ntp), tb_north(is:ie, nz, ntp))
+      tb_west = 0.0_rp; tb_east = 0.0_rp; tb_south = 0.0_rp; tb_north = 0.0_rp
+    endif
   end subroutine alloc_passive
 
   subroutine init_passive()
@@ -515,12 +549,13 @@ contains
     integer(ip) :: i, j, k, nx, ny, nz, ns, nn, nr, itr, ntr, ilo, ihi, jlo, jhi
     real(rp) :: cx, cy, cext, dtw, cff, text
     real(rp) :: g0c, g0p, g1c, g1p, tn
-    logical :: sw, se, nw, ne, mir
+    logical :: sw, se, nw, ne, mir, mbry
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = ntp
     ns = nstp; nn = nnew; nr = nrhs
     ilo = lbound(tp, 1); ihi = ubound(tp, 1)
     jlo = lbound(tp, 2); jhi = ubound(tp, 2)
     mir = passive_mirror
+    mbry = passive_marbl
     if (nnew == 3) then
       dtw = 0.5_rp * dt
     else
@@ -551,6 +586,7 @@ contains
                    + cx * (real(tp(1, j, k, ns, itr), rp) - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p)
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_west(j, k, isalt)
+              if (mbry) text = tb_west(j, k, itr)
               tp(0, j, k, nn, itr) = real(((1.0_rp - cext) * tn + cext * text) * rmask(0, j), pp)
             enddo
           enddo
@@ -593,6 +629,7 @@ contains
                    + cx * (real(tp(nx, j, k, nn, itr), rp) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_east(j, k, isalt)
+              if (mbry) text = tb_east(j, k, itr)
               tp(nx + 1, j, k, nn, itr) = real(((1.0_rp - cext) * tn + cext * text) * rmask(nx + 1, j), pp)
             enddo
           enddo
@@ -635,6 +672,7 @@ contains
                    + cx * (real(tp(i, 1, k, ns, itr), rp) - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p)
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_south(i, k, isalt)
+              if (mbry) text = tb_south(i, k, itr)
               tp(i, 0, k, nn, itr) = real(((1.0_rp - cext) * tn + cext * text) * rmask(i, 0), pp)
             enddo
           enddo
@@ -677,6 +715,7 @@ contains
                    + cx * (real(tp(i, ny, k, nn, itr), rp) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_north(i, k, isalt)
+              if (mbry) text = tb_north(i, k, itr)
               tp(i, ny + 1, k, nn, itr) = real(((1.0_rp - cext) * tn + cext * text) * rmask(i, ny + 1), pp)
             enddo
           enddo

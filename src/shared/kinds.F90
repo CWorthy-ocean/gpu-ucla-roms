@@ -5,7 +5,11 @@ module kinds
   integer, parameter, public :: ip = selected_int_kind(9)
   ! Storage kind of the passive (anomaly) tracers: float32. Set to rp for
   ! an FP64 passive build (validation of the storage error).
+#ifdef PASSIVE_FP64
+  integer, parameter, public :: pp = selected_real_kind(15, 307)
+#else
   integer, parameter, public :: pp = selected_real_kind(6, 37)
+#endif
 
   ! Neighbor sentinels. Periodic wrap on this rank is NBR_SELF.
   ! Physical edges are NBR_NONE. A real MPI neighbor is the rank (>= 0).

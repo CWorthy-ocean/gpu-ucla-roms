@@ -32,6 +32,7 @@ module nc_io
   public :: nc_get_1d
   public :: nc_get_ints
   public :: nc_get_att_text
+  public :: nc_get_att_real
   public :: nc_var_shape
   public :: nc_forcing_layout
   public :: nc_read_forcing_2d
@@ -312,6 +313,22 @@ contains
     call nc_check(nf90_put_att(ncid, varid, trim(att), trim(val)), &
                   'att '//trim(att))
   end subroutine nc_put_att_text
+
+  subroutine nc_get_att_real(ncid, name, att, val, found)
+    ! Numeric attribute of a variable (e.g. cycle_length of a time axis).
+    integer,          intent(in)  :: ncid
+    character(len=*), intent(in)  :: name, att
+    real(rp),         intent(out) :: val
+    logical,          intent(out) :: found
+    integer :: varid, ierr
+    val = 0.0_rp
+    found = .false.
+    ierr = nf90_inq_varid(ncid, trim(name), varid)
+    if (ierr /= nf90_noerr) return
+    ierr = nf90_get_att(ncid, varid, trim(att), val)
+    found = (ierr == nf90_noerr)
+    if (.not. found) val = 0.0_rp
+  end subroutine nc_get_att_real
 
   subroutine nc_get_att_text(ncid, name, att, val)
     integer,          intent(in)  :: ncid

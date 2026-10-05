@@ -14,6 +14,8 @@ module case_io
   use comm_mod, only: comm_rank, comm_size
   use formulas, only: rho0_eos => rho0
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name
+  use marbl_gpu, only: marbl_on, read_marbl_namelist, marbl_gpu_setup_tracers, marbl_gpu_init_forcing, &
+                       marbl_gpu_load_state
   implicit none
   private
   logical :: passive_loaded = .false.
@@ -117,6 +119,7 @@ contains
     call read_tide_namelist(unit)
     call read_output_namelist(unit)
     call read_passive_namelist(unit, nt_passive)
+    call read_marbl_namelist(unit, nml_dir, nt_bgc)
 
     rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios)
     close(unit)
@@ -289,6 +292,7 @@ contains
       error stop 'load_case'
     endif
     call alloc_state(nt)
+    if (marbl_on) call marbl_gpu_setup_tracers()
     call alloc_passive()
 
     call nc_open_read(case_grdname, ncid)
@@ -373,7 +377,9 @@ contains
     tdays = start_time * sec2day
     call dump_vic('after load')
     if (.not. passive_loaded) call init_passive()
+    if (marbl_on .and. .not. passive_loaded) error stop 'MARBL: initial file lacks the MARBL tracers'
     call init_forcing()
+    if (marbl_on) call marbl_gpu_init_forcing()
     call init_bry()
     call init_tides()
     frc_slot = 0
@@ -539,6 +545,7 @@ contains
         passive_loaded = .true.
       endif
     endif
+    if (marbl_on .and. tindx == 1) call marbl_gpu_load_state(ncid, rec, i0, j0, nxi, neta)
   end subroutine load_3d_record
 
   subroutine load_coupling_fields(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)

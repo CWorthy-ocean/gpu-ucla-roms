@@ -15,6 +15,7 @@ module step_driver
   use rho_eos_mod, only: rho_eos
   use pre_step3d_mod, only: pre_step3d, ncol_probe, icol_probe, jcol_probe
   use step3d_uv_mod, only: step3d_uv1, step3d_uv2
+  use marbl_gpu, only: marbl_gpu_step
   use visc3d_mod, only: visc3d
   use step3d_t_mod, only: step3d_t
   use t3dmix_mod, only: t3dmix
@@ -180,6 +181,7 @@ contains
     call dump_we_b('after uv2 omega')
     call dump_swflx_b('after uv2 omega')
     call step3d_t()
+    call marbl_gpu_step()
     call dump_max_t('after step3d_t')
     call dump_col_probe('after step3d_t', nnew)
     call dump_rim('after step3d_t')

@@ -9,6 +9,8 @@ module his_io
   use nc_io
   use io_server
   use passive_mod, only: ntp, tp, wrt_passive, passive_name
+  use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
+                       marbl_gpu_define_rst, marbl_gpu_write_rst
   implicit none
   private
 
@@ -224,6 +226,7 @@ contains
     if (wrt_Aks)  call io_stage_3d('Aks', Akt(is, js, 0, isalt), 0, nz, ir0, ir1, jr0, jr1)
     if (wrt_Hbls) call io_stage_2d('hbls', hbls(is, js), ir0, ir1, jr0, jr1)
     if (wrt_Hbbl) call io_stage_2d('hbbl', hbbl(is, js), ir0, ir1, jr0, jr1)
+    if (marbl_on) call marbl_gpu_stage_his(ir0, ir1, jr0, jr1)
     call io_stage_end()
     write(*,'(a,es14.6,a,i0,a,i0)') 'staged history t = ', twrite, &
          '  rec = ', rec_his, '  file ', nfile_his
@@ -261,6 +264,7 @@ contains
     enddo
     call put_r2(ncid, 'hbls', hbls, rec_rst)
     call put_r2(ncid, 'hbbl', hbbl, rec_rst)
+    if (marbl_on) call marbl_gpu_write_rst(ncid, rec_rst, ir0, ir1, jr0, jr1)
     call put_u2(ncid, 'DU_avg1', DU_avg1, rec_rst)
     call put_v2(ncid, 'DV_avg1', DV_avg1, rec_rst)
     call put_u2(ncid, 'DU_avg2', DU_avg2, rec_rst)
@@ -306,6 +310,7 @@ contains
     if (wrt_Aks)  id = nc_def_var_f(ncid, 'Aks', (/d_xi, d_eta, d_w, d_t/))
     if (wrt_Hbls) id = nc_def_var_f(ncid, 'hbls', (/d_xi, d_eta, d_t/))
     if (wrt_Hbbl) id = nc_def_var_f(ncid, 'hbbl', (/d_xi, d_eta, d_t/))
+    if (marbl_on) call marbl_gpu_define_his(ncid, d_xi, d_eta, d_s, d_t)
     call nc_put_att_text(ncid, '', 'title', output_title)
     call nc_put_att_text(ncid, '', 'history_precision', 'float32 (staged on the GPU)')
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
@@ -334,10 +339,15 @@ contains
     id = nc_def_var(ncid, 'temp', (/d_xi, d_eta, d_s, d_t/))
     id = nc_def_var(ncid, 'salt', (/d_xi, d_eta, d_s, d_t/))
     do itp = 1, ntp
-      id = nc_def_var_f(ncid, trim(passive_name(itp)), (/d_xi, d_eta, d_s, d_t/))
+      if (pp == rp) then
+        id = nc_def_var(ncid, trim(passive_name(itp)), (/d_xi, d_eta, d_s, d_t/))
+      else
+        id = nc_def_var_f(ncid, trim(passive_name(itp)), (/d_xi, d_eta, d_s, d_t/))
+      endif
     enddo
     id = nc_def_var(ncid, 'hbls', (/d_xi, d_eta, d_t/))
     id = nc_def_var(ncid, 'hbbl', (/d_xi, d_eta, d_t/))
+    if (marbl_on) call marbl_gpu_define_rst(ncid, d_xi, d_eta, d_s, d_t)
     id = nc_def_var(ncid, 'DU_avg1', (/d_xiu, d_eta, d_t/))
     id = nc_def_var(ncid, 'DV_avg1', (/d_xi, d_etav, d_t/))
     id = nc_def_var(ncid, 'DU_avg2', (/d_xiu, d_eta, d_t/))
@@ -359,9 +369,10 @@ contains
     nxy = max(nxi, nxi_u) * max(neta, neta_v)
     nh = decomp%nz
     nhw = decomp%nz + 1
-    n2d = count((/wrt_Z, wrt_Ub, wrt_Vb, wrt_Hbls, wrt_Hbbl/))
+    n2d = count((/wrt_Z, wrt_Ub, wrt_Vb, wrt_Hbls, wrt_Hbbl/)) + marbl_gpu_nhis()
     n3d = count((/wrt_U, wrt_V, wrt_temp, wrt_salt, wrt_R/))
     if (wrt_passive) n3d = n3d + ntp
+    n3d = n3d + marbl_gpu_nhis3()
     n3w = count((/wrt_O, wrt_Akv, wrt_Akt, wrt_Aks/))
     cap_rec = n2d * nxy + n3d * nxy * nh + n3w * nxy * nhw
     cap_field = nxy * nhw
@@ -434,15 +445,24 @@ contains
   end subroutine put_r3
 
   subroutine put_r3_p(ncid, name, src, rec)
-    ! Passive tracer (real(pp) storage) into a float32 restart variable.
+    ! Passive tracer (real(pp) storage) into the restart: float32 for the
+    ! float32 build, double when the passives are FP64 (MARBL runs).
     integer,          intent(in) :: ncid, rec
     character(len=*), intent(in) :: name
     real(pp),         intent(in) :: src(decomp%is:, decomp%js:, :)
     real(4), allocatable :: tmp(:,:,:)
-    allocate(tmp(nxi, neta, decomp%nz))
-    tmp = real(src(ir0:ir1, jr0:jr1, 1:decomp%nz), 4)
-    call nc_put_3d_rec_f(ncid, name, tmp, nxi, neta, decomp%nz, rec)
-    deallocate(tmp)
+    real(rp), allocatable :: tmp8(:,:,:)
+    if (pp == rp) then
+      allocate(tmp8(nxi, neta, decomp%nz))
+      tmp8 = real(src(ir0:ir1, jr0:jr1, 1:decomp%nz), rp)
+      call nc_put_3d_rec(ncid, name, tmp8, rec)
+      deallocate(tmp8)
+    else
+      allocate(tmp(nxi, neta, decomp%nz))
+      tmp = real(src(ir0:ir1, jr0:jr1, 1:decomp%nz), 4)
+      call nc_put_3d_rec_f(ncid, name, tmp, nxi, neta, decomp%nz, rec)
+      deallocate(tmp)
+    endif
   end subroutine put_r3_p
 
   subroutine put_u3(ncid, name, src, rec)

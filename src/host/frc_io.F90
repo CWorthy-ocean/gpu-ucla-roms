@@ -31,6 +31,9 @@ module frc_io
     character(len=1)   :: gtype = 'r'
     integer :: ntot = 0, it1 = 1, it2 = 2, n1 = 0, n2 = 0, time_axis = 3
     logical :: ready = .false.
+    ! climatology: cycle_length attribute of the time axis (<= 0: none);
+    ! t1e/t2e are the shifted record times of the current bracket
+    real(rp) :: cycle = -1.0_rp, t1e = 0.0_rp, t2e = 0.0_rp
     integer, allocatable :: ifile(:), irec(:)
     character(len=512), allocatable :: paths(:)
     real(rp), allocatable :: times(:)
@@ -39,11 +42,18 @@ module frc_io
 
   type(series2d) :: s_sustr, s_svstr, s_shflx, s_swflx, s_swrad
   type(series2d) :: s_uwnd, s_vwnd, s_tair, s_qair, s_prate, s_lwrad, s_bswrad
+  ! MARBL surface forcing (dust/iron/nox/nhy climatologies, atmospheric xCO2)
+  type(series2d) :: s_dust, s_iron, s_nox, s_nhy, s_xco2, s_xco2a
+  logical, public :: bgc_frc_on = .false.
   real(rp), WORK_ATTR allocatable :: uwnd(:,:), vwnd(:,:), qair(:,:), prate(:,:), lwrad_in(:,:)
 
   public :: read_forcing_namelist
   public :: init_forcing
   public :: set_forces
+  public :: init_bgc_forcing
+  public :: set_bgc_forces
+  public :: cyc_bracket
+  public :: uwnd, vwnd
   public :: write_toy_flux
   public :: write_toy_bulk
 
@@ -188,6 +198,8 @@ contains
     character(len=*), intent(in)    :: vname, tname, gtype
     integer :: i, ncid, nxi, neta, nrec, tax, k, ntot
     real(rp), allocatable :: tloc(:)
+    real(rp) :: cyc
+    logical :: lcyc
     s%vname = trim(vname)
     s%tname = trim(tname)
     s%gtype = gtype
@@ -232,6 +244,19 @@ contains
     enddo
     if (s%ntot < 1) return
     call sort_catalog(s)
+    ! climatology? cycle_length on the time axis of the first file with the variable
+    s%cycle = -1.0_rp
+    do i = 1, case_nfrc
+      call nc_open_read(case_frcfiles(i), ncid)
+      if (nc_has_var(ncid, vname) .and. nc_has_var(ncid, tname)) then
+        call nc_get_att_real(ncid, tname, 'cycle_length', cyc, lcyc)
+        if (lcyc .and. cyc > 0.0_rp) s%cycle = cyc
+        call nc_close(ncid)
+        exit
+      endif
+      call nc_close(ncid)
+    enddo
+    if (s%cycle > 0.0_rp) write(*,'(3a,f10.3)') 'forcing ', trim(vname), ' is cyclic, cycle_length =', s%cycle
     s%ready = .true.
     allocate(s%buf(s%n1, s%n2, 2))
     s%buf = 0.0_rp
@@ -291,11 +316,55 @@ contains
     deallocate(tmp)
   end subroutine read_catalog_rec
 
+  ! Climatology bracket, as the CPU model (find_new_record_cycle): the
+  ! record times are shifted by whole cycles so that the first shifted time
+  ! above tneed is record i2; i1 is the one before it (wrapping to the last
+  ! record of the previous cycle).
+  subroutine cyc_bracket(times, ntot, cycle, tneed, i1, i2, t1, t2)
+    integer,  intent(in)  :: ntot
+    real(rp), intent(in)  :: times(ntot), cycle, tneed
+    integer,  intent(out) :: i1, i2
+    real(rp), intent(out) :: t1, t2
+    integer :: icycle, k
+    if (ntot < 2) then
+      i1 = 1; i2 = 1; t1 = tneed; t2 = tneed
+      return
+    endif
+    icycle = floor((tneed - times(ntot)) / cycle) + 1
+    i2 = ntot
+    do k = 1, ntot
+      if (times(k) + real(icycle, rp) * cycle > tneed) then
+        i2 = k
+        exit
+      endif
+    enddo
+    t2 = times(i2) + real(icycle, rp) * cycle
+    if (i2 == 1) then
+      i1 = ntot
+      t1 = times(ntot) + real(icycle - 1, rp) * cycle
+    else
+      i1 = i2 - 1
+      t1 = times(i1) + real(icycle, rp) * cycle
+    endif
+  end subroutine cyc_bracket
+
   subroutine advance_series(s, tneed)
     type(series2d), intent(inout) :: s
     real(rp),       intent(in)    :: tneed
-    integer :: rec, i, old1, old2
+    integer :: rec, i, old1, old2, i1, i2
     if (.not. s%ready .or. s%ntot < 2) return
+    if (s%cycle > 0.0_rp) then
+      call cyc_bracket(s%times, s%ntot, s%cycle, tneed, i1, i2, s%t1e, s%t2e)
+      if (i1 /= s%it1) then
+        s%it1 = i1
+        call read_catalog_rec(s, i1, 1)
+      endif
+      if (i2 /= s%it2) then
+        s%it2 = i2
+        call read_catalog_rec(s, i2, 2)
+      endif
+      return
+    endif
     if (s%times(s%it2) >= tneed .and. s%times(s%it1) <= tneed) return
     rec = 1
     do i = 1, s%ntot - 1
@@ -319,16 +388,22 @@ contains
     real(rp),       intent(in)  :: tneed
     real(rp),       intent(out) :: c1, c2
     real(rp) :: dtm
+    real(rp) :: t1, t2
     if (s%ntot < 2) then
       c1 = 1.0_rp; c2 = 0.0_rp
       return
     endif
-    dtm = s%times(s%it2) - s%times(s%it1)
+    if (s%cycle > 0.0_rp) then
+      t1 = s%t1e; t2 = s%t2e
+    else
+      t1 = s%times(s%it1); t2 = s%times(s%it2)
+    endif
+    dtm = t2 - t1
     if (abs(dtm) < 1.0e-12_rp) then
       c1 = 1.0_rp; c2 = 0.0_rp
     else
-      c1 = (s%times(s%it2) - tneed) / dtm
-      c2 = (tneed - s%times(s%it1)) / dtm
+      c1 = (t2 - tneed) / dtm
+      c2 = (tneed - t1) / dtm
     endif
   end subroutine weights
 
@@ -436,6 +511,65 @@ contains
       enddo
     enddo
   end subroutine interp_on_grid
+
+  ! MARBL surface forcing series. Names/units as the CPU model
+  ! (bgc_shared_vars / marbl_driver): dust kg/m2/s, iron nmol/cm2/s ->
+  ! mmol/m2/s (x0.01), nox/nhy kg N/m2/s -> mmol/m2/s (x71394.200220751),
+  ! xco2_air / xco2_air_alt ppm. Missing series leave the field as is.
+  subroutine init_bgc_forcing()
+    bgc_frc_on = .false.
+    if (case_nfrc < 1) return
+    call bind_series(s_dust, 'dust', 'dust_time', 'r')
+    call bind_series(s_iron, 'iron', 'iron_time', 'r')
+    call bind_series(s_nox, 'nox', 'nox_time', 'r')
+    call bind_series(s_nhy, 'nhy', 'nhy_time', 'r')
+    call bind_series(s_xco2, 'xco2_air', 'xco2_time', 'r')
+    call bind_series(s_xco2a, 'xco2_air_alt', 'xco2_time', 'r')
+    bgc_frc_on = s_dust%ready .or. s_iron%ready .or. s_nox%ready .or. s_nhy%ready .or. s_xco2%ready
+    write(*,'(a,6l2)') 'MARBL forcing series dust iron nox nhy xco2 xco2_alt ready =', s_dust%ready, &
+         s_iron%ready, s_nox%ready, s_nhy%ready, s_xco2%ready, s_xco2a%ready
+  end subroutine init_bgc_forcing
+
+  subroutine set_bgc_forces(tneed, dust, iron, nox, nhy, xco2, xco2a)
+    real(rp), intent(in) :: tneed
+    real(rp), WORK_ATTR intent(inout) :: dust(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: iron(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: nox(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: nhy(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: xco2(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: xco2a(decomp%is:decomp%ie, decomp%js:decomp%je)
+    if (.not. bgc_frc_on) return
+    if (s_dust%ready) call fill_r(s_dust, tneed, dust)
+    if (s_iron%ready) then
+      call fill_r(s_iron, tneed, iron)
+      call scale_2d(iron, 0.01_rp)
+    endif
+    if (s_nox%ready) then
+      call fill_r(s_nox, tneed, nox)
+      call scale_2d(nox, 71394.200220751_rp)
+    endif
+    if (s_nhy%ready) then
+      call fill_r(s_nhy, tneed, nhy)
+      call scale_2d(nhy, 71394.200220751_rp)
+    endif
+    if (s_xco2%ready) call fill_r(s_xco2, tneed, xco2)
+    if (s_xco2a%ready) call fill_r(s_xco2a, tneed, xco2a)
+  end subroutine set_bgc_forces
+
+  subroutine scale_2d(a, f)
+    real(rp), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), intent(in) :: f
+    integer :: i, j, is, ie, js, je
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = js, je
+      do i = is, ie
+        a(i, j) = a(i, j) * f
+      enddo
+    enddo
+  end subroutine scale_2d
 
   subroutine set_2d(a, val)
     real(rp), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je)

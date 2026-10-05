@@ -46,10 +46,35 @@ SRC_DEV    = src/device/gpu_state.F90 src/device/column_solve.F90 src/device/hal
              src/device/bulk_coare.F90
 SRC_HOST   = src/host/step_driver.F90
 SRC_IO     = src/host/nc_io.F90 src/host/host_buf.F90 src/host/frc_io.F90 \
-             src/host/bry_io.F90 src/host/tide_io.F90 src/host/io_server.F90 src/host/his_io.F90 \
+             src/host/bry_io.F90 src/host/tide_io.F90 src/host/io_server.F90 src/host/marbl_step.F90 src/host/his_io.F90 \
              src/host/case_io.F90
 MODDIR     = build
 GPUDIR     = build_gpu
+
+# MARBL (upstream sources, compiled into the GPU build as host code). The
+# list is in module-dependency order (from MARBL's makedep.py); each object
+# is also chained to the one before it so a parallel make keeps the order.
+# git submodule MARBL (CWorthy-ocean/MARBL @ 6e6b2f7); override with MARBL_SRC=<path>
+MARBL_SRC ?= $(CURDIR)/MARBL/src
+MARBL_NAMES = marbl_kinds_mod marbl_constants_mod marbl_logging marbl_pft_mod \
+  marbl_settings_mod marbl_interface_public_types marbl_timing_mod \
+  marbl_interface_private_types marbl_diagnostics_share_mod \
+  marbl_abio_dic_diagnostics_mod marbl_abio_dic_interior_tendency_mod \
+  marbl_co2calc_mod marbl_schmidt_number_mod marbl_abio_dic_surface_flux_mod \
+  marbl_ciso_diagnostics_mod marbl_interior_tendency_share_mod \
+  marbl_ciso_interior_tendency_mod marbl_ciso_surface_flux_mod marbl_debug_mod \
+  marbl_oxygen marbl_utils_mod marbl_diagnostics_mod marbl_glo_avg_mod \
+  marbl_init_tracer_metadata_mod marbl_init_mod marbl_restore_mod \
+  marbl_temperature marbl_interior_tendency_mod marbl_saved_state_mod \
+  marbl_nhx_surface_emis_mod marbl_surface_flux_share_mod marbl_surface_flux_mod \
+  marbl_interface marbl_interface_constants
+MARBL_OBJS = $(addprefix $(GPUDIR)/marbl/,$(addsuffix .o,$(MARBL_NAMES)))
+# Host-side MARBL glue (instance, settings, per-column reference). Compiled
+# on its own like comm.F90: its external calls must not disable nvfortran's
+# cross-file inlining in the main command.
+SRC_MARBL_HOST = src/host/marbl_host.F90
+# Device MARBL kernels (part of the main command).
+SRC_MARBL_DEV  = src/device/marbl_sflux.F90 src/device/marbl_interior.F90
 
 .PHONY: all host tests gpu clean run
 
@@ -142,10 +167,52 @@ run: $(MODDIR)/roms_gpu
 # linked in; the main command sees only comm_mod.mod.
 SRC_SHARED_NOCOMM = $(filter-out src/shared/comm.F90,$(SRC_SHARED))
 
-gpu: | $(GPUDIR)
+$(GPUDIR)/marbl:
+	mkdir -p $(GPUDIR)/marbl
+$(GPUDIR)/marbl/%.o: $(MARBL_SRC)/%.F90 | $(GPUDIR)/marbl
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c $< -o $@
+# nvfortran 25.9 -O2 miscompiles the array-section WHERE constructs in
+# MARBL's interior module (segfault in compute_autotroph_nutrient_uptake for
+# the second autotroph); this host reference code is built at -O0.
+$(GPUDIR)/marbl/marbl_interior_tendency_mod.o: $(MARBL_SRC)/marbl_interior_tendency_mod.F90 | $(GPUDIR)/marbl
+	$(FC_GPU) $(filter-out -O2 -O3,$(FFLAGS_GPU)) -O0 -module $(GPUDIR) -c $< -o $@
+# chain: object n depends (order-only) on object n-1
+define MARBL_CHAIN
+$(GPUDIR)/marbl/$(1).o: | $(GPUDIR)/marbl/$(2).o
+endef
+$(foreach i,$(shell seq 2 $(words $(MARBL_NAMES))),\
+  $(eval $(call MARBL_CHAIN,$(word $(i),$(MARBL_NAMES)),$(word $(shell expr $(i) - 1),$(MARBL_NAMES)))))
+.PHONY: marbl
+marbl: $(MARBL_OBJS)
+
+$(GPUDIR)/kinds_pre.o: src/shared/kinds.F90 | $(GPUDIR)
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/shared/kinds.F90 -o $(GPUDIR)/kinds_pre.o
+$(GPUDIR)/marbl_host.o: $(SRC_MARBL_HOST) $(GPUDIR)/kinds_pre.o $(MARBL_OBJS)
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c $(SRC_MARBL_HOST) -o $(GPUDIR)/marbl_host.o
+
+gpu: $(GPUDIR)/kinds_pre.o $(GPUDIR)/marbl_host.o | $(GPUDIR)
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/shared/comm.F90 -o $(GPUDIR)/comm.o
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -o $(GPUDIR)/roms_gpu_cuda \
-	  $(SRC_SHARED_NOCOMM) $(SRC_DEV) $(SRC_IO) $(SRC_HOST) src/host/main.F90 $(GPUDIR)/comm.o $(LIBS)
+	  $(SRC_SHARED_NOCOMM) $(SRC_DEV) $(SRC_MARBL_DEV) $(SRC_IO) $(SRC_HOST) src/host/main.F90 \
+	  $(GPUDIR)/comm.o $(GPUDIR)/marbl_host.o $(MARBL_OBJS) $(LIBS)
+
+# Column-by-column check of the device MARBL interior kernels against the
+# unchanged MARBL code (host).
+$(GPUDIR)/test_marbl_interior: $(GPUDIR)/kinds_pre.o $(GPUDIR)/marbl_host.o tests/test_marbl_interior.F90 \
+                               $(SRC_MARBL_DEV) | $(GPUDIR)
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/shared/comm.F90 -o $(GPUDIR)/comm.o
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -o $@ \
+	  $(SRC_SHARED_NOCOMM) $(SRC_MARBL_DEV) tests/test_marbl_interior.F90 \
+	  $(GPUDIR)/comm.o $(GPUDIR)/marbl_host.o $(MARBL_OBJS) $(LIBS)
+
+# Column-by-column check of the device MARBL surface-flux kernel against
+# the unchanged MARBL code (host). Built the same way as the model.
+$(GPUDIR)/test_marbl_sflux: $(GPUDIR)/kinds_pre.o $(GPUDIR)/marbl_host.o tests/test_marbl_sflux.F90 \
+                            $(SRC_MARBL_DEV) | $(GPUDIR)
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/shared/comm.F90 -o $(GPUDIR)/comm.o
+	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -o $@ \
+	  $(SRC_SHARED_NOCOMM) $(SRC_MARBL_DEV) tests/test_marbl_sflux.F90 \
+	  $(GPUDIR)/comm.o $(GPUDIR)/marbl_host.o $(MARBL_OBJS) $(LIBS)
 
 clean:
 	rm -rf $(MODDIR) $(GPUDIR)

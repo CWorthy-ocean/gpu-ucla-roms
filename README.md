@@ -71,3 +71,14 @@ Halo pack/unpack and the interiors of `set_depth`, `rho_eos`, `prsgrd`, LMD (`sw
 
 1. Tiled NetCDF I/O (so MiniPac can use `np_xi × np_eta`); rivers; BGC
 
+## MARBL
+
+MARBL (git submodule `MARBL`, CWorthy-ocean/MARBL @ 6e6b2f7, the version the
+CPU model uses) runs on the GPU: MARBL's own sources are compiled as host
+code for settings/initialisation (`src/host/marbl_host.F90`), and the surface
+flux and interior tendency paths are ported to CUDA Fortran kernels
+(`src/device/marbl_sflux.F90`, `src/device/marbl_interior.F90`), driven from
+`src/host/marbl_step.F90`. The 32 MARBL tracers are the passive tracers in
+MARBL mode (build with `-DPASSIVE_FP64`). Validation, results and lessons:
+`MARBL_GPU_PORT.md`; how to build and run: `MARBL_RESUME.md`; cases:
+`cases/minipac`. Clone with `git clone --recurse-submodules`.

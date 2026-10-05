@@ -13,7 +13,8 @@ module bry_io
   use decomp_mod
   use gpu_state
   use time_state
-  use frc_io, only: case_frcfiles, case_nfrc
+  use frc_io, only: case_frcfiles, case_nfrc, cyc_bracket
+  use passive_mod, only: ntp, passive_marbl, passive_name, tb_west, tb_east, tb_south, tb_north
   use nc_io
   use arch_mod, only: sync_arch
 #ifdef USE_CUDA
@@ -30,6 +31,7 @@ module bry_io
     character(len=64)  :: tname = 'bry_time'
     integer :: n = 0, nrec = 0, it1 = 1, it2 = 2
     logical :: ready = .false., warned = .false.
+    real(rp) :: cycle = -1.0_rp, t1e = 0.0_rp, t2e = 0.0_rp
     real(rp), allocatable :: times(:)
     character(len=512), allocatable :: paths(:)
     integer, allocatable :: irec(:)
@@ -41,6 +43,7 @@ module bry_io
     character(len=64)  :: tname = 'bry_time'
     integer :: n = 0, nz = 0, nrec = 0, it1 = 1, it2 = 2
     logical :: ready = .false., warned = .false.
+    real(rp) :: cycle = -1.0_rp, t1e = 0.0_rp, t2e = 0.0_rp
     real(rp), allocatable :: times(:)
     character(len=512), allocatable :: paths(:)
     integer, allocatable :: irec(:)
@@ -51,6 +54,8 @@ module bry_io
   type(series1d) :: ser_zs, ser_ubs, ser_vbs, ser_zn, ser_ubn, ser_vbn
   type(series_z) :: ser_uw, ser_vw, ser_tw, ser_sw, ser_ue, ser_ve, ser_te, ser_se
   type(series_z) :: ser_us, ser_vs, ser_ts, ser_ss, ser_un, ser_vn, ser_tn, ser_sn
+  ! MARBL tracers (passive_mod MARBL mode): one series per tracer and side
+  type(series_z), allocatable :: ser_tbw(:), ser_tbe(:), ser_tbs(:), ser_tbn(:)
 
   public :: init_bry
   public :: set_bry_all
@@ -60,6 +65,7 @@ module bry_io
 contains
 
   subroutine init_bry()
+    integer(ip) :: m, nmiss
     have_bry = .false.
     obc_west = .false.; obc_east = .false.; obc_south = .false.; obc_north = .false.
     if (case_nfrc < 1) return
@@ -81,11 +87,26 @@ contains
     obc_north = ser_zn%ready .or. ser_vbn%ready
     have_bry = obc_west .or. obc_east .or. obc_south .or. obc_north
     if (have_bry) write(*,'(a,4l2)') 'OBC W E S N =', obc_west, obc_east, obc_south, obc_north
+    if (have_bry .and. passive_marbl .and. ntp > 0) then
+      allocate(ser_tbw(ntp), ser_tbe(ntp), ser_tbs(ntp), ser_tbn(ntp))
+      nmiss = 0
+      do m = 1, ntp
+        call bindz(ser_tbw(m), trim(passive_name(m))//'_west')
+        call bindz(ser_tbe(m), trim(passive_name(m))//'_east')
+        call bindz(ser_tbs(m), trim(passive_name(m))//'_south')
+        call bindz(ser_tbn(m), trim(passive_name(m))//'_north')
+        if (.not. (ser_tbw(m)%ready .or. ser_tbe(m)%ready .or. ser_tbs(m)%ready .or. ser_tbn(m)%ready)) &
+             nmiss = nmiss + 1
+      enddo
+      write(*,'(a,i0,a,i0,a)') 'MARBL boundary data bound for ', ntp - nmiss, ' of ', ntp, &
+           ' tracers (missing ones use 0 on inflow)'
+    endif
   end subroutine init_bry
 
   subroutine set_bry_all()
     real(rp) :: tneed
     integer :: nz, is, js
+    integer(ip) :: m
     if (.not. have_bry) return
     tneed = frc_modtime()
     call fill1j(ser_zw, tneed, zeta_west)
@@ -119,6 +140,14 @@ contains
     call fillzi(ser_ss, tneed, t_south(is, 1, isalt), nz)
     call fillzi(ser_tn, tneed, t_north(is, 1, itemp), nz)
     call fillzi(ser_sn, tneed, t_north(is, 1, isalt), nz)
+    if (passive_marbl .and. allocated(ser_tbw)) then
+      do m = 1, ntp
+        call fillzj(ser_tbw(m), tneed, tb_west(js, 1, m), nz)
+        call fillzj(ser_tbe(m), tneed, tb_east(js, 1, m), nz)
+        call fillzi(ser_tbs(m), tneed, tb_south(is, 1, m), nz)
+        call fillzi(ser_tbn(m), tneed, tb_north(is, 1, m), nz)
+      enddo
+    endif
     call dump_bry_north('after clim', tneed)
   end subroutine set_bry_all
 
@@ -127,7 +156,7 @@ contains
     character(len=*), intent(in)    :: vname
     integer :: n1, n2
     s%vname = trim(vname)
-    call build_catalog(vname, s%tname, s%times, s%paths, s%irec, s%nrec, n1, n2)
+    call build_catalog(vname, s%tname, s%times, s%paths, s%irec, s%nrec, n1, n2, s%cycle)
     s%ready = (s%nrec > 0)
     if (.not. s%ready) return
     s%n = n1
@@ -142,7 +171,7 @@ contains
     character(len=*), intent(in)    :: vname
     integer :: n1, n2
     s%vname = trim(vname)
-    call build_catalog(vname, s%tname, s%times, s%paths, s%irec, s%nrec, n1, n2)
+    call build_catalog(vname, s%tname, s%times, s%paths, s%irec, s%nrec, n1, n2, s%cycle)
     s%ready = (s%nrec > 0)
     if (.not. s%ready) return
     s%n = n1; s%nz = n2
@@ -152,18 +181,20 @@ contains
     call read_recz(s, s%it2, 2)
   end subroutine bindz
 
-  subroutine build_catalog(vname, tname, times, paths, irec, ntot, n1, n2)
+  subroutine build_catalog(vname, tname, times, paths, irec, ntot, n1, n2, cycle)
     character(len=*), intent(in) :: vname, tname
     real(rp), allocatable, intent(inout) :: times(:)
     character(len=512), allocatable, intent(inout) :: paths(:)
     integer, allocatable, intent(inout) :: irec(:)
     integer, intent(out) :: ntot, n1, n2
+    real(rp), intent(out) :: cycle
     integer :: pass, i, k, j, ncid, a1, a2, a3, nrec, isw
     real(rp), allocatable :: tloc(:)
-    real(rp) :: tsw
+    real(rp) :: tsw, cyc
     character(len=512) :: psw
+    logical :: lcyc
 
-    ntot = 0; n1 = 0; n2 = 0
+    ntot = 0; n1 = 0; n2 = 0; cycle = -1.0_rp
     do pass = 1, 2
       if (pass == 2) then
         if (ntot < 1) return
@@ -179,6 +210,10 @@ contains
           if (pass == 1) then
             if (n1 == 0) then
               n1 = a1; n2 = a2
+              if (nc_has_var(ncid, tname)) then
+                call nc_get_att_real(ncid, tname, 'cycle_length', cyc, lcyc)
+                if (lcyc .and. cyc > 0.0_rp) cycle = cyc
+              endif
             endif
             ntot = ntot + nrec
           else
@@ -388,8 +423,20 @@ contains
   subroutine adv1(s, tneed)
     type(series1d), intent(inout) :: s
     real(rp),       intent(in)    :: tneed
-    integer :: rec, i
+    integer :: rec, i, i1, i2
     if (s%nrec < 2) return
+    if (s%cycle > 0.0_rp) then
+      call cyc_bracket(s%times, s%nrec, s%cycle, tneed, i1, i2, s%t1e, s%t2e)
+      if (i1 /= s%it1) then
+        s%it1 = i1
+        call read_rec1(s, i1, 1)
+      endif
+      if (i2 /= s%it2) then
+        s%it2 = i2
+        call read_rec1(s, i2, 2)
+      endif
+      return
+    endif
     if (s%times(s%it2) >= tneed .and. s%times(s%it1) <= tneed) return
     rec = 1
     do i = 1, s%nrec - 1
@@ -408,8 +455,20 @@ contains
   subroutine advz(s, tneed)
     type(series_z), intent(inout) :: s
     real(rp),       intent(in)    :: tneed
-    integer :: rec, i
+    integer :: rec, i, i1, i2
     if (s%nrec < 2) return
+    if (s%cycle > 0.0_rp) then
+      call cyc_bracket(s%times, s%nrec, s%cycle, tneed, i1, i2, s%t1e, s%t2e)
+      if (i1 /= s%it1) then
+        s%it1 = i1
+        call read_recz(s, i1, 1)
+      endif
+      if (i2 /= s%it2) then
+        s%it2 = i2
+        call read_recz(s, i2, 2)
+      endif
+      return
+    endif
     if (s%times(s%it2) >= tneed .and. s%times(s%it1) <= tneed) return
     rec = 1
     do i = 1, s%nrec - 1
@@ -429,14 +488,22 @@ contains
     type(series1d), intent(inout) :: s
     real(rp),       intent(in)    :: tneed
     real(rp),       intent(out)   :: c1, c2
-    call time_weights(s%nrec, s%times(s%it1), s%times(s%it2), tneed, s%vname, s%warned, c1, c2)
+    if (s%cycle > 0.0_rp) then
+      call time_weights(s%nrec, s%t1e, s%t2e, tneed, s%vname, s%warned, c1, c2)
+    else
+      call time_weights(s%nrec, s%times(s%it1), s%times(s%it2), tneed, s%vname, s%warned, c1, c2)
+    endif
   end subroutine wgt1
 
   subroutine wgtz(s, tneed, c1, c2)
     type(series_z), intent(inout) :: s
     real(rp),       intent(in)    :: tneed
     real(rp),       intent(out)   :: c1, c2
-    call time_weights(s%nrec, s%times(s%it1), s%times(s%it2), tneed, s%vname, s%warned, c1, c2)
+    if (s%cycle > 0.0_rp) then
+      call time_weights(s%nrec, s%t1e, s%t2e, tneed, s%vname, s%warned, c1, c2)
+    else
+      call time_weights(s%nrec, s%times(s%it1), s%times(s%it2), tneed, s%vname, s%warned, c1, c2)
+    endif
   end subroutine wgtz
 
   subroutine time_weights(nrec, t1, t2, tneed, vname, warned, c1, c2)
