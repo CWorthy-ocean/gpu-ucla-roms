@@ -1,12 +1,14 @@
 """Day-3 restart (double precision) noise-floor comparison: GPU vs CPU ref,
 with the CPU perturbed twin as the floor. Last time record of the CPU
 restarts (EXACT_RESTART writes two)."""
+import sys
 import netCDF4 as nc
 import numpy as np
+TAG = sys.argv[1] if len(sys.argv) > 1 else "3d"   # GPU run tag (minipac_gpu_marbl<TAG>_rst.nc)
 B = "/glade/derecho/scratch/bachman/roms_marbl_setup_assistant/cases/"
 grd = nc.Dataset(B + "MiniPac/input_data/PACMED12km_v2ni_grid.nc")
 wet = (grd["mask_rho"][:] > 0.5)[1:-1, 1:-1]
-g = nc.Dataset(B + "GPU/output/minipac_gpu_marbl3d_rst.nc")
+g = nc.Dataset(B + "GPU/output/minipac_gpu_marbl" + TAG + "_rst.nc")
 r = nc.Dataset(B + "CPU_marbl/output/minipac_cpu_marbl3d_rst.20100402000000.nc")
 p = nc.Dataset(B + "CPU_marbl/output/minipac_cpu_marbl3d_pert_rst.20100402000000.nc")
 print("times gpu", float(g["ocean_time"][-1]), "cpu", np.asarray(r["ocean_time"][:]) if "ocean_time" in r.variables else [v for v in r.variables if "time" in v])

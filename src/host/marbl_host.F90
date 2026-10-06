@@ -64,7 +64,7 @@ module marbl_host
   integer, parameter, public :: MA = 4    ! max autotrophs
   integer, parameter, public :: MZ = 2    ! max zooplankton
   integer, parameter, public :: MP = 4    ! max prey classes
-  integer, parameter, public :: NTRMAX = 64
+  integer, parameter, public :: NTRMAX = 32   ! base MARBL tracer set; marbl_host_fill_par errors above it
   integer, parameter, public :: ND_IT = 16 ! interior debug diagnostics
   type, public :: marbl_par_t
     integer(ip) :: ntr = 0, nauto = 0, nzoo = 0, nprey = 0

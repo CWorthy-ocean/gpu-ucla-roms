@@ -544,7 +544,7 @@ contains
     integer(ip) :: i, j, m, ierr
     real(rp) :: sst, sss, u10sqr, xco2, xco2a, dust, iron, nox, nhy
     real(rp) :: piston, xkw_ice, sch_co2, pv_co2, sch_o2, pv_o2, o2s, flux_o2, flux_co2, flux_alt
-    real(rp) :: ph, ph_alt, phlo, phhi, nhx
+    real(rp) :: ph, ph_alt, ph0, phlo, phhi, nhx
     real(rp) :: f_o2, f_dic, f_dica, f_nh4, f_fe, f_po4, f_sio3, f_no3, f_alk, f_alka
     real(rp) :: k0, k1, k2, ff, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft
     real(rp) :: c_ph, c_co3, c_co2star, c_dco2star, c_pco2surf, c_dpco2
@@ -606,6 +606,7 @@ contains
         t_dic = real(tr(i, j, kk, slot, idic), rp); t_alk = real(tr(i, j, kk, slot, ialk), rp)
         t_po4 = real(tr(i, j, kk, slot, ipo4), rp); t_sio3 = real(tr(i, j, kk, slot, isio3), rp)
         t_dica = real(tr(i, j, kk, slot, idica), rp); t_alka = real(tr(i, j, kk, slot, ialka), rp)
+        ph0 = ph
         call co2calc_surface1(t_dic, xco2, t_alk, t_po4, t_sio3, atm_pres, mass_to_vol, &
              k1, k2, ff, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, ph, &
              c_ph, c_co3, c_co2star, c_dco2star, c_pco2surf, c_dpco2, c_ierr)
@@ -613,20 +614,29 @@ contains
         if (ierr == 0) then
           ph = c_ph
           flux_co2 = pv_co2 * c_dco2star
-          if (ph_alt /= c0) then
-            phlo = ph_alt - del_ph
-            phhi = ph_alt + del_ph
-          else
-            phlo = phlo_init
-            phhi = phhi_init
-          endif
-          call co2calc_surface1(t_dica, xco2a, t_alka, t_po4, t_sio3, atm_pres, mass_to_vol, &
-               k1, k2, ff, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, ph_alt, &
-               a_ph, a_co3, a_co2star, a_dco2star, a_pco2surf, a_dpco2, c_ierr)
-          ierr = c_ierr
-          if (ierr == 0) then
+          if (t_dica == t_dic .and. t_alka == t_alk .and. xco2a == xco2 .and. ph_alt == ph0) then
+            ! identical inputs and bracket: the alternative-CO2 solve would
+            ! repeat the base one exactly, so reuse its results
+            a_ph = c_ph; a_co3 = c_co3; a_co2star = c_co2star; a_dco2star = c_dco2star
+            a_pco2surf = c_pco2surf; a_dpco2 = c_dpco2
             ph_alt = a_ph
             flux_alt = pv_co2 * a_dco2star
+          else
+            if (ph_alt /= c0) then
+              phlo = ph_alt - del_ph
+              phhi = ph_alt + del_ph
+            else
+              phlo = phlo_init
+              phhi = phhi_init
+            endif
+            call co2calc_surface1(t_dica, xco2a, t_alka, t_po4, t_sio3, atm_pres, mass_to_vol, &
+                 k1, k2, ff, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, ph_alt, &
+                 a_ph, a_co3, a_co2star, a_dco2star, a_pco2surf, a_dpco2, c_ierr)
+            ierr = c_ierr
+            if (ierr == 0) then
+              ph_alt = a_ph
+              flux_alt = pv_co2 * a_dco2star
+            endif
           endif
         endif
         f_dic = f_dic + flux_co2

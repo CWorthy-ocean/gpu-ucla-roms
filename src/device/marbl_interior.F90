@@ -1090,7 +1090,7 @@ contains
     real(rp), device, intent(in) :: z_r(is:ie, js:je, nz)
     real(rp), device, intent(in) :: mask(is:ie, js:je)
     integer(ip) :: i, j, kk, ierr, ierr2
-    real(rp) :: potemp, salt, press, tins, phlo, phhi, ph, pha, h2co3, hco3, co3, h2co3a, hco3a, co3a
+    real(rp) :: potemp, salt, press, tins, phlo, phhi, ph, ph0, pha, h2co3, hco3, co3, h2co3a, hco3a, co3a
     real(rp) :: k0, k1, k2, ff, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, csat, asat
     real(rp) :: t_dic, t_alk, t_po4, t_sio3, t_dica, t_alka
     integer(ip), parameter :: lpress = 1
@@ -1118,16 +1118,24 @@ contains
     else
       phlo = PR%phlo_3d_init; phhi = PR%phhi_3d_init
     endif
+    ph0 = ph
     call co2calc_interior1(t_dic, t_alk, t_po4, t_sio3, PR%mass_to_vol, &
          k1, k2, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, ph, h2co3, hco3, co3, ierr)
     pha = it_pha(i, j, kk)
-    if (pha /= c0) then
-      phlo = pha - PR%del_ph; phhi = pha + PR%del_ph
+    if (t_dica == t_dic .and. t_alka == t_alk .and. pha == ph0) then
+      ! identical inputs and bracket: the alternative-CO2 solve would repeat
+      ! the base one exactly, so reuse its results (half the kernel's work
+      ! when ALT_CO2 runs the same forcing, as in MiniPac)
+      pha = ph; h2co3a = h2co3; hco3a = hco3; co3a = co3; ierr2 = ierr
     else
-      phlo = PR%phlo_3d_init; phhi = PR%phhi_3d_init
+      if (pha /= c0) then
+        phlo = pha - PR%del_ph; phhi = pha + PR%del_ph
+      else
+        phlo = PR%phlo_3d_init; phhi = PR%phhi_3d_init
+      endif
+      call co2calc_interior1(t_dica, t_alka, t_po4, t_sio3, PR%mass_to_vol, &
+           k1, k2, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, pha, h2co3a, hco3a, co3a, ierr2)
     endif
-    call co2calc_interior1(t_dica, t_alka, t_po4, t_sio3, PR%mass_to_vol, &
-         k1, k2, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, pha, h2co3a, hco3a, co3a, ierr2)
     call co3_sat1(tins, salt, press, PR%mass_to_vol, csat, asat)
     it_ph(i, j, kk) = ph
     it_pha(i, j, kk) = pha

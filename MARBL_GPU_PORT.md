@@ -113,6 +113,47 @@ same per-tracer cost as the T/S path; MARBL's K2 (255 registers) costs
 ~100 ms per hourly call; the per-step passive boundary fills are small
 (kernels < 1 ms, `set_bry` 1.7 ms) and not worth moving.
 
+Second round (2026-10-05, evening), all checked bit-identical on the 3-day
+run unless noted:
+
+- Exit hang fixed: with `wrt_file_his = .false.` the I/O rank was never
+  told to quit (`io_finalize` returned early when nothing had been staged)
+  and the run hung after its last step.
+- Alternative-CO2 carbonate solve skipped when its inputs and bracket equal
+  the base solve's (true wherever ALT_CO2 runs the same forcing, as in
+  MiniPac): carbonate kernel 18.5 -> 13.7 ms per call, surface flux
+  0.53 -> 0.37 ms. Interior kernel per-thread arrays sized to the 32
+  tracers in use (NTRMAX 64 -> 32): 96.9 -> 92.7 ms. Hourly MARBL call
+  117 -> 107 ms.
+- Tried and reverted: fusing the horizontal C4/UP3 step into the passive
+  column kernel (bit-identical, but 165-180 ms per call against 50 + 40 ms
+  for the separate kernels; a per-column kernel cannot hide the latency of
+  the eight neighbour loads per level that the 3-D kernel hides with 100x
+  more threads). Source kept as `passive*.F90.hfuse_slow`.
+- Measured and declined: float32 storage for the passives
+  (build without `-DPASSIVE_FP64`): passive kernels 210 -> 206 ms per
+  step, mean step 0.441 -> 0.429 s, device memory 27.5 -> 19.2 GB. The
+  transport kernels are not bandwidth-bound; their cost is instruction
+  issue and latency. Science of the float32 run (`minipac_gpu_marbl3df32`,
+  `MARBL_NOISE_FLOOR_3D_2026-10-05.txt`): all 32 tracers stay inside the
+  CPU noise floor (worst ratio 1.04, as FP64; float32 vs FP64 GPU
+  differences 1e-7 to 3e-6 relative at hour 72), but the saturation-depth
+  diagnostics break: zsatcalc/zsatarag RMS differences 2,000-4,000 times
+  the twin's, because the root of CO3 - CO3_sat at depth flips level under
+  float32 rounding of DIC/ALK. FP64 storage is kept (decision 2026-10-05).
+- Not done: splitting the interior kernel into light / pointwise
+  physiology / particle-recurrence kernels. The level routine is a strict
+  per-level chain (PAR feeds the physiology, Fe scavenging depends on the
+  particle state and feeds it back, remineralisation feeds denitrification,
+  ligands, O2 and the tendencies), so a split needs three kernels and ~40
+  intermediate 3-D fields for an estimated ~25 ms per hourly call (< 2% of
+  a step), with loss of bit-identity.
+
+Where the remaining time goes (per plain step, 0.367 s on the GPU
+timeline): passive kernels 206-210 ms, dycore + T/S 153 ms spread over
+~1,700 launches with no kernel above 6 ms, GPU idle 4 ms; the hourly MARBL
+call adds 107 ms; a history record adds 70-100 ms.
+
 Pitfalls met: nvfortran inlined the explicit `<<<>>>` launch into
 `passive_predictor` and the host segfaulted in `cuLaunchKernel`
 (compute-sanitizer clean); keeping the kernel + launcher in their own

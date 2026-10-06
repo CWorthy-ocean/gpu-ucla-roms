@@ -52,6 +52,7 @@ module io_server
   type(rec_t) :: pend(NSET)
   integer :: cur = 0                 ! set being filled
   integer :: hcap = 0, dcap = 0
+  logical :: quit_sent = .false.   ! CMD_QUIT sent to the I/O rank (io_finalize may run twice)
 #ifdef USE_CUDA
   real(4), pinned, allocatable :: hpin1(:), hpin2(:)
   real(4), device, allocatable :: dstage(:)
@@ -310,13 +311,16 @@ contains
 #ifdef USE_MPI
     integer :: hdr(NHDR), ierr
 #endif
-    if (hcap == 0) return
-    call io_flush()
+    ! The I/O rank waits for commands from start-up, so it must be told to
+    ! quit even when no history was ever staged (hcap == 0); otherwise the
+    ! run hangs at exit with wrt_file_his = .false.
+    if (hcap > 0) call io_flush()
 #ifdef USE_MPI
-    if (have_io_server() .and. .not. is_io_rank()) then
+    if (have_io_server() .and. .not. is_io_rank() .and. .not. quit_sent) then
       hdr = 0
       hdr(1) = CMD_QUIT
       call MPI_Send(hdr, NHDR, MPI_INTEGER, io_server_rank(), TAG_CMD, comm_world(), ierr)
+      quit_sent = .true.
     endif
 #endif
     hcap = 0
