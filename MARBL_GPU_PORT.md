@@ -180,6 +180,23 @@ With one tracer per thread the horizontal kernels did not change at all
 per-cell face arithmetic itself (four C4 faces with a division each, or
 the UP3 faces), which bit-identity forbids reducing algebraically.
 
+Dycore round (2026-10-06): kernel fusion, all bit-identical on the 3-day
+run. Tracer lateral diffusion: the two flux temporaries and the divergence
+kernel became one kernel per tracer with the faces inline (5.1 -> 3.3 ms
+per step). Horizontal pressure gradient: per direction, the face
+differences, the two edge-copy kernels, the harmonic averages and the
+update became one kernel, with the edge copies folded into index clamps
+(14.8 -> 6.1 ms). Horizontal momentum right-hand side: the Coriolis/
+curvature term, the four flux families (curvature temporaries with edge
+copies, then faces) and the divergence became one kernel per component
+(15.0 -> 9.8 ms; 21 launches per call -> 1). The same per-point expressions
+in the same accumulation order make these bit-identical; the price is that
+each face is evaluated by both neighbouring cells, which here costs less
+than writing and re-reading the temporaries. Dycore 152.7 -> 134.6 ms per
+step, 3-day mean step 0.402 -> 0.389 s. Not pursued: raising the occupancy
+of the column kernels above 128 registers (vertical momentum advection,
+KPP, momentum corrector) by block-size caps; at most ~2 ms at stake.
+
 Where the remaining time goes (per plain step, 0.351 s on the GPU
 timeline after the layout change; the numbers below are from before it): passive kernels 206-210 ms, dycore + T/S 153 ms spread over
 ~1,700 launches with no kernel above 6 ms, GPU idle 4 ms; the hourly MARBL

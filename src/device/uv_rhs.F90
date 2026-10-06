@@ -372,6 +372,9 @@ contains
     integer(ip) :: j_ue_lo, j_ue_hi, i_vx_lo, i_vx_hi, j_v0, j_v1
     logical :: edge_w, edge_e, edge_s, edge_n, up
     real(rp) :: cff, fomn
+    integer(ip) :: ii, jj
+    real(rp) :: c_0, c_m, rr, uxm, ux0, uxp, fxm, fx0, fxp, uem, ue0, uep, fvm_j, fv0_j, fvm_jp, fv0_jp
+    real(rp) :: fa_m, fa_0, fb_0, fb_p
 
     nx = decomp%nx
     ny = decomp%ny
@@ -394,43 +397,8 @@ contains
     j_v1 = ny + 1
     if (edge_n) j_v1 = ny
 
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = 0, ny
-        do i = 0, nx
-          fomn = f(i, j) / max(pm(i, j) * pn(i, j), 1.0e-30_rp)
-          cff = 0.5_rp * Hz(i, j, kk) * (fomn + 0.5_rp * ( &
-               (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs)) * dndx(i, j) - &
-               (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs)) * dmde(i, j)))
-          wrk3a(i, j, kk) = cff * (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs))
-          wrk3d(i, j, kk) = cff * (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs))
-        enddo
-      enddo
-    enddo
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = 1, ny
-        do i = i_u0, i_u1
-          ru(i, j, kk) = ru(i, j, kk) + 0.5_rp * (wrk3a(i, j, kk) + wrk3a(i - 1, j, kk))
-        enddo
-      enddo
-    enddo
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = j_v0, j_v1
-        do i = 1, nx
-          rv(i, j, kk) = rv(i, j, kk) - 0.5_rp * (wrk3d(i, j, kk) + wrk3d(i, j - 1, kk))
-        enddo
-      enddo
-    enddo
-
-    ! CPU: imin=istrU on the west edge, then uxx(istrU-1)=uxx(istrU).
+    ! Curvature ranges of the former wrk3e/wrk3f temporaries; the edge copies
+    ! (uxx(istrU-1) = uxx(istrU) etc.) become index clamps below.
     if (edge_w) then
       i_ux_lo = i_u0
     else
@@ -441,59 +409,6 @@ contains
     else
       i_ux_hi = nx + 1
     endif
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = 1, ny
-        do i = i_ux_lo, i_ux_hi
-          wrk3e(i, j, kk) = u(i - 1, j, kk, n_rhs) - 2.0_rp * u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs)
-          wrk3f(i, j, kk) = FlxU(i - 1, j, kk) - 2.0_rp * FlxU(i, j, kk) + FlxU(i + 1, j, kk)
-        enddo
-      enddo
-    enddo
-    if (edge_w) then
-#ifdef USE_CUDA
-      !$cuf kernel do(2) <<<*,*>>>
-#endif
-      do kk = 1, nz
-        do j = 1, ny
-          wrk3e(i_ufx_lo, j, kk) = wrk3e(i_u0, j, kk)
-          wrk3f(i_ufx_lo, j, kk) = wrk3f(i_u0, j, kk)
-        enddo
-      enddo
-    endif
-    if (edge_e) then
-#ifdef USE_CUDA
-      !$cuf kernel do(2) <<<*,*>>>
-#endif
-      do kk = 1, nz
-        do j = 1, ny
-          wrk3e(nx + 1, j, kk) = wrk3e(nx, j, kk)
-          wrk3f(nx + 1, j, kk) = wrk3f(nx, j, kk)
-        enddo
-      enddo
-    endif
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = 1, ny
-        do i = i_ufx_lo, i_u1
-          if (up) then
-            wrk3a(i, j, kk) = upstream_uv_face(u(i, j, kk, n_rhs), u(i + 1, j, kk, n_rhs), &
-               wrk3e(i, j, kk), wrk3e(i + 1, j, kk), wrk3f(i, j, kk), wrk3f(i + 1, j, kk), &
-               FlxU(i, j, kk), FlxU(i + 1, j, kk))
-          else
-            wrk3a(i, j, kk) = centered_uv_face(u(i, j, kk, n_rhs), u(i + 1, j, kk, n_rhs), &
-               wrk3e(i, j, kk), wrk3e(i + 1, j, kk), wrk3f(i, j, kk), wrk3f(i + 1, j, kk), &
-               FlxU(i, j, kk), FlxU(i + 1, j, kk))
-          endif
-        enddo
-      enddo
-    enddo
-
-    ! CPU: jmin=jstrV on south (then vee(jstrV-1)=vee(jstrV)), jmax=jend on north.
     if (edge_s) then
       j_ve_lo = j_v0
     else
@@ -504,58 +419,6 @@ contains
     else
       j_ve_hi = ny + 1
     endif
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = j_ve_lo, j_ve_hi
-        do i = 1, nx
-          wrk3e(i, j, kk) = v(i, j - 1, kk, n_rhs) - 2.0_rp * v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs)
-          wrk3f(i, j, kk) = FlxV(i, j - 1, kk) - 2.0_rp * FlxV(i, j, kk) + FlxV(i, j + 1, kk)
-        enddo
-      enddo
-    enddo
-    if (edge_s) then
-#ifdef USE_CUDA
-      !$cuf kernel do(2) <<<*,*>>>
-#endif
-      do kk = 1, nz
-        do i = 1, nx
-          wrk3e(i, j_v0 - 1, kk) = wrk3e(i, j_v0, kk)
-          wrk3f(i, j_v0 - 1, kk) = wrk3f(i, j_v0, kk)
-        enddo
-      enddo
-    endif
-    if (edge_n) then
-#ifdef USE_CUDA
-      !$cuf kernel do(2) <<<*,*>>>
-#endif
-      do kk = 1, nz
-        do i = 1, nx
-          wrk3e(i, ny + 1, kk) = wrk3e(i, ny, kk)
-          wrk3f(i, ny + 1, kk) = wrk3f(i, ny, kk)
-        enddo
-      enddo
-    endif
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = j_v0 - 1, j_v1
-        do i = 1, nx
-          if (up) then
-            wrk3d(i, j, kk) = upstream_uv_face(v(i, j, kk, n_rhs), v(i, j + 1, kk, n_rhs), &
-               wrk3e(i, j, kk), wrk3e(i, j + 1, kk), wrk3f(i, j, kk), wrk3f(i, j + 1, kk), &
-               FlxV(i, j, kk), FlxV(i, j + 1, kk))
-          else
-            wrk3d(i, j, kk) = centered_uv_face(v(i, j, kk, n_rhs), v(i, j + 1, kk, n_rhs), &
-               wrk3e(i, j, kk), wrk3e(i, j + 1, kk), wrk3f(i, j, kk), wrk3f(i, j + 1, kk), &
-               FlxV(i, j, kk), FlxV(i, j + 1, kk))
-          endif
-        enddo
-      enddo
-    enddo
-
     if (edge_s) then
       j_ue_lo = 1
     else
@@ -566,65 +429,6 @@ contains
     else
       j_ue_hi = ny + 1
     endif
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = j_ue_lo, j_ue_hi
-        do i = i_u0, i_u1
-          wrk3e(i, j, kk) = u(i, j - 1, kk, n_rhs) - 2.0_rp * u(i, j, kk, n_rhs) + u(i, j + 1, kk, n_rhs)
-        enddo
-      enddo
-    enddo
-    if (edge_s) then
-#ifdef USE_CUDA
-      !$cuf kernel do(2) <<<*,*>>>
-#endif
-      do kk = 1, nz
-        do i = i_u0, i_u1
-          wrk3e(i, 0, kk) = wrk3e(i, 1, kk)
-        enddo
-      enddo
-    endif
-    if (edge_n) then
-#ifdef USE_CUDA
-      !$cuf kernel do(2) <<<*,*>>>
-#endif
-      do kk = 1, nz
-        do i = i_u0, i_u1
-          wrk3e(i, ny + 1, kk) = wrk3e(i, ny, kk)
-        enddo
-      enddo
-    endif
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = 1, ny + 1
-        do i = 0, nx
-          wrk3f(i, j, kk) = FlxV(i - 1, j, kk) - 2.0_rp * FlxV(i, j, kk) + FlxV(i + 1, j, kk)
-        enddo
-      enddo
-    enddo
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = 1, ny + 1
-        do i = i_u0, i_u1
-          if (up) then
-            wrk3b(i, j, kk) = upstream_uv_face(u(i, j - 1, kk, n_rhs), u(i, j, kk, n_rhs), &
-               wrk3e(i, j - 1, kk), wrk3e(i, j, kk), wrk3f(i - 1, j, kk), wrk3f(i, j, kk), &
-               FlxV(i, j, kk), FlxV(i - 1, j, kk))
-          else
-            wrk3b(i, j, kk) = centered_uv_face(u(i, j - 1, kk, n_rhs), u(i, j, kk, n_rhs), &
-               wrk3e(i, j - 1, kk), wrk3e(i, j, kk), wrk3f(i - 1, j, kk), wrk3f(i, j, kk), &
-               FlxV(i, j, kk), FlxV(i - 1, j, kk))
-          endif
-        enddo
-      enddo
-    enddo
-
     if (edge_w) then
       i_vx_lo = 1
     else
@@ -635,82 +439,138 @@ contains
     else
       i_vx_hi = nx + 1
     endif
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = j_v0, j_v1
-        do i = i_vx_lo, i_vx_hi
-          wrk3e(i, j, kk) = v(i - 1, j, kk, n_rhs) - 2.0_rp * v(i, j, kk, n_rhs) + v(i + 1, j, kk, n_rhs)
-        enddo
-      enddo
-    enddo
-    if (edge_w) then
-#ifdef USE_CUDA
-      !$cuf kernel do(2) <<<*,*>>>
-#endif
-      do kk = 1, nz
-        do j = j_v0, j_v1
-          wrk3e(0, j, kk) = wrk3e(1, j, kk)
-        enddo
-      enddo
-    endif
-    if (edge_e) then
-#ifdef USE_CUDA
-      !$cuf kernel do(2) <<<*,*>>>
-#endif
-      do kk = 1, nz
-        do j = j_v0, j_v1
-          wrk3e(nx + 1, j, kk) = wrk3e(nx, j, kk)
-        enddo
-      enddo
-    endif
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = j_v0 - 1, j_v1
-        do i = 1, nx + 1
-          wrk3f(i, j, kk) = FlxU(i, j - 1, kk) - 2.0_rp * FlxU(i, j, kk) + FlxU(i, j + 1, kk)
-        enddo
-      enddo
-    enddo
-#ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
-#endif
-    do kk = 1, nz
-      do j = j_v0, j_v1
-        do i = 1, nx + 1
-          if (up) then
-            wrk3c(i, j, kk) = upstream_uv_face(v(i - 1, j, kk, n_rhs), v(i, j, kk, n_rhs), &
-               wrk3e(i - 1, j, kk), wrk3e(i, j, kk), wrk3f(i, j - 1, kk), wrk3f(i, j, kk), &
-               FlxU(i, j, kk), FlxU(i, j - 1, kk))
-          else
-            wrk3c(i, j, kk) = centered_uv_face(v(i - 1, j, kk, n_rhs), v(i, j, kk, n_rhs), &
-               wrk3e(i - 1, j, kk), wrk3e(i, j, kk), wrk3f(i, j - 1, kk), wrk3f(i, j, kk), &
-               FlxU(i, j, kk), FlxU(i, j - 1, kk))
-          endif
-        enddo
-      enddo
-    enddo
-
+    ! ---- ru: one kernel. Per point: the Coriolis/curvature term of the two
+    ! neighbouring rho points, the u-by-FlxU faces i-1 and i, the u-by-FlxV
+    ! faces j and j+1, each face the same expression as before (curvatures
+    ! evaluated inline), and the same accumulation order:
+    ! ru + 0.5*(cor_i + cor_im1) - fa_i + fa_im1 - fb_jp1 + fb_j.
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*>>>
 #endif
     do kk = 1, nz
       do j = 1, ny
         do i = i_u0, i_u1
-          ru(i, j, kk) = ru(i, j, kk) - wrk3a(i, j, kk) + wrk3a(i - 1, j, kk) - wrk3b(i, j + 1, kk) + wrk3b(i, j, kk)
+          ! Coriolis / curvature at rho points i and i-1
+          fomn = f(i, j) / max(pm(i, j) * pn(i, j), 1.0e-30_rp)
+          cff = 0.5_rp * Hz(i, j, kk) * (fomn + 0.5_rp * ( &
+               (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs)) * dndx(i, j) - &
+               (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs)) * dmde(i, j)))
+          c_0 = cff * (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs))
+          fomn = f(i - 1, j) / max(pm(i - 1, j) * pn(i - 1, j), 1.0e-30_rp)
+          cff = 0.5_rp * Hz(i - 1, j, kk) * (fomn + 0.5_rp * ( &
+               (v(i - 1, j, kk, n_rhs) + v(i - 1, j + 1, kk, n_rhs)) * dndx(i - 1, j) - &
+               (u(i - 1, j, kk, n_rhs) + u(i, j, kk, n_rhs)) * dmde(i - 1, j)))
+          c_m = cff * (v(i - 1, j, kk, n_rhs) + v(i - 1, j + 1, kk, n_rhs))
+          rr = ru(i, j, kk) + 0.5_rp * (c_0 + c_m)
+          ! u-by-FlxU faces i-1 and i: curvatures at i-1, i, i+1 (clamped at open edges)
+          ii = max(i - 1, i_ux_lo)
+          uxm = u(ii - 1, j, kk, n_rhs) - 2.0_rp * u(ii, j, kk, n_rhs) + u(ii + 1, j, kk, n_rhs)
+          fxm = FlxU(ii - 1, j, kk) - 2.0_rp * FlxU(ii, j, kk) + FlxU(ii + 1, j, kk)
+          ii = min(max(i, i_ux_lo), i_ux_hi)
+          ux0 = u(ii - 1, j, kk, n_rhs) - 2.0_rp * u(ii, j, kk, n_rhs) + u(ii + 1, j, kk, n_rhs)
+          fx0 = FlxU(ii - 1, j, kk) - 2.0_rp * FlxU(ii, j, kk) + FlxU(ii + 1, j, kk)
+          ii = min(i + 1, i_ux_hi)
+          uxp = u(ii - 1, j, kk, n_rhs) - 2.0_rp * u(ii, j, kk, n_rhs) + u(ii + 1, j, kk, n_rhs)
+          fxp = FlxU(ii - 1, j, kk) - 2.0_rp * FlxU(ii, j, kk) + FlxU(ii + 1, j, kk)
+          if (up) then
+            fa_m = upstream_uv_face(u(i - 1, j, kk, n_rhs), u(i, j, kk, n_rhs), uxm, ux0, fxm, fx0, &
+                                    FlxU(i - 1, j, kk), FlxU(i, j, kk))
+            fa_0 = upstream_uv_face(u(i, j, kk, n_rhs), u(i + 1, j, kk, n_rhs), ux0, uxp, fx0, fxp, &
+                                    FlxU(i, j, kk), FlxU(i + 1, j, kk))
+          else
+            fa_m = centered_uv_face(u(i - 1, j, kk, n_rhs), u(i, j, kk, n_rhs), uxm, ux0, fxm, fx0, &
+                                    FlxU(i - 1, j, kk), FlxU(i, j, kk))
+            fa_0 = centered_uv_face(u(i, j, kk, n_rhs), u(i + 1, j, kk, n_rhs), ux0, uxp, fx0, fxp, &
+                                    FlxU(i, j, kk), FlxU(i + 1, j, kk))
+          endif
+          ! u-by-FlxV faces j and j+1: uee at j-1, j, j+1 (clamped), FlxV curvature in x at i-1 and i
+          jj = max(j - 1, j_ue_lo)
+          uem = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
+          jj = j
+          ue0 = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
+          jj = min(j + 1, j_ue_hi)
+          uep = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
+          fvm_j = FlxV(i - 2, j, kk) - 2.0_rp * FlxV(i - 1, j, kk) + FlxV(i, j, kk)
+          fv0_j = FlxV(i - 1, j, kk) - 2.0_rp * FlxV(i, j, kk) + FlxV(i + 1, j, kk)
+          fvm_jp = FlxV(i - 2, j + 1, kk) - 2.0_rp * FlxV(i - 1, j + 1, kk) + FlxV(i, j + 1, kk)
+          fv0_jp = FlxV(i - 1, j + 1, kk) - 2.0_rp * FlxV(i, j + 1, kk) + FlxV(i + 1, j + 1, kk)
+          if (up) then
+            fb_0 = upstream_uv_face(u(i, j - 1, kk, n_rhs), u(i, j, kk, n_rhs), uem, ue0, fvm_j, fv0_j, &
+                                    FlxV(i, j, kk), FlxV(i - 1, j, kk))
+            fb_p = upstream_uv_face(u(i, j, kk, n_rhs), u(i, j + 1, kk, n_rhs), ue0, uep, fvm_jp, fv0_jp, &
+                                    FlxV(i, j + 1, kk), FlxV(i - 1, j + 1, kk))
+          else
+            fb_0 = centered_uv_face(u(i, j - 1, kk, n_rhs), u(i, j, kk, n_rhs), uem, ue0, fvm_j, fv0_j, &
+                                    FlxV(i, j, kk), FlxV(i - 1, j, kk))
+            fb_p = centered_uv_face(u(i, j, kk, n_rhs), u(i, j + 1, kk, n_rhs), ue0, uep, fvm_jp, fv0_jp, &
+                                    FlxV(i, j + 1, kk), FlxV(i - 1, j + 1, kk))
+          endif
+          ru(i, j, kk) = rr - fa_0 + fa_m - fb_p + fb_0
         enddo
       enddo
     enddo
+    ! ---- rv: rv - 0.5*(cor_j + cor_jm1) - fc_ip1 + fc_i - fd_j + fd_jm1
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*>>>
 #endif
     do kk = 1, nz
       do j = j_v0, j_v1
         do i = 1, nx
-          rv(i, j, kk) = rv(i, j, kk) - wrk3c(i + 1, j, kk) + wrk3c(i, j, kk) - wrk3d(i, j, kk) + wrk3d(i, j - 1, kk)
+          fomn = f(i, j) / max(pm(i, j) * pn(i, j), 1.0e-30_rp)
+          cff = 0.5_rp * Hz(i, j, kk) * (fomn + 0.5_rp * ( &
+               (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs)) * dndx(i, j) - &
+               (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs)) * dmde(i, j)))
+          c_0 = cff * (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs))
+          fomn = f(i, j - 1) / max(pm(i, j - 1) * pn(i, j - 1), 1.0e-30_rp)
+          cff = 0.5_rp * Hz(i, j - 1, kk) * (fomn + 0.5_rp * ( &
+               (v(i, j - 1, kk, n_rhs) + v(i, j, kk, n_rhs)) * dndx(i, j - 1) - &
+               (u(i, j - 1, kk, n_rhs) + u(i + 1, j - 1, kk, n_rhs)) * dmde(i, j - 1)))
+          c_m = cff * (u(i, j - 1, kk, n_rhs) + u(i + 1, j - 1, kk, n_rhs))
+          rr = rv(i, j, kk) - 0.5_rp * (c_0 + c_m)
+          ! v-by-FlxV faces j-1 and j: vee and FlxV curvature at j-1, j, j+1 (both clamped)
+          jj = max(j - 1, j_ve_lo)
+          uxm = v(i, jj - 1, kk, n_rhs) - 2.0_rp * v(i, jj, kk, n_rhs) + v(i, jj + 1, kk, n_rhs)
+          fxm = FlxV(i, jj - 1, kk) - 2.0_rp * FlxV(i, jj, kk) + FlxV(i, jj + 1, kk)
+          jj = min(max(j, j_ve_lo), j_ve_hi)
+          ux0 = v(i, jj - 1, kk, n_rhs) - 2.0_rp * v(i, jj, kk, n_rhs) + v(i, jj + 1, kk, n_rhs)
+          fx0 = FlxV(i, jj - 1, kk) - 2.0_rp * FlxV(i, jj, kk) + FlxV(i, jj + 1, kk)
+          jj = min(j + 1, j_ve_hi)
+          uxp = v(i, jj - 1, kk, n_rhs) - 2.0_rp * v(i, jj, kk, n_rhs) + v(i, jj + 1, kk, n_rhs)
+          fxp = FlxV(i, jj - 1, kk) - 2.0_rp * FlxV(i, jj, kk) + FlxV(i, jj + 1, kk)
+          if (up) then
+            fa_m = upstream_uv_face(v(i, j - 1, kk, n_rhs), v(i, j, kk, n_rhs), uxm, ux0, fxm, fx0, &
+                                    FlxV(i, j - 1, kk), FlxV(i, j, kk))
+            fa_0 = upstream_uv_face(v(i, j, kk, n_rhs), v(i, j + 1, kk, n_rhs), ux0, uxp, fx0, fxp, &
+                                    FlxV(i, j, kk), FlxV(i, j + 1, kk))
+          else
+            fa_m = centered_uv_face(v(i, j - 1, kk, n_rhs), v(i, j, kk, n_rhs), uxm, ux0, fxm, fx0, &
+                                    FlxV(i, j - 1, kk), FlxV(i, j, kk))
+            fa_0 = centered_uv_face(v(i, j, kk, n_rhs), v(i, j + 1, kk, n_rhs), ux0, uxp, fx0, fxp, &
+                                    FlxV(i, j, kk), FlxV(i, j + 1, kk))
+          endif
+          ! v-by-FlxU faces i and i+1: vxx at i-1, i, i+1 (clamped), FlxU curvature in y at j-1 and j
+          ii = max(i - 1, i_vx_lo)
+          uem = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
+          ii = i
+          ue0 = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
+          ii = min(i + 1, i_vx_hi)
+          uep = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
+          fvm_j = FlxU(i, j - 2, kk) - 2.0_rp * FlxU(i, j - 1, kk) + FlxU(i, j, kk)
+          fv0_j = FlxU(i, j - 1, kk) - 2.0_rp * FlxU(i, j, kk) + FlxU(i, j + 1, kk)
+          fvm_jp = FlxU(i + 1, j - 2, kk) - 2.0_rp * FlxU(i + 1, j - 1, kk) + FlxU(i + 1, j, kk)
+          fv0_jp = FlxU(i + 1, j - 1, kk) - 2.0_rp * FlxU(i + 1, j, kk) + FlxU(i + 1, j + 1, kk)
+          if (up) then
+            fb_0 = upstream_uv_face(v(i - 1, j, kk, n_rhs), v(i, j, kk, n_rhs), uem, ue0, fvm_j, fv0_j, &
+                                    FlxU(i, j, kk), FlxU(i, j - 1, kk))
+            fb_p = upstream_uv_face(v(i, j, kk, n_rhs), v(i + 1, j, kk, n_rhs), ue0, uep, fvm_jp, fv0_jp, &
+                                    FlxU(i + 1, j, kk), FlxU(i + 1, j - 1, kk))
+          else
+            fb_0 = centered_uv_face(v(i - 1, j, kk, n_rhs), v(i, j, kk, n_rhs), uem, ue0, fvm_j, fv0_j, &
+                                    FlxU(i, j, kk), FlxU(i, j - 1, kk))
+            fb_p = centered_uv_face(v(i, j, kk, n_rhs), v(i + 1, j, kk, n_rhs), ue0, uep, fvm_jp, fv0_jp, &
+                                    FlxU(i + 1, j, kk), FlxU(i + 1, j - 1, kk))
+          endif
+          rv(i, j, kk) = rr - fb_p + fb_0 - fa_0 + fa_m
         enddo
       enddo
     enddo
