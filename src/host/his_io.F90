@@ -212,7 +212,7 @@ contains
     if (wrt_salt) call io_stage_3d('salt', t(is, js, 1, n3, isalt), 1, nz, ir0, ir1, jr0, jr1)
     if (wrt_passive) then
       do itp = 1, ntp
-        call io_stage_3d_p(trim(passive_name(itp)), tp(is, js, 1, n3, itp), 1, nz, ir0, ir1, jr0, jr1)
+        call io_stage_3d_pt(trim(passive_name(itp)), tp(1, is, js, 1, n3), ntp, itp, 1, nz, ir0, ir1, jr0, jr1)
       enddo
     endif
     if (wrt_R)    call io_stage_3d('rho', rho1(is, js, 1), 1, nz, ir0, ir1, jr0, jr1)
@@ -260,7 +260,7 @@ contains
     call put_r3(ncid, 'temp', t(:,:,:,n3,itemp), rec_rst)
     call put_r3(ncid, 'salt', t(:,:,:,n3,isalt), rec_rst)
     do itp = 1, ntp
-      call put_r3_p(ncid, trim(passive_name(itp)), tp(:,:,:,n3,itp), rec_rst)
+      call put_r3_p(ncid, trim(passive_name(itp)), tp(itp,:,:,:,n3), rec_rst)
     enddo
     call put_r2(ncid, 'hbls', hbls, rec_rst)
     call put_r2(ncid, 'hbbl', hbbl, rec_rst)

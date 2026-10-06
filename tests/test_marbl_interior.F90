@@ -35,7 +35,7 @@ program test_marbl_interior
   real(rp), allocatable :: ref_tend(:,:,:), ref_diag(:,:,:), ref_ph(:,:), ref_pha(:,:)
   real(rp), allocatable :: prt_tend(:,:,:), prt_diag(:,:,:), prt_ph(:,:), prt_pha(:,:)
   real(rp), allocatable :: dz(:), zw(:), zt(:), pot(:), sal(:), prs(:), trm(:,:), ph(:), pha(:), tnd(:,:), dgm(:,:)
-  real(pp), WORK_ATTR allocatable :: tr(:,:,:,:,:)
+  real(pp), WORK_ATTR allocatable :: tr(:, :, :, :, :)
   real(rp), WORK_ATTR allocatable :: ts(:,:,:,:,:), mask(:,:), z_r3(:,:,:), z_w3(:,:,:), hz3(:,:,:)
   real(rp) :: qsw, dust, t0, t1, thost, tport, tk1, tk2, ds, s_w, s_r, dtm
   integer :: nerr_host, nerr_port, nerr_gpu
@@ -162,7 +162,7 @@ program test_marbl_interior
   enddo
 
   ! ---- device-side arrays (column n -> local (ii,jj)); kind pp for tracers
-  allocate(tr(is:ie, js:je, nz, 1, ntr), ts(is:ie, js:je, nz, 1, 2), mask(is:ie, js:je))
+  allocate(tr(ntr, is:ie, js:je, nz, 1), ts(is:ie, js:je, nz, 1, 2), mask(is:ie, js:je))
   allocate(z_r3(is:ie, js:je, nz), z_w3(is:ie, js:je, 0:nz), hz3(is:ie, js:je, nz))
   tr = 0.0_pp; ts = 0.0_rp; mask = 0.0_rp; z_r3 = 0.0_rp; z_w3 = 0.0_rp; hz3 = 1.0_rp
   call seed_device()
@@ -312,7 +312,7 @@ contains
       sal(k) = col_s(kk, n)
       prs(k) = -col_zr(kk, n) * 0.1_rp
       do m = 1, ntr
-        trm(m, k) = real(tr(ii, jj, kk, 1, m), rp)
+        trm(m, k) = real(tr(m, ii, jj, kk, 1), rp)
       enddo
       ref_ph(k, n) = col_ph(kk, n); ref_pha(k, n) = col_pha(kk, n)
       prt_ph(k, n) = col_ph(kk, n); prt_pha(k, n) = col_pha(kk, n)
@@ -326,7 +326,7 @@ contains
       ii = mod(n - 1, nside) + 1; jj = (n - 1) / nside + 1
       do k = 1, nz
         do m = 1, ntr
-          tr(ii, jj, k, 1, m) = real(col_tr(m, k, n), pp)
+          tr(m, ii, jj, k, 1) = real(col_tr(m, k, n), pp)
         enddo
         ts(ii, jj, k, 1, itemp) = col_t(k, n)
         ts(ii, jj, k, 1, isalt) = col_s(k, n)

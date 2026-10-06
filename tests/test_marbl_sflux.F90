@@ -25,7 +25,7 @@ program test_marbl_sflux
   integer(ip) :: ntr
   integer, allocatable :: maski(:,:), ci(:), cj(:)
   real(rp), allocatable :: g2(:,:), surf(:,:,:), tsurf(:,:), ssurf(:,:), ph0(:,:), pha0(:,:)
-  real(pp), WORK_ATTR allocatable :: tr(:,:,:,:,:)
+  real(pp), WORK_ATTR allocatable :: tr(:, :, :, :, :)
   real(rp), WORK_ATTR allocatable :: ts(:,:,:,:,:), mask(:,:)
   real(rp), allocatable :: ref_flux(:,:), ref_diag(:,:), ref_ph(:), ref_pha(:), trs(:), fl(:), dg(:)
   real(rp) :: u10, dust, iron, nox, nhy, xco2, ph, pha, t0, t1, thost, tgpu
@@ -49,7 +49,7 @@ program test_marbl_sflux
   call marbl_host_init(100_ip, trim(cfg), .true.)
   ntr = nt_marbl
   call alloc_marbl_sflux(ntr)
-  allocate(tr(is:ie, js:je, 1, 3, ntr), ts(is:ie, js:je, 1, 3, 2), mask(is:ie, js:je))
+  allocate(tr(ntr, is:ie, js:je, 1, 3), ts(is:ie, js:je, 1, 3, 2), mask(is:ie, js:je))
   tr = 0.0_pp; ts = 0.0_rp; mask = 0.0_rp
 
   ! ---- read the restart surface level
@@ -106,7 +106,7 @@ program test_marbl_sflux
     ii = mod(n - 1, nside) + 1; jj = (n - 1) / nside + 1
     i = ci(n); j = cj(n)
     do m = 1, ntr
-      tr(ii, jj, 1, 1, m) = real(surf(i, j, m), pp)
+      tr(m, ii, jj, 1, 1) = real(surf(i, j, m), pp)
     enddo
     ts(ii, jj, 1, 1, itemp) = tsurf(i, j)
     ts(ii, jj, 1, 1, isalt) = ssurf(i, j)
@@ -132,7 +132,7 @@ program test_marbl_sflux
       ii = mod(n - 1, nside) + 1; jj = (n - 1) / nside + 1
       i = ci(n); j = cj(n)
       do m = 1, ntr
-        trs(m) = real(tr(ii, jj, 1, 1, m), rp)     ! exactly what the kernel reads
+        trs(m) = real(tr(m, ii, jj, 1, 1), rp)     ! exactly what the kernel reads
       enddo
       if (scen == 1) then
         ph = ph0(i, j); pha = pha0(i, j)

@@ -174,7 +174,7 @@ contains
       do j = 1, ny
         do i = 1, nx
           if (rmask(i, j) /= 0.0_rp) then
-            tp(i, j, nz, nn, m) = real(real(tp(i, j, nz, nn, m), rp) + &
+            tp(m, i, j, nz, nn) = real(real(tp(m, i, j, nz, nn), rp) + &
                  sf_flux(i, j, m) * dtm / Hz(i, j, nz), pp)
           endif
         enddo
@@ -195,39 +195,6 @@ contains
 
   ! Debug: NaN census of the surface-flux inputs/outputs after the first
   ! call, plus one sample point.
-  subroutine marbl_debug_census(stage)
-    character(len=*), intent(in) :: stage
-    integer(ip) :: nx, ny, nz, i, j, nn, m
-    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; nn = nnew
-    call sync_arch()
-    write(*,*) 'marbl dbg === ', stage, '  nnew=', nn, ' nstp=', nstp
-    do m = 1, ntp
-      write(*,*) 'marbl dbg tracer', m, ' ', trim(passive_name(m)), &
-           '  NaN top(nn)/top(nstp)/all(nn):', count(is_nan(real(tp(1:nx,1:ny,nz,nn,m),rp))), &
-           count(is_nan(real(tp(1:nx,1:ny,nz,nstp,m),rp))), count(is_nan(real(tp(1:nx,1:ny,:,nn,m),rp))), &
-           '  pt(100,100) nz,nz-1 nn / nz nstp:', real(tp(100,100,nz,nn,m),rp), real(tp(100,100,nz-1,nn,m),rp), &
-           real(tp(100,100,nz,nstp,m),rp)
-    enddo
-    write(*,'(a,6i8)') 'marbl dbg NaN counts u10sqr qsw nox nhy dust xco2: ', &
-         count(is_nan(sf_u10sqr(1:nx,1:ny))), count(is_nan(it_qsw(1:nx,1:ny))), count(is_nan(sf_nox(1:nx,1:ny))), &
-         count(is_nan(sf_nhy(1:nx,1:ny))), count(is_nan(sf_dust(1:nx,1:ny))), count(is_nan(sf_xco2(1:nx,1:ny)))
-    write(*,'(a,4i8)') 'marbl dbg NaN counts flux(nh4) flux(no3) flux(alk) diag(nhx): ', &
-         count(is_nan(sf_flux(1:nx,1:ny,msf%nh4))), count(is_nan(sf_flux(1:nx,1:ny,msf%no3))), &
-         count(is_nan(sf_flux(1:nx,1:ny,msf%alk))), count(is_nan(sf_diag(1:nx,1:ny,D_NHX)))
-    write(*,'(a,3i8)') 'marbl dbg NaN counts uwnd vwnd srflx: ', count(is_nan(uwnd(1:nx,1:ny))), &
-         count(is_nan(vwnd(1:nx,1:ny))), count(is_nan(srflx(1:nx,1:ny)))
-    write(*,'(a,2es14.6,a,2es14.6)') 'marbl dbg ranges u10sqr: ', minval(sf_u10sqr(1:nx,1:ny)), maxval(sf_u10sqr(1:nx,1:ny)), &
-         '  nhy: ', minval(sf_nhy(1:nx,1:ny)), maxval(sf_nhy(1:nx,1:ny))
-    do j = 100, 300, 100
-      do i = 100, 400, 150
-        if (rmask(i, j) /= 0.0_rp) then
-          write(*,'(a,2i5,a,*(es13.5))') 'marbl dbg pt', i, j, ' u10sqr sst sss nh4 ph nhx nhy nox fnh4 falk fdic: ', &
-               sf_u10sqr(i,j), t(i,j,nz,nn,itemp), t(i,j,nz,nn,isalt), real(tp(i,j,nz,nn,msf%nh4),rp), sf_ph(i,j), &
-               sf_diag(i,j,D_NHX), sf_nhy(i,j), sf_nox(i,j), sf_flux(i,j,msf%nh4), sf_flux(i,j,msf%alk), sf_flux(i,j,msf%dic)
-        endif
-      enddo
-    enddo
-  end subroutine marbl_debug_census
 
   integer function marbl_gpu_nhis()
     ! number of 2-D MARBL history fields (staging capacity)

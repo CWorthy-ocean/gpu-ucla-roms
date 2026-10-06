@@ -1085,7 +1085,7 @@ contains
   attributes(global) &
   subroutine carb_kernel(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, tr, ts, z_r, mask)
     integer(ip), value :: ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny
-    real(pp), device, intent(in) :: tr(is:ie, js:je, nz, nslot, ntr)
+    real(pp), device, intent(in) :: tr(ntr, is:ie, js:je, nz, nslot)
     real(rp), device, intent(in) :: ts(is:ie, js:je, nz, nslot, nts)
     real(rp), device, intent(in) :: z_r(is:ie, js:je, nz)
     real(rp), device, intent(in) :: mask(is:ie, js:je)
@@ -1105,9 +1105,9 @@ contains
     press = -z_r(i, j, kk) * 0.1_rp
     call potemp_s(salt, potemp, c0, press, tins)
     it_temp(i, j, kk) = tins
-    t_dic = real(tr(i, j, kk, slot, PR%dic), rp); t_alk = real(tr(i, j, kk, slot, PR%alk), rp)
-    t_po4 = real(tr(i, j, kk, slot, PR%po4), rp); t_sio3 = real(tr(i, j, kk, slot, PR%sio3), rp)
-    t_dica = real(tr(i, j, kk, slot, PR%dica), rp); t_alka = real(tr(i, j, kk, slot, PR%alka), rp)
+    t_dic = real(tr(PR%dic, i, j, kk, slot), rp); t_alk = real(tr(PR%alk, i, j, kk, slot), rp)
+    t_po4 = real(tr(PR%po4, i, j, kk, slot), rp); t_sio3 = real(tr(PR%sio3, i, j, kk, slot), rp)
+    t_dica = real(tr(PR%dica, i, j, kk, slot), rp); t_alka = real(tr(PR%alka, i, j, kk, slot), rp)
     ! max(0,.) as in setup_local_tracers
     t_dic = max(c0, t_dic); t_alk = max(c0, t_alk); t_po4 = max(c0, t_po4); t_sio3 = max(c0, t_sio3)
     t_dica = max(c0, t_dica); t_alka = max(c0, t_alka)
@@ -1157,7 +1157,7 @@ contains
                              tr, ts, z_r, z_w, Hz, mask, dust)
     integer(ip), value :: ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, ldg
     real(rp), value :: dtm
-    real(pp), device, intent(inout) :: tr(is:ie, js:je, nz, nslot, ntr)
+    real(pp), device, intent(inout) :: tr(ntr, is:ie, js:je, nz, nslot)
     real(rp), device, intent(in) :: ts(is:ie, js:je, nz, nslot, nts)
     real(rp), device, intent(in) :: z_r(is:ie, js:je, nz), z_w(is:ie, js:je, 0:nz), Hz(is:ie, js:je, nz)
     real(rp), device, intent(in) :: mask(is:ie, js:je), dust(is:ie, js:je)
@@ -1192,12 +1192,12 @@ contains
       tins = it_temp(i, j, kk)
       h2co3 = it_h2co3(i, j, kk); co3 = it_co3(i, j, kk); co3a = it_co3a(i, j, kk); co3sat = it_co3sat(i, j, kk)
       do m = 1, ntr
-        trk(m) = real(tr(i, j, kk, slot, m), rp)
+        trk(m) = real(tr(m, i, j, kk, slot), rp)
       enddo
       call level_step(k, nz, dz, dz1, zw, zt, tins, h2co3, co3, co3a, co3sat, dust_flux, &
                       trk, st, tend, dg, ldg)
       do m = 1, ntr
-        tr(i, j, kk, slot, m) = real(trk(m) + tend(m) * dtm, pp)
+        tr(m, i, j, kk, slot) = real(trk(m) + tend(m) * dtm, pp)
       enddo
       if (ldg /= 0) then
         do m = 1, ntr
@@ -1284,7 +1284,7 @@ contains
   ! Host launchers. tr: MARBL tracers (level kk, slot); ts: T/S array.
   subroutine marbl_carbonate_compute(ntr, nz, slot, nslot, tr, nts, ts, z_r, mask)
     integer(ip), intent(in) :: ntr, nz, slot, nslot, nts
-    real(pp), WORK_ATTR intent(in) :: tr(decomp%is:decomp%ie, decomp%js:decomp%je, nz, nslot, ntr)
+    real(pp), WORK_ATTR intent(in) :: tr(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, nz, nslot)
     real(rp), WORK_ATTR intent(in) :: ts(decomp%is:decomp%ie, decomp%js:decomp%je, nz, nslot, nts)
     real(rp), WORK_ATTR intent(in) :: z_r(decomp%is:decomp%ie, decomp%js:decomp%je, nz)
     real(rp), WORK_ATTR intent(in) :: mask(decomp%is:decomp%ie, decomp%js:decomp%je)
@@ -1304,7 +1304,7 @@ contains
 
   subroutine marbl_interior_compute(ntr, nz, slot, nslot, tr, nts, ts, z_r, z_w, Hz, mask, dust, dtm, keep)
     integer(ip), intent(in) :: ntr, nz, slot, nslot, nts
-    real(pp), WORK_ATTR intent(inout) :: tr(decomp%is:decomp%ie, decomp%js:decomp%je, nz, nslot, ntr)
+    real(pp), WORK_ATTR intent(inout) :: tr(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, nz, nslot)
     real(rp), WORK_ATTR intent(in) :: ts(decomp%is:decomp%ie, decomp%js:decomp%je, nz, nslot, nts)
     real(rp), WORK_ATTR intent(in) :: z_r(decomp%is:decomp%ie, decomp%js:decomp%je, nz)
     real(rp), WORK_ATTR intent(in) :: z_w(decomp%is:decomp%ie, decomp%js:decomp%je, 0:nz)

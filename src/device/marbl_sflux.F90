@@ -538,7 +538,7 @@ contains
     integer(ip), value :: ipo4, ino3, isio3, inh4, ife, io2, idic, idica, ialk, ialka, lo2, lco2, lnhx
     real(rp), value :: xkw_coeff, mass_to_vol, dust_po4_fac, dust_sio3_fac, len2m, cm2len, m2len
     real(rp), value :: del_ph, phlo_init, phhi_init, ifrac, atm_pres
-    real(pp), device, intent(in) :: tr(is:ie, js:je, nz, 3, ntr)
+    real(pp), device, intent(in) :: tr(ntr, is:ie, js:je, nz, 3)
     real(rp), device, intent(in) :: ts(is:ie, js:je, nz, 3, nts)
     real(rp), device, intent(in) :: mask(is:ie, js:je)
     integer(ip) :: i, j, m, ierr
@@ -591,7 +591,7 @@ contains
         call o2sat_1atm(sst, sss, o2s)
         pv_o2 = xkw_ice * sqrt(660.0_rp / sch_o2)
         o2s = atm_pres * o2s
-        flux_o2 = pv_o2 * (o2s - real(tr(i, j, kk, slot, io2), rp))
+        flux_o2 = pv_o2 * (o2s - real(tr(io2, i, j, kk, slot), rp))
         f_o2 = f_o2 + flux_o2
       endif
       if (lco2 /= 0) then
@@ -603,9 +603,9 @@ contains
           phhi = phhi_init
         endif
         call co2_coeffs(sst, sss, c0, nopress, k0, k1, k2, ff, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft)
-        t_dic = real(tr(i, j, kk, slot, idic), rp); t_alk = real(tr(i, j, kk, slot, ialk), rp)
-        t_po4 = real(tr(i, j, kk, slot, ipo4), rp); t_sio3 = real(tr(i, j, kk, slot, isio3), rp)
-        t_dica = real(tr(i, j, kk, slot, idica), rp); t_alka = real(tr(i, j, kk, slot, ialka), rp)
+        t_dic = real(tr(idic, i, j, kk, slot), rp); t_alk = real(tr(ialk, i, j, kk, slot), rp)
+        t_po4 = real(tr(ipo4, i, j, kk, slot), rp); t_sio3 = real(tr(isio3, i, j, kk, slot), rp)
+        t_dica = real(tr(idica, i, j, kk, slot), rp); t_alka = real(tr(ialka, i, j, kk, slot), rp)
         ph0 = ph
         call co2calc_surface1(t_dic, xco2, t_alk, t_po4, t_sio3, atm_pres, mass_to_vol, &
              k1, k2, ff, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, ph, &
@@ -643,7 +643,7 @@ contains
         f_dica = f_dica + flux_alt
       endif
       if (lnhx /= 0) then
-        t_nh4 = real(tr(i, j, kk, slot, inh4), rp)
+        t_nh4 = real(tr(inh4, i, j, kk, slot), rp)
         call nhx_emis1(t_nh4, ph, sst, sss, u10sqr, atm_pres, ifrac, len2m, cm2len, m2len, nhx)
         f_nh4 = f_nh4 - nhx
       endif
@@ -691,7 +691,7 @@ contains
   subroutine marbl_sflux_compute(p, ntr, nz, kk, slot, tr, nts, ts, mask)
     type(marbl_sf_par_t), intent(in) :: p
     integer(ip), intent(in) :: ntr, nz, kk, slot, nts
-    real(pp), WORK_ATTR intent(in) :: tr(decomp%is:decomp%ie, decomp%js:decomp%je, nz, 3, ntr)
+    real(pp), WORK_ATTR intent(in) :: tr(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, nz, 3)
     real(rp), WORK_ATTR intent(in) :: ts(decomp%is:decomp%ie, decomp%js:decomp%je, nz, 3, nts)
     real(rp), WORK_ATTR intent(in) :: mask(decomp%is:decomp%ie, decomp%js:decomp%je)
 #ifdef USE_CUDA

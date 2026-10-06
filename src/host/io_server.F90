@@ -70,7 +70,7 @@ module io_server
   public :: io_stage_begin
   public :: io_stage_2d
   public :: io_stage_3d
-  public :: io_stage_3d_p
+  public :: io_stage_3d_p, io_stage_3d_pt
   public :: io_stage_omega
   public :: io_stage_end
   public :: io_poll
@@ -213,6 +213,30 @@ contains
     enddo
     call copy_to_host(off, ni * nj * nk)
   end subroutine io_stage_3d
+
+  subroutine io_stage_3d_pt(name, a, ntr, itr, k0, k1, i0, i1, j0, j1)
+    ! Tracer itr of a tracer-innermost (ntr, is:ie, js:je, k0:k1) slab;
+    ! a is its first element (sequence association).
+    character(len=*), intent(in) :: name
+    integer, intent(in) :: ntr, itr, k0, k1, i0, i1, j0, j1
+    real(pp), WORK_ATTR intent(in) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, k0:k1)
+    integer :: i, j, k, ni, nj, nk, off
+    ni = i1 - i0 + 1
+    nj = j1 - j0 + 1
+    nk = k1 - k0 + 1
+    call add_var(name, ni, nj, nk, 3, off)
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*,*,0,work_stream>>>
+#endif
+    do k = k0, k1
+      do j = j0, j1
+        do i = i0, i1
+          dstage((k - k0) * ni * nj + (j - j0) * ni + (i - i0) + 1) = real(a(itr, i, j, k), 4)
+        enddo
+      enddo
+    enddo
+    call copy_to_host(off, ni * nj * nk)
+  end subroutine io_stage_3d_pt
 
   subroutine io_stage_3d_p(name, a, k0, k1, i0, i1, j0, j1)
     ! As io_stage_3d for a real(pp) (passive tracer) slab.

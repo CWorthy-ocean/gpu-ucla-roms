@@ -149,8 +149,39 @@ run unless noted:
   intermediate 3-D fields for an estimated ~25 ms per hourly call (< 2% of
   a step), with loss of bit-identity.
 
-Where the remaining time goes (per plain step, 0.367 s on the GPU
-timeline): passive kernels 206-210 ms, dycore + T/S 153 ms spread over
+Third round (2026-10-05, late): tracer-innermost passive layout. `tp` is
+now `(ntp, is:ie, js:je, nz, 3)`, so the tracers of a point are one
+contiguous 256-byte line. The transport kernels (`passive_column.F90`)
+are one thread per (tracer, cell) for the C4 predictor, the UP3 corrector
+and the lateral diffusion, and one thread per (tracer, column) for the
+fused vertical advection + implicit solve; consecutive threads hold
+consecutive tracers, so every tracer load of a warp is one coalesced
+line, and per-thread state is one tracer (80-91 registers, no stack).
+The per-element arithmetic is unchanged and the 3-day run is
+bit-identical to the previous layout (history and restart). The boundary
+kernels loop over the tracer innermost; the MARBL kernels take the
+tracer index first; history staging gathers one tracer from the
+interleaved slab; the restart write and the initial read use array
+sections. Result on the 4-step profile: passive kernels 209 -> 179 ms
+per step (horizontal 2 x 40 -> 2 x 40, column 2 x 50 -> 2 x 36, t3dmix
+27 -> 23), step 367 -> 351 ms; 3-day mean step 0.441 -> 0.402 s. The
+column tests (`tests/test_marbl_*`) were re-mapped to the new layout and
+pass with the same accuracy as before.
+
+Tried and rejected on top of it: shared-memory tile kernels for the
+horizontal steps and the lateral diffusion (a 4 x 4-cell block computes
+each face once into shared memory, 2.5 face evaluations per cell instead
+of 4, bit-identical by construction). Slower: horizontal 2 x 40 -> 2 x 55
+ms, diffusion 23 -> 31 ms; the shared-memory round trip, the block
+synchronisation and the half-empty second face round cost more than the
+repeated face arithmetic. Source kept as `passive_column.F90.tile_slow`.
+With one tracer per thread the horizontal kernels did not change at all
+(2 x 40 ms before and after the layout change), so their cost is the
+per-cell face arithmetic itself (four C4 faces with a division each, or
+the UP3 faces), which bit-identity forbids reducing algebraically.
+
+Where the remaining time goes (per plain step, 0.351 s on the GPU
+timeline after the layout change; the numbers below are from before it): passive kernels 206-210 ms, dycore + T/S 153 ms spread over
 ~1,700 launches with no kernel above 6 ms, GPU idle 4 ms; the hourly MARBL
 call adds 107 ms; a history record adds 70-100 ms.
 

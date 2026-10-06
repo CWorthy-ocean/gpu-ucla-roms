@@ -539,7 +539,7 @@ contains
         do itp = 1, ntp
           if (.not. nc_has_var(ncid, trim(passive_name(itp)))) exit
           call nc_read_3d(ncid, trim(passive_name(itp)), tmp, nxi, neta, decomp%nz, rec)
-          tp(i0:i0+nxi-1, j0:j0+neta-1, :, tindx, itp) = real(tmp, pp)
+          tp(itp, i0:i0+nxi-1, j0:j0+neta-1, :, tindx) = real(tmp, pp)
         enddo
         deallocate(tmp)
         passive_loaded = .true.
