@@ -8,6 +8,7 @@ module his_io
   use time_state
   use nc_io
   use io_server
+  use comm_mod, only: comm_rank, comm_size, compute_barrier
   use passive_mod, only: ntp, tp, wrt_passive, passive_name
   use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
                        marbl_gpu_define_rst, marbl_gpu_write_rst
@@ -39,7 +40,8 @@ module his_io
   logical  :: warned_w = .false.
 
   integer :: ir0, ir1, jr0, jr1, iu0, iu1, jv0, jv1
-  integer :: nxi, neta, nxi_u, neta_v
+  integer :: nxi, neta, nxi_u, neta_v           ! this tile's written extents
+  integer :: gxi, geta, gxi_u, geta_v           ! global file dimensions
 
   public :: read_output_namelist
   public :: set_output_root
@@ -195,7 +197,8 @@ contains
       nfile_his = nfile_his + 1
       rec_his = 0
       call make_fname(output_root, 'his', nfile_his, fname_his)
-      call create_his_file(fname_his)
+      if (comm_rank() == 0) call create_his_file(fname_his)
+      call compute_barrier()       ! the file exists before any tile announces it
       open_path = fname_his
     endif
     rec_his = rec_his + 1
@@ -203,37 +206,37 @@ contains
     is = decomp%is
     js = decomp%js
     call io_stage_begin(IO_KIND_HIS, rec_his, nfile_his, twrite, open_path)
-    if (wrt_Z)  call io_stage_2d('zeta', zeta(is, js, n2), ir0, ir1, jr0, jr1)
-    if (wrt_Ub) call io_stage_2d('ubar', ubar(is, js, n2), iu0, iu1, jr0, jr1)
-    if (wrt_Vb) call io_stage_2d('vbar', vbar(is, js, n2), ir0, ir1, jv0, jv1)
-    if (wrt_U)  call io_stage_3d('u', u(is, js, 1, n3), 1, nz, iu0, iu1, jr0, jr1)
-    if (wrt_V)  call io_stage_3d('v', v(is, js, 1, n3), 1, nz, ir0, ir1, jv0, jv1)
-    if (wrt_temp) call io_stage_3d('temp', t(is, js, 1, n3, itemp), 1, nz, ir0, ir1, jr0, jr1)
-    if (wrt_salt) call io_stage_3d('salt', t(is, js, 1, n3, isalt), 1, nz, ir0, ir1, jr0, jr1)
+    if (wrt_Z)  call io_stage_2d('zeta', zeta(is, js, n2), ir0, ir1, jr0, jr1, ir0, jr0)
+    if (wrt_Ub) call io_stage_2d('ubar', ubar(is, js, n2), iu0, iu1, jr0, jr1, 0, jr0)
+    if (wrt_Vb) call io_stage_2d('vbar', vbar(is, js, n2), ir0, ir1, jv0, jv1, ir0, 0)
+    if (wrt_U)  call io_stage_3d('u', u(is, js, 1, n3), 1, nz, iu0, iu1, jr0, jr1, 0, jr0)
+    if (wrt_V)  call io_stage_3d('v', v(is, js, 1, n3), 1, nz, ir0, ir1, jv0, jv1, ir0, 0)
+    if (wrt_temp) call io_stage_3d('temp', t(is, js, 1, n3, itemp), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+    if (wrt_salt) call io_stage_3d('salt', t(is, js, 1, n3, isalt), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
     if (wrt_passive) then
       do itp = 1, ntp
-        call io_stage_3d_pt(trim(passive_name(itp)), tp(1, is, js, 1, n3), ntp, itp, 1, nz, ir0, ir1, jr0, jr1)
+        call io_stage_3d_pt(trim(passive_name(itp)), tp(1, is, js, 1, n3), ntp, itp, 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
       enddo
     endif
-    if (wrt_R)    call io_stage_3d('rho', rho1(is, js, 1), 1, nz, ir0, ir1, jr0, jr1)
-    if (wrt_O)    call io_stage_omega('omega', ir0, ir1, jr0, jr1)
+    if (wrt_R)    call io_stage_3d('rho', rho1(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+    if (wrt_O)    call io_stage_omega('omega', ir0, ir1, jr0, jr1, ir0, jr0)
     if (wrt_W .and. .not. warned_w) then
       write(*,*) 'wrt_W requested but wvlcty is not ported; skipping w'
       warned_w = .true.
     endif
-    if (wrt_Akv)  call io_stage_3d('Akv', Akv(is, js, 0), 0, nz, ir0, ir1, jr0, jr1)
-    if (wrt_Akt)  call io_stage_3d('Akt', Akt(is, js, 0, itemp), 0, nz, ir0, ir1, jr0, jr1)
-    if (wrt_Aks)  call io_stage_3d('Aks', Akt(is, js, 0, isalt), 0, nz, ir0, ir1, jr0, jr1)
-    if (wrt_Hbls) call io_stage_2d('hbls', hbls(is, js), ir0, ir1, jr0, jr1)
-    if (wrt_Hbbl) call io_stage_2d('hbbl', hbbl(is, js), ir0, ir1, jr0, jr1)
-    if (marbl_on) call marbl_gpu_stage_his(ir0, ir1, jr0, jr1)
+    if (wrt_Akv)  call io_stage_3d('Akv', Akv(is, js, 0), 0, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+    if (wrt_Akt)  call io_stage_3d('Akt', Akt(is, js, 0, itemp), 0, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+    if (wrt_Aks)  call io_stage_3d('Aks', Akt(is, js, 0, isalt), 0, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+    if (wrt_Hbls) call io_stage_2d('hbls', hbls(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
+    if (wrt_Hbbl) call io_stage_2d('hbbl', hbbl(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
+    if (marbl_on) call marbl_gpu_stage_his(ir0, ir1, jr0, jr1, ir0, jr0)
     call io_stage_end()
     write(*,'(a,es14.6,a,i0,a,i0)') 'staged history t = ', twrite, &
          '  rec = ', rec_his, '  file ', nfile_his
   end subroutine wrt_his
 
   subroutine wrt_rst()
-    integer :: ncid, n2, n3, itp
+    integer :: ncid, n2, n3, itp, ir
     real(rp) :: twrite
     if (.not. wrt_file_rst) return
     if (.not. output_ready) call init_output()
@@ -247,9 +250,13 @@ contains
       nfile_rst = nfile_rst + 1
       rec_rst = 0
       call make_fname(output_root, 'rst', nfile_rst, fname_rst)
-      call create_rst_file(fname_rst)
+      if (comm_rank() == 0) call create_rst_file(fname_rst)
+      call compute_barrier()
     endif
     rec_rst = rec_rst + 1
+    ! one tile at a time (a single NetCDF writer), each slab at its global offsets
+    do ir = 0, int(comm_size()) - 1
+    if (ir == comm_rank()) then
     call nc_open_write(fname_rst, ncid)
     call nc_put_1d_rec(ncid, 'ocean_time', twrite, rec_rst)
     call put_r2(ncid, 'zeta', zeta(:,:,n2), rec_rst)
@@ -264,7 +271,7 @@ contains
     enddo
     call put_r2(ncid, 'hbls', hbls, rec_rst)
     call put_r2(ncid, 'hbbl', hbbl, rec_rst)
-    if (marbl_on) call marbl_gpu_write_rst(ncid, rec_rst, ir0, ir1, jr0, jr1)
+    if (marbl_on) call marbl_gpu_write_rst(ncid, rec_rst, ir0, ir1, jr0, jr1, int(decomp%i0) + ir0, int(decomp%j0) + jr0)
     call put_u2(ncid, 'DU_avg1', DU_avg1, rec_rst)
     call put_v2(ncid, 'DV_avg1', DV_avg1, rec_rst)
     call put_u2(ncid, 'DU_avg2', DU_avg2, rec_rst)
@@ -274,7 +281,10 @@ contains
     call put_u2(ncid, 'rufrc', rufrc_bak(:,:,max(nstp,1)), rec_rst)
     call put_v2(ncid, 'rvfrc', rvfrc_bak(:,:,max(nstp,1)), rec_rst)
     call nc_close(ncid)
-    write(*,'(a,es14.6,a,i0,a,i0)') 'wrote restart t = ', twrite, &
+    endif
+    call compute_barrier()
+    enddo
+    if (comm_rank() == 0) write(*,'(a,es14.6,a,i0,a,i0)') 'wrote restart t = ', twrite, &
          '  rec = ', rec_rst, '  file ', nfile_rst
   end subroutine wrt_rst
 
@@ -284,10 +294,10 @@ contains
     call ensure_parent(path)
     call nc_create(trim(path), ncid)
     d_t = nc_def_dim(ncid, 'ocean_time', 0)
-    d_xi = nc_def_dim(ncid, 'xi_rho', nxi)
-    d_eta = nc_def_dim(ncid, 'eta_rho', neta)
-    d_xiu = nc_def_dim(ncid, 'xi_u', nxi_u)
-    d_etav = nc_def_dim(ncid, 'eta_v', neta_v)
+    d_xi = nc_def_dim(ncid, 'xi_rho', gxi)
+    d_eta = nc_def_dim(ncid, 'eta_rho', geta)
+    d_xiu = nc_def_dim(ncid, 'xi_u', gxi_u)
+    d_etav = nc_def_dim(ncid, 'eta_v', geta_v)
     d_s = nc_def_dim(ncid, 's_rho', decomp%nz)
     d_w = nc_def_dim(ncid, 's_w', decomp%nz + 1)
     id = nc_def_var(ncid, 'ocean_time', (/d_t/))
@@ -325,10 +335,10 @@ contains
     call ensure_parent(path)
     call nc_create(trim(path), ncid)
     d_t = nc_def_dim(ncid, 'ocean_time', 0)
-    d_xi = nc_def_dim(ncid, 'xi_rho', nxi)
-    d_eta = nc_def_dim(ncid, 'eta_rho', neta)
-    d_xiu = nc_def_dim(ncid, 'xi_u', nxi_u)
-    d_etav = nc_def_dim(ncid, 'eta_v', neta_v)
+    d_xi = nc_def_dim(ncid, 'xi_rho', gxi)
+    d_eta = nc_def_dim(ncid, 'eta_rho', geta)
+    d_xiu = nc_def_dim(ncid, 'xi_u', gxi_u)
+    d_etav = nc_def_dim(ncid, 'eta_v', geta_v)
     d_s = nc_def_dim(ncid, 's_rho', decomp%nz)
     id = nc_def_var(ncid, 'ocean_time', (/d_t/))
     id = nc_def_var(ncid, 'zeta', (/d_xi, d_eta, d_t/))
@@ -380,24 +390,25 @@ contains
   end subroutine init_staging
 
   subroutine set_write_bounds()
-    if (decomp%periodic_x) then
-      ir0 = 1; ir1 = decomp%nx
-      iu0 = 1; iu1 = decomp%nx
-    else
-      ir0 = 0; ir1 = decomp%nx + 1
-      iu0 = 1; iu1 = decomp%nx + 1
-    endif
-    if (decomp%periodic_y) then
-      jr0 = 1; jr1 = decomp%ny
-      jv0 = 1; jv1 = decomp%ny
-    else
-      jr0 = 0; jr1 = decomp%ny + 1
-      jv0 = 1; jv1 = decomp%ny + 1
-    endif
+    ! Each tile writes the points it owns: its interior, plus the boundary
+    ! row/column at a physical edge. A seam face (u nx+1 / v ny+1) belongs to
+    ! the east/north tile as its point 1. Halo points are never written, so
+    ! arrays that are not exchanged (fast averages, MARBL state and
+    ! diagnostics) stay bit-identical to the single-tile output.
+    ir0 = merge(0, 1, decomp%edge_w); ir1 = merge(decomp%nx + 1, decomp%nx, decomp%edge_e)
+    iu0 = 1;                          iu1 = merge(decomp%nx + 1, decomp%nx, decomp%edge_e)
+    jr0 = merge(0, 1, decomp%edge_s); jr1 = merge(decomp%ny + 1, decomp%ny, decomp%edge_n)
+    jv0 = 1;                          jv1 = merge(decomp%ny + 1, decomp%ny, decomp%edge_n)
     nxi = ir1 - ir0 + 1
     neta = jr1 - jr0 + 1
     nxi_u = iu1 - iu0 + 1
     neta_v = jv1 - jv0 + 1
+    ! file dimensions span the global grid; each tile writes its slab at
+    ! (decomp%i0, decomp%j0), the same offsets for every stagger
+    gxi = merge(int(decomp%gnx), int(decomp%gnx) + 2, decomp%periodic_x)
+    gxi_u = merge(int(decomp%gnx), int(decomp%gnx) + 1, decomp%periodic_x)
+    geta = merge(int(decomp%gny), int(decomp%gny) + 2, decomp%periodic_y)
+    geta_v = merge(int(decomp%gny), int(decomp%gny) + 1, decomp%periodic_y)
   end subroutine set_write_bounds
 
   subroutine put_r2(ncid, name, src, rec)
@@ -407,7 +418,7 @@ contains
     real(rp), allocatable :: tmp(:,:)
     allocate(tmp(nxi, neta))
     tmp = src(ir0:ir1, jr0:jr1)
-    call nc_put_2d_rec(ncid, name, tmp, rec)
+    call nc_put_2d_rec(ncid, name, tmp, rec, int(decomp%i0) + ir0, int(decomp%j0) + jr0)
     deallocate(tmp)
   end subroutine put_r2
 
@@ -418,7 +429,7 @@ contains
     real(rp), allocatable :: tmp(:,:)
     allocate(tmp(nxi_u, neta))
     tmp = src(iu0:iu1, jr0:jr1)
-    call nc_put_2d_rec(ncid, name, tmp, rec)
+    call nc_put_2d_rec(ncid, name, tmp, rec, int(decomp%i0), int(decomp%j0) + jr0)
     deallocate(tmp)
   end subroutine put_u2
 
@@ -429,7 +440,7 @@ contains
     real(rp), allocatable :: tmp(:,:)
     allocate(tmp(nxi, neta_v))
     tmp = src(ir0:ir1, jv0:jv1)
-    call nc_put_2d_rec(ncid, name, tmp, rec)
+    call nc_put_2d_rec(ncid, name, tmp, rec, int(decomp%i0) + ir0, int(decomp%j0))
     deallocate(tmp)
   end subroutine put_v2
 
@@ -440,7 +451,7 @@ contains
     real(rp), allocatable :: tmp(:,:,:)
     allocate(tmp(nxi, neta, decomp%nz))
     tmp = src(ir0:ir1, jr0:jr1, 1:decomp%nz)
-    call nc_put_3d_rec(ncid, name, tmp, rec)
+    call nc_put_3d_rec(ncid, name, tmp, rec, int(decomp%i0) + ir0, int(decomp%j0) + jr0)
     deallocate(tmp)
   end subroutine put_r3
 
@@ -455,12 +466,12 @@ contains
     if (pp == rp) then
       allocate(tmp8(nxi, neta, decomp%nz))
       tmp8 = real(src(ir0:ir1, jr0:jr1, 1:decomp%nz), rp)
-      call nc_put_3d_rec(ncid, name, tmp8, rec)
+      call nc_put_3d_rec(ncid, name, tmp8, rec, int(decomp%i0) + ir0, int(decomp%j0) + jr0)
       deallocate(tmp8)
     else
       allocate(tmp(nxi, neta, decomp%nz))
       tmp = real(src(ir0:ir1, jr0:jr1, 1:decomp%nz), 4)
-      call nc_put_3d_rec_f(ncid, name, tmp, nxi, neta, decomp%nz, rec)
+      call nc_put_3d_rec_f(ncid, name, tmp, nxi, neta, decomp%nz, rec, int(decomp%i0) + ir0, int(decomp%j0) + jr0)
       deallocate(tmp)
     endif
   end subroutine put_r3_p
@@ -472,7 +483,7 @@ contains
     real(rp), allocatable :: tmp(:,:,:)
     allocate(tmp(nxi_u, neta, decomp%nz))
     tmp = src(iu0:iu1, jr0:jr1, 1:decomp%nz)
-    call nc_put_3d_rec(ncid, name, tmp, rec)
+    call nc_put_3d_rec(ncid, name, tmp, rec, int(decomp%i0), int(decomp%j0) + jr0)
     deallocate(tmp)
   end subroutine put_u3
 
@@ -483,7 +494,7 @@ contains
     real(rp), allocatable :: tmp(:,:,:)
     allocate(tmp(nxi, neta_v, decomp%nz))
     tmp = src(ir0:ir1, jv0:jv1, 1:decomp%nz)
-    call nc_put_3d_rec(ncid, name, tmp, rec)
+    call nc_put_3d_rec(ncid, name, tmp, rec, int(decomp%i0) + ir0, int(decomp%j0))
     deallocate(tmp)
   end subroutine put_v3
 
@@ -496,7 +507,7 @@ contains
     nz = decomp%nz
     allocate(tmp(nxi, neta, nz + 1))
     tmp = src(ir0:ir1, jr0:jr1, 0:nz)
-    call nc_put_3d_rec(ncid, name, tmp, rec)
+    call nc_put_3d_rec(ncid, name, tmp, rec, int(decomp%i0) + ir0, int(decomp%j0) + jr0)
     deallocate(tmp)
   end subroutine put_rw
 

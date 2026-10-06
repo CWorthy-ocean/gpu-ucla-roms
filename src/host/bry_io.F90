@@ -36,6 +36,7 @@ module bry_io
     character(len=512), allocatable :: paths(:)
     integer, allocatable :: irec(:)
     real(rp), WORK_ATTR allocatable :: buf(:,:)   ! (n,2), managed: read on the device
+    integer :: f0 = 1   ! file start of this tile's sub-range along the edge
   end type series1d
 
   type :: series_z
@@ -48,6 +49,7 @@ module bry_io
     character(len=512), allocatable :: paths(:)
     integer, allocatable :: irec(:)
     real(rp), WORK_ATTR allocatable :: buf(:,:,:) ! (n,nz,2), managed
+    integer :: f0 = 1   ! file start of this tile's sub-range along the edge
   end type series_z
 
   type(series1d) :: ser_zw, ser_ubw, ser_vbw, ser_ze, ser_ube, ser_vbe
@@ -69,18 +71,18 @@ contains
     have_bry = .false.
     obc_west = .false.; obc_east = .false.; obc_south = .false.; obc_north = .false.
     if (case_nfrc < 1) return
-    call bind1(ser_zw, 'zeta_west'); call bind1(ser_ubw, 'ubar_west'); call bind1(ser_vbw, 'vbar_west')
-    call bind1(ser_ze, 'zeta_east'); call bind1(ser_ube, 'ubar_east'); call bind1(ser_vbe, 'vbar_east')
-    call bind1(ser_zs, 'zeta_south'); call bind1(ser_ubs, 'ubar_south'); call bind1(ser_vbs, 'vbar_south')
-    call bind1(ser_zn, 'zeta_north'); call bind1(ser_ubn, 'ubar_north'); call bind1(ser_vbn, 'vbar_north')
-    call bindz(ser_uw, 'u_west'); call bindz(ser_vw, 'v_west')
-    call bindz(ser_tw, 'temp_west'); call bindz(ser_sw, 'salt_west')
-    call bindz(ser_ue, 'u_east'); call bindz(ser_ve, 'v_east')
-    call bindz(ser_te, 'temp_east'); call bindz(ser_se, 'salt_east')
-    call bindz(ser_us, 'u_south'); call bindz(ser_vs, 'v_south')
-    call bindz(ser_ts, 'temp_south'); call bindz(ser_ss, 'salt_south')
-    call bindz(ser_un, 'u_north'); call bindz(ser_vn, 'v_north')
-    call bindz(ser_tn, 'temp_north'); call bindz(ser_sn, 'salt_north')
+    call bind1(ser_zw, 'zeta_west', 'j'); call bind1(ser_ubw, 'ubar_west', 'j'); call bind1(ser_vbw, 'vbar_west', 'j')
+    call bind1(ser_ze, 'zeta_east', 'j'); call bind1(ser_ube, 'ubar_east', 'j'); call bind1(ser_vbe, 'vbar_east', 'j')
+    call bind1(ser_zs, 'zeta_south', 'i'); call bind1(ser_ubs, 'ubar_south', 'i'); call bind1(ser_vbs, 'vbar_south', 'i')
+    call bind1(ser_zn, 'zeta_north', 'i'); call bind1(ser_ubn, 'ubar_north', 'i'); call bind1(ser_vbn, 'vbar_north', 'i')
+    call bindz(ser_uw, 'u_west', 'j'); call bindz(ser_vw, 'v_west', 'j')
+    call bindz(ser_tw, 'temp_west', 'j'); call bindz(ser_sw, 'salt_west', 'j')
+    call bindz(ser_ue, 'u_east', 'j'); call bindz(ser_ve, 'v_east', 'j')
+    call bindz(ser_te, 'temp_east', 'j'); call bindz(ser_se, 'salt_east', 'j')
+    call bindz(ser_us, 'u_south', 'i'); call bindz(ser_vs, 'v_south', 'i')
+    call bindz(ser_ts, 'temp_south', 'i'); call bindz(ser_ss, 'salt_south', 'i')
+    call bindz(ser_un, 'u_north', 'i'); call bindz(ser_vn, 'v_north', 'i')
+    call bindz(ser_tn, 'temp_north', 'i'); call bindz(ser_sn, 'salt_north', 'i')
     obc_west  = ser_zw%ready .or. ser_ubw%ready
     obc_east  = ser_ze%ready .or. ser_ube%ready
     obc_south = ser_zs%ready .or. ser_vbs%ready
@@ -91,10 +93,10 @@ contains
       allocate(ser_tbw(ntp), ser_tbe(ntp), ser_tbs(ntp), ser_tbn(ntp))
       nmiss = 0
       do m = 1, ntp
-        call bindz(ser_tbw(m), trim(passive_name(m))//'_west')
-        call bindz(ser_tbe(m), trim(passive_name(m))//'_east')
-        call bindz(ser_tbs(m), trim(passive_name(m))//'_south')
-        call bindz(ser_tbn(m), trim(passive_name(m))//'_north')
+        call bindz(ser_tbw(m), trim(passive_name(m))//'_west', 'j')
+        call bindz(ser_tbe(m), trim(passive_name(m))//'_east', 'j')
+        call bindz(ser_tbs(m), trim(passive_name(m))//'_south', 'i')
+        call bindz(ser_tbn(m), trim(passive_name(m))//'_north', 'i')
         if (.not. (ser_tbw(m)%ready .or. ser_tbe(m)%ready .or. ser_tbs(m)%ready .or. ser_tbn(m)%ready)) &
              nmiss = nmiss + 1
       enddo
@@ -151,31 +153,53 @@ contains
     call dump_bry_north('after clim', tneed)
   end subroutine set_bry_all
 
-  subroutine bind1(s, vname)
+  subroutine tile_window(axis, n, f0)
+    ! An edge series of global length gn+2 / gn+1 / gn (rho with boundary
+    ! points, u/v, interior rho) is read as this tile's n+2 / n+1 / n points
+    ! starting at the tile's global offset; any other length is left whole.
+    character(len=*), intent(in)    :: axis
+    integer,          intent(inout) :: n
+    integer,          intent(out)   :: f0
+    integer :: g, l, o
+    if (axis == 'j') then
+      g = int(decomp%gny); l = int(decomp%ny); o = int(decomp%j0)
+    else
+      g = int(decomp%gnx); l = int(decomp%nx); o = int(decomp%i0)
+    endif
+    f0 = 1
+    if (n == g + 2 .or. n == g + 1 .or. n == g) then
+      n = n - g + l
+      f0 = o
+    endif
+  end subroutine tile_window
+
+  subroutine bind1(s, vname, axis)
     type(series1d),   intent(inout) :: s
-    character(len=*), intent(in)    :: vname
+    character(len=*), intent(in)    :: vname, axis
     integer :: n1, n2
     s%vname = trim(vname)
     call build_catalog(vname, s%tname, s%times, s%paths, s%irec, s%nrec, n1, n2, s%cycle)
     s%ready = (s%nrec > 0)
     if (.not. s%ready) return
     s%n = n1
-    allocate(s%buf(n1, 2))
+    call tile_window(axis, s%n, s%f0)
+    allocate(s%buf(s%n, 2))
     s%it1 = 1; s%it2 = min(2, s%nrec)
     call read_rec1(s, s%it1, 1)
     call read_rec1(s, s%it2, 2)
   end subroutine bind1
 
-  subroutine bindz(s, vname)
+  subroutine bindz(s, vname, axis)
     type(series_z),   intent(inout) :: s
-    character(len=*), intent(in)    :: vname
+    character(len=*), intent(in)    :: vname, axis
     integer :: n1, n2
     s%vname = trim(vname)
     call build_catalog(vname, s%tname, s%times, s%paths, s%irec, s%nrec, n1, n2, s%cycle)
     s%ready = (s%nrec > 0)
     if (.not. s%ready) return
     s%n = n1; s%nz = n2
-    allocate(s%buf(n1, n2, 2))
+    call tile_window(axis, s%n, s%f0)
+    allocate(s%buf(s%n, n2, 2))
     s%it1 = 1; s%it2 = min(2, s%nrec)
     call read_recz(s, s%it1, 1)
     call read_recz(s, s%it2, 2)
@@ -255,7 +279,7 @@ contains
 #endif
     allocate(tmp(s%n, 1))
     call nc_open_read(s%paths(idx), ncid)
-    call nc_read_2d(ncid, s%vname, tmp, s%n, 1, s%irec(idx))
+    call nc_read_2d(ncid, s%vname, tmp, s%n, 1, s%irec(idx), s%f0, 1)
     call nc_close(ncid)
 #ifdef USE_CUDA
     ierr = cudaMemcpy(s%buf(:,slot), tmp(:,1), s%n, cudaMemcpyHostToDevice)
@@ -276,7 +300,7 @@ contains
 #endif
     allocate(tmp(s%n, s%nz))
     call nc_open_read(s%paths(idx), ncid)
-    call nc_read_2d(ncid, s%vname, tmp, s%n, s%nz, s%irec(idx))
+    call nc_read_2d(ncid, s%vname, tmp, s%n, s%nz, s%irec(idx), s%f0, 1)
     call nc_close(ncid)
 #ifdef USE_CUDA
     ierr = cudaMemcpy(s%buf(:,:,slot), tmp, s%n * s%nz, cudaMemcpyHostToDevice)

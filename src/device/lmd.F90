@@ -117,9 +117,9 @@ contains
     call ensure_wrk3()
     call lmd_rig_3d(tid)
     call pad_phys_edges_3s(col_dc, 1, nz - 1)
-    do k = 1, nz - 1
-      call halo_fill_2d_sw(col_dc, STAGGER_RHO, k)
-    enddo
+    ! One 3-D exchange (levels 0:nz) instead of nz-1 per-level exchanges;
+    ! levels 1:nz-1 receive the same values, levels 0 and nz are not read.
+    call halo_fill_3d_w(col_dc, STAGGER_RHO)
     call smooth_iso_3d_s(col_dc, 1, nz - 1)
 
 #ifdef USE_CUDA

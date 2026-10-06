@@ -35,7 +35,7 @@ module io_server
   integer, parameter :: CMD_OPEN = 1, CMD_PUT = 2, CMD_QUIT = 3
   integer, parameter :: TAG_CMD = 900, TAG_STR = 901, TAG_TIME = 902, TAG_DATA = 910
   integer, parameter :: MAXV = 96, NAMELEN = 16, PATHLEN = 512   ! MARBL: 32 tracers + diagnostics
-  integer, parameter :: NHDR = 8 + 4 * MAXV
+  integer, parameter :: NHDR = 8 + 6 * MAXV
   integer, parameter :: NSET = 2
 
   type rec_t
@@ -45,6 +45,7 @@ module io_server
     character(len=PATHLEN) :: open_path = ''
     character(len=NAMELEN) :: names(MAXV) = ''
     integer :: n1(MAXV) = 0, n2(MAXV) = 0, n3(MAXV) = 0, nrank(MAXV) = 0, off(MAXV) = 0
+    integer :: i0f(MAXV) = 1, j0f(MAXV) = 1   ! file start of this tile's slab (global offsets)
     integer :: nreq = 0
     integer :: reqs(MAXV) = 0
   end type rec_t
@@ -125,10 +126,14 @@ contains
     cur = idx
   end subroutine io_stage_begin
 
-  subroutine add_var(name, n1, n2, n3, nrank, off)
+  subroutine add_var(name, n1, n2, n3, nrank, off, di, dj)
+    ! di, dj: the slab's local start minus the local index that maps to file
+    ! index decomp%i0 / decomp%j0 (0 for a slab starting at rho point 0 or
+    ! u/v point 1; 1 for a rho slab starting at point 1 inside a tiled grid).
     character(len=*), intent(in) :: name
     integer, intent(in) :: n1, n2, n3, nrank
     integer, intent(out) :: off
+    integer, intent(in), optional :: di, dj
     integer :: iv, n
     type(rec_t), pointer :: r
     r => null()
@@ -145,6 +150,10 @@ contains
     pend(cur)%n3(iv) = n3
     pend(cur)%nrank(iv) = nrank
     pend(cur)%off(iv) = off
+    pend(cur)%i0f(iv) = int(decomp%i0)
+    pend(cur)%j0f(iv) = int(decomp%j0)
+    if (present(di)) pend(cur)%i0f(iv) = pend(cur)%i0f(iv) + di
+    if (present(dj)) pend(cur)%j0f(iv) = pend(cur)%j0f(iv) + dj
     pend(cur)%nfloat = pend(cur)%nfloat + n
   end subroutine add_var
 
@@ -171,15 +180,16 @@ contains
 #endif
   end subroutine copy_to_host
 
-  subroutine io_stage_2d(name, a, i0, i1, j0, j1)
+  subroutine io_stage_2d(name, a, i0, i1, j0, j1, di, dj)
     ! a is the first element of a (is:ie, js:je) slab (sequence association).
     character(len=*), intent(in) :: name
     real(rp), WORK_ATTR intent(in) :: a(decomp%is:decomp%ie, decomp%js:decomp%je)
     integer, intent(in) :: i0, i1, j0, j1
+    integer, intent(in), optional :: di, dj
     integer :: i, j, ni, nj, off
     ni = i1 - i0 + 1
     nj = j1 - j0 + 1
-    call add_var(name, ni, nj, 1, 2, off)
+    call add_var(name, ni, nj, 1, 2, off, di, dj)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*,0,work_stream>>>
 #endif
@@ -191,16 +201,17 @@ contains
     call copy_to_host(off, ni * nj)
   end subroutine io_stage_2d
 
-  subroutine io_stage_3d(name, a, k0, k1, i0, i1, j0, j1)
+  subroutine io_stage_3d(name, a, k0, k1, i0, i1, j0, j1, di, dj)
     ! a is the first element of a (is:ie, js:je, k0:k1) slab.
     character(len=*), intent(in) :: name
     integer, intent(in) :: k0, k1, i0, i1, j0, j1
+    integer, intent(in), optional :: di, dj
     real(rp), WORK_ATTR intent(in) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, k0:k1)
     integer :: i, j, k, ni, nj, nk, off
     ni = i1 - i0 + 1
     nj = j1 - j0 + 1
     nk = k1 - k0 + 1
-    call add_var(name, ni, nj, nk, 3, off)
+    call add_var(name, ni, nj, nk, 3, off, di, dj)
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*,0,work_stream>>>
 #endif
@@ -214,17 +225,18 @@ contains
     call copy_to_host(off, ni * nj * nk)
   end subroutine io_stage_3d
 
-  subroutine io_stage_3d_pt(name, a, ntr, itr, k0, k1, i0, i1, j0, j1)
+  subroutine io_stage_3d_pt(name, a, ntr, itr, k0, k1, i0, i1, j0, j1, di, dj)
     ! Tracer itr of a tracer-innermost (ntr, is:ie, js:je, k0:k1) slab;
     ! a is its first element (sequence association).
     character(len=*), intent(in) :: name
     integer, intent(in) :: ntr, itr, k0, k1, i0, i1, j0, j1
+    integer, intent(in), optional :: di, dj
     real(pp), WORK_ATTR intent(in) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, k0:k1)
     integer :: i, j, k, ni, nj, nk, off
     ni = i1 - i0 + 1
     nj = j1 - j0 + 1
     nk = k1 - k0 + 1
-    call add_var(name, ni, nj, nk, 3, off)
+    call add_var(name, ni, nj, nk, 3, off, di, dj)
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*,0,work_stream>>>
 #endif
@@ -238,16 +250,17 @@ contains
     call copy_to_host(off, ni * nj * nk)
   end subroutine io_stage_3d_pt
 
-  subroutine io_stage_3d_p(name, a, k0, k1, i0, i1, j0, j1)
+  subroutine io_stage_3d_p(name, a, k0, k1, i0, i1, j0, j1, di, dj)
     ! As io_stage_3d for a real(pp) (passive tracer) slab.
     character(len=*), intent(in) :: name
     integer, intent(in) :: k0, k1, i0, i1, j0, j1
+    integer, intent(in), optional :: di, dj
     real(pp), WORK_ATTR intent(in) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, k0:k1)
     integer :: i, j, k, ni, nj, nk, off
     ni = i1 - i0 + 1
     nj = j1 - j0 + 1
     nk = k1 - k0 + 1
-    call add_var(name, ni, nj, nk, 3, off)
+    call add_var(name, ni, nj, nk, 3, off, di, dj)
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*,0,work_stream>>>
 #endif
@@ -261,15 +274,16 @@ contains
     call copy_to_host(off, ni * nj * nk)
   end subroutine io_stage_3d_p
 
-  subroutine io_stage_omega(name, i0, i1, j0, j1)
+  subroutine io_stage_omega(name, i0, i1, j0, j1, di, dj)
     ! omega = pm*pn*(We+Wi) on w-levels 0:nz (as the former host put_omega).
     character(len=*), intent(in) :: name
     integer, intent(in) :: i0, i1, j0, j1
+    integer, intent(in), optional :: di, dj
     integer :: i, j, k, ni, nj, nz, off
     ni = i1 - i0 + 1
     nj = j1 - j0 + 1
     nz = decomp%nz
-    call add_var(name, ni, nj, nz + 1, 3, off)
+    call add_var(name, ni, nj, nz + 1, 3, off, di, dj)
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*,0,work_stream>>>
 #endif
@@ -391,11 +405,13 @@ contains
     hdr(4) = r%nvars
     hdr(6) = r%nfile
     do iv = 1, r%nvars
-      b = 8 + 4 * (iv - 1)
+      b = 8 + 6 * (iv - 1)
       hdr(b + 1) = r%n1(iv)
       hdr(b + 2) = r%n2(iv)
       hdr(b + 3) = r%n3(iv)
       hdr(b + 4) = r%nrank(iv)
+      hdr(b + 5) = r%i0f(iv)
+      hdr(b + 6) = r%j0f(iv)
     enddo
   end subroutine pack_hdr
 
@@ -449,9 +465,9 @@ contains
     do iv = 1, r%nvars
       off = r%off(iv)
       if (r%nrank(iv) == 2) then
-        call nc_put_2d_rec_f(ncid, trim(r%names(iv)), buf(off), r%n1(iv), r%n2(iv), r%rec)
+        call nc_put_2d_rec_f(ncid, trim(r%names(iv)), buf(off), r%n1(iv), r%n2(iv), r%rec, r%i0f(iv), r%j0f(iv))
       else
-        call nc_put_3d_rec_f(ncid, trim(r%names(iv)), buf(off), r%n1(iv), r%n2(iv), r%n3(iv), r%rec)
+        call nc_put_3d_rec_f(ncid, trim(r%names(iv)), buf(off), r%n1(iv), r%n2(iv), r%n3(iv), r%rec, r%i0f(iv), r%j0f(iv))
       endif
     enddo
   end subroutine write_record
@@ -487,26 +503,35 @@ contains
   subroutine io_server_run()
     ! I/O rank main loop. Returns after CMD_QUIT.
 #ifdef USE_MPI
-    integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), src, comm, iv, off, n, b, k, ntot
+    integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), src, comm, iv, off, n, b, k, ntot, nquit, ncompute
+    character(len=PATHLEN) :: open_name(2)
     integer :: c0, c1, c2, rate
     character(len=PATHLEN) :: path
     character(len=NAMELEN * MAXV) :: namebuf
     type(rec_t) :: r
-    src = 0                      ! compute root is world rank 0
     comm = comm_world()
+    ncompute = comm_world_size() - 1   ! every compute rank sends its own slabs and its own quit
+    nquit = 0
+    open_name = ''
     write(*,'(a,i0)') 'io_server: ready on world rank ', comm_world_rank()
     flush(6)
     do
-      call MPI_Recv(hdr, NHDR, MPI_INTEGER, src, TAG_CMD, comm, stat, ierr)
+      call MPI_Recv(hdr, NHDR, MPI_INTEGER, MPI_ANY_SOURCE, TAG_CMD, comm, stat, ierr)
       if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv cmd'
+      src = stat(MPI_SOURCE)       ! the rest of this message comes from the same rank
       select case (hdr(1))
       case (CMD_OPEN)
         call MPI_Recv(path, PATHLEN, MPI_CHARACTER, src, TAG_STR, comm, stat, ierr)
         k = hdr(2)
-        if (ncid_open(k) >= 0) call nc_close(ncid_open(k))
-        call nc_open_write(trim(path), ncid_open(k))
-        write(*,'(a,a)') 'io_server: opened ', trim(path)
-        flush(6)
+        if (ncid_open(k) >= 0 .and. trim(path) == trim(open_name(k))) then
+          continue                 ! another tile announcing the file already open
+        else
+          if (ncid_open(k) >= 0) call nc_close(ncid_open(k))
+          call nc_open_write(trim(path), ncid_open(k))
+          open_name(k) = path
+          write(*,'(a,a)') 'io_server: opened ', trim(path)
+          flush(6)
+        endif
       case (CMD_PUT)
         r = rec_t()
         r%fkind = hdr(2)
@@ -517,9 +542,10 @@ contains
         call MPI_Recv(r%time, 1, MPI_DOUBLE_PRECISION, src, TAG_TIME, comm, stat, ierr)
         ntot = 0
         do iv = 1, r%nvars
-          b = 8 + 4 * (iv - 1)
+          b = 8 + 6 * (iv - 1)
           r%n1(iv) = hdr(b + 1); r%n2(iv) = hdr(b + 2); r%n3(iv) = hdr(b + 3)
           r%nrank(iv) = hdr(b + 4)
+          r%i0f(iv) = hdr(b + 5); r%j0f(iv) = hdr(b + 6)
           r%names(iv) = namebuf((iv - 1) * NAMELEN + 1:iv * NAMELEN)
           r%off(iv) = ntot + 1
           ntot = ntot + r%n1(iv) * r%n2(iv) * r%n3(iv)
@@ -547,6 +573,8 @@ contains
         write(*,'(a,f7.2,a,f7.2,a,f7.1,a)') 'io_server:   recv ', real(c1 - c0) / real(rate), &
              ' s  write ', real(c2 - c1) / real(rate), ' s  (', real(ntot) * 4.0 / 2.0**20, ' MB)'
       case (CMD_QUIT)
+        nquit = nquit + 1
+        if (nquit < ncompute) cycle
         do k = 1, 2
           if (ncid_open(k) >= 0) call nc_close(ncid_open(k))
           ncid_open(k) = -1

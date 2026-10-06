@@ -42,7 +42,7 @@ contains
     real(rp), WORK_ATTR intent(in) :: qair(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: prate(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: lwrad(decomp%is:decomp%ie, decomp%js:decomp%je)
-    integer(ip) :: i, j, iter, itermax, nx, ny, nz, is, ie, js, je, n_rhs
+    integer(ip) :: i, j, iter, itermax, nx, ny, nz, is, ie, js, je, n_rhs, i_fb, j_fb
     real(rp) :: rho0i, cpi, TseaC, TseaK, TairC, TairK, Qsea, rhoAir
     real(rp) :: VisAir, Hlv, delW, delT, delQ, u10, Zo10, Cd10, Ch10, Ct10, Cd
     real(rp) :: Ct, CC, Ri, Ribcu, Zetu, L10, Wstar, Tstar, Qstar
@@ -181,12 +181,16 @@ contains
     enddo
 
     ! Surface stress current feedback (the i = nx+1 / j = ny+1 points of the
-    ! CPU loops only computed an unused cff, so the ranges stop at nx / ny).
+    ! CPU loops only computed an unused cff, so the ranges stop at nx / ny at
+    ! a physical edge). Toward a neighbor tile the point is a seam face that
+    ! the neighbor computes as its own i = 1 / j = 1, so it is included there.
+    i_fb = merge(nx, nx + 1, decomp%edge_e)
+    j_fb = merge(ny, ny + 1, decomp%edge_n)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 0, ny + 1
-      do i = 0, nx
+      do i = 0, i_fb
         wspd = sqrt(uwnd(i, j) * uwnd(i, j) + vwnd(i, j) * vwnd(i, j))
         if (wspd > Wspd_min) then
           cff = cfb_slope * wspd + cfb_offset
@@ -208,7 +212,7 @@ contains
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
-    do j = 0, ny
+    do j = 0, j_fb
       do i = 0, nx + 1
         wspd = sqrt(uwnd(i, j) * uwnd(i, j) + vwnd(i, j) * vwnd(i, j))
         if (wspd > Wspd_min) then

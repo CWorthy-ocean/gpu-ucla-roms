@@ -15,7 +15,7 @@ module pre_step3d_mod
   use advect, only: horiz_c4_fluxes, vert_c4_fluxes, dump_horiz_flux_probe, &
                     fuse_tracers, pre_tracers_horiz_fused, pre_tracers_vert_fused
   use uv_rhs
-  use passive_mod, only: ntp, passive_predictor, passive_t3dbc
+  use passive_mod, only: ntp, tp, passive_predictor, passive_t3dbc
   use obc, only: u3dbc, v3dbc, t3dbc
   implicit none
   private
@@ -287,6 +287,7 @@ contains
     call halo_fill_3d_s(v, STAGGER_V, nnew)
     call halo_fill_3d_t(t, STAGGER_RHO, nnew, itemp)
     call halo_fill_3d_t(t, STAGGER_RHO, nnew, isalt)
+    if (ntp > 0) call halo_fill_3d_tp(tp, ntp, nnew)
     call dump_pre_step_t()
   end subroutine pre_step3d
 

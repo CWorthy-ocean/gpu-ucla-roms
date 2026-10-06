@@ -114,28 +114,32 @@ contains
     if (n < 1) n = 1
   end function nc_var_nrecs
 
-  subroutine nc_read_2d(ncid, name, dest, nxi, neta, rec)
-    ! dest is the model slice that receives file(1:nxi,1:neta).
+  subroutine nc_read_2d(ncid, name, dest, nxi, neta, rec, i0f, j0f)
+    ! dest is the model slice that receives file(i0f:i0f+nxi-1, j0f:j0f+neta-1)
+    ! (i0f, j0f default to 1: the file origin; a tile passes its global offset).
     integer,          intent(in)    :: ncid, nxi, neta
     character(len=*), intent(in)    :: name
     real(rp),         intent(inout) :: dest(nxi, neta)
-    integer,          intent(in), optional :: rec
-    integer :: varid, ndims, xtype
+    integer,          intent(in), optional :: rec, i0f, j0f
+    integer :: varid, ndims, xtype, i0, j0
     integer, allocatable :: start(:), cnt(:), ibuf(:,:)
+    i0 = 1; j0 = 1
+    if (present(i0f)) i0 = i0f
+    if (present(j0f)) j0 = j0f
 
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'var '//trim(name))
     call nc_check(nf90_inquire_variable(ncid, varid, xtype=xtype, ndims=ndims), 'ndims '//trim(name))
     if (present(rec) .and. ndims >= 3) then
       allocate(start(3), cnt(3))
-      start = (/1, 1, rec/)
+      start = (/i0, j0, rec/)
       cnt   = (/nxi, neta, 1/)
     elseif (present(rec) .and. ndims == 2 .and. neta == 1) then
       allocate(start(2), cnt(2))
-      start = (/1, rec/)
+      start = (/i0, rec/)
       cnt   = (/nxi, 1/)
     else
       allocate(start(2), cnt(2))
-      start = (/1, 1/)
+      start = (/i0, j0/)
       cnt   = (/nxi, neta/)
     endif
     if (xtype == nf90_int .or. xtype == nf90_short .or. xtype == nf90_byte) then
@@ -149,23 +153,26 @@ contains
     deallocate(start, cnt)
   end subroutine nc_read_2d
 
-  subroutine nc_read_3d(ncid, name, dest, nxi, neta, nz, rec)
+  subroutine nc_read_3d(ncid, name, dest, nxi, neta, nz, rec, i0f, j0f)
     integer,          intent(in)    :: ncid, nxi, neta, nz
     character(len=*), intent(in)    :: name
     real(rp),         intent(inout) :: dest(nxi, neta, nz)
-    integer,          intent(in), optional :: rec
-    integer :: varid, ndims
+    integer,          intent(in), optional :: rec, i0f, j0f
+    integer :: varid, ndims, i0, j0
     integer, allocatable :: start(:), cnt(:)
+    i0 = 1; j0 = 1
+    if (present(i0f)) i0 = i0f
+    if (present(j0f)) j0 = j0f
 
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'var '//trim(name))
     call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims), 'ndims '//trim(name))
     if (present(rec) .and. ndims >= 4) then
       allocate(start(4), cnt(4))
-      start = (/1, 1, 1, rec/)
+      start = (/i0, j0, 1, rec/)
       cnt   = (/nxi, neta, nz, 1/)
     else
       allocate(start(3), cnt(3))
-      start = (/1, 1, 1/)
+      start = (/i0, j0, 1/)
       cnt   = (/nxi, neta, nz/)
     endif
     call nc_check(nf90_get_var(ncid, varid, dest, start=start, count=cnt), 'get '//trim(name))
@@ -215,24 +222,34 @@ contains
     call nc_check(nf90_sync(ncid), 'sync')
   end subroutine nc_sync
 
-  subroutine nc_put_2d_rec_f(ncid, name, arr, n1, n2, rec)
-    ! arr is the first element of a contiguous (n1, n2) float32 block.
+  subroutine nc_put_2d_rec_f(ncid, name, arr, n1, n2, rec, i0f, j0f)
+    ! arr is the first element of a contiguous (n1, n2) float32 block,
+    ! written at file position (i0f, j0f) (default the origin).
     integer,          intent(in) :: ncid, n1, n2, rec
     character(len=*), intent(in) :: name
     real(4),          intent(in) :: arr(n1, n2)
-    integer :: varid
+    integer,          intent(in), optional :: i0f, j0f
+    integer :: varid, i0, j0
+    i0 = 1; j0 = 1
+    if (present(i0f)) i0 = i0f
+    if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
-    call nc_check(nf90_put_var(ncid, varid, arr, start=(/1, 1, rec/), &
+    call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, rec/), &
                   count=(/n1, n2, 1/)), 'putrec '//trim(name))
   end subroutine nc_put_2d_rec_f
 
-  subroutine nc_put_3d_rec_f(ncid, name, arr, n1, n2, n3, rec)
+  subroutine nc_put_3d_rec_f(ncid, name, arr, n1, n2, n3, rec, i0f, j0f)
     integer,          intent(in) :: ncid, n1, n2, n3, rec
+    integer,          intent(in), optional :: i0f, j0f
+    integer :: i0, j0
     character(len=*), intent(in) :: name
     real(4),          intent(in) :: arr(n1, n2, n3)
     integer :: varid
+    i0 = 1; j0 = 1
+    if (present(i0f)) i0 = i0f
+    if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
-    call nc_check(nf90_put_var(ncid, varid, arr, start=(/1, 1, 1, rec/), &
+    call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1, rec/), &
                   count=(/n1, n2, n3, 1/)), 'putrec '//trim(name))
   end subroutine nc_put_3d_rec_f
 
@@ -280,23 +297,32 @@ contains
                   'putrec '//trim(name))
   end subroutine nc_put_1d_rec
 
-  subroutine nc_put_2d_rec(ncid, name, arr, rec)
+  subroutine nc_put_2d_rec(ncid, name, arr, rec, i0f, j0f)
     integer,          intent(in) :: ncid, rec
     character(len=*), intent(in) :: name
     real(rp),         intent(in) :: arr(:, :)
-    integer :: varid
+    integer,          intent(in), optional :: i0f, j0f
+    integer :: varid, i0, j0
+    i0 = 1; j0 = 1
+    if (present(i0f)) i0 = i0f
+    if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
-    call nc_check(nf90_put_var(ncid, varid, arr, start=(/1, 1, rec/), &
+    call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, rec/), &
                   count=(/size(arr,1), size(arr,2), 1/)), 'putrec '//trim(name))
   end subroutine nc_put_2d_rec
 
-  subroutine nc_put_3d_rec(ncid, name, arr, rec)
+  subroutine nc_put_3d_rec(ncid, name, arr, rec, i0f, j0f)
     integer,          intent(in) :: ncid, rec
+    integer,          intent(in), optional :: i0f, j0f
+    integer :: i0, j0
     character(len=*), intent(in) :: name
     real(rp),         intent(in) :: arr(:, :, :)
     integer :: varid
+    i0 = 1; j0 = 1
+    if (present(i0f)) i0 = i0f
+    if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
-    call nc_check(nf90_put_var(ncid, varid, arr, start=(/1, 1, 1, rec/), &
+    call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1, rec/), &
                   count=(/size(arr,1), size(arr,2), size(arr,3), 1/)), &
                   'putrec '//trim(name))
   end subroutine nc_put_3d_rec
@@ -457,20 +483,25 @@ contains
     endif
   end subroutine nc_forcing_layout
 
-  subroutine nc_read_forcing_2d(ncid, name, dest, nxi, neta, rec, time_axis)
+  subroutine nc_read_forcing_2d(ncid, name, dest, nxi, neta, rec, time_axis, i0f, j0f)
     integer,          intent(in)    :: ncid, nxi, neta, rec, time_axis
+    integer,          intent(in), optional :: i0f, j0f
+    integer :: i0, j0
     character(len=*), intent(in)    :: name
     real(rp),         intent(inout) :: dest(nxi, neta)
     integer :: varid, ndims, i, j
     integer, allocatable :: start(:), cnt(:)
     real(rp), allocatable :: tmp3(:,:,:)
 
+    i0 = 1; j0 = 1
+    if (present(i0f)) i0 = i0f
+    if (present(j0f)) j0 = j0f
     call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'var '//trim(name))
     call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims), 'ndims '//trim(name))
     if (ndims >= 3 .and. time_axis == 1) then
       ! CDL (time, eta, xi) -> dest(xi, eta)
       allocate(start(3), cnt(3), tmp3(1, neta, nxi))
-      start = (/rec, 1, 1/)
+      start = (/rec, j0, i0/)
       cnt   = (/1, neta, nxi/)
       call nc_check(nf90_get_var(ncid, varid, tmp3, start=start, count=cnt), &
                     'get frc '//trim(name))
@@ -483,11 +514,11 @@ contains
     else
       if (ndims >= 3) then
         allocate(start(3), cnt(3))
-        start = (/1, 1, rec/)
+        start = (/i0, j0, rec/)
         cnt   = (/nxi, neta, 1/)
       else
         allocate(start(2), cnt(2))
-        start = (/1, 1/)
+        start = (/i0, j0/)
         cnt   = (/nxi, neta/)
       endif
       call nc_check(nf90_get_var(ncid, varid, dest, start=start, count=cnt), &

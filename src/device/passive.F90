@@ -19,6 +19,7 @@ module passive_mod
   use formulas
   use time_state
   use passive_column_mod, only: passive_column_run, passive_horiz_run, passive_t3dmix_run
+  use halo_mod, only: halo_fill_3d_tp
   implicit none
   private
 
@@ -164,8 +165,10 @@ contains
     real(rp), intent(in) :: dtau, cf_stp, cf_bak
     integer(ip), intent(in) :: n_stp, n_new, indx
     if (ntp <= 0) return
+    call halo_fill_3d_tp(tp, ntp, nrhs)
     call passive_horiz_run(tp, ntp, 1_ip, nrhs, n_stp, n_new, indx, cf_stp, cf_bak, dtau)
     call passive_column_run(tp, ntp, nrhs, n_new, dtau, 1_ip, .true., passive_mirror)
+    call halo_fill_3d_tp(tp, ntp, n_new)
   end subroutine passive_predictor
 
   ! --------------------------------------------------------- corrector
@@ -175,9 +178,11 @@ contains
     ! solve, open boundaries.
     real(rp), intent(in) :: dt_in
     if (ntp <= 0) return
+    call halo_fill_3d_tp(tp, ntp, nrhs)
     call passive_horiz_run(tp, ntp, 2_ip, nrhs, nnew, nnew, nnew, 0.0_rp, 0.0_rp, dt_in)
     call passive_column_run(tp, ntp, nrhs, nnew, dt_in, 0_ip, .false., passive_mirror)
     call passive_t3dbc()
+    call halo_fill_3d_tp(tp, ntp, nnew)
   end subroutine passive_corrector
 
   ! ------------------------------------------------ lateral diffusion
@@ -185,7 +190,9 @@ contains
     ! Harmonic diffusion along s-surfaces with the salinity diffusivity
     ! (t3dmix for tp; one thread per tracer and cell).
     if (ntp <= 0) return
+    call halo_fill_3d_tp(tp, ntp, nrhs)
     call passive_t3dmix_run(tp, ntp, nrhs, nnew, dt)
+    call halo_fill_3d_tp(tp, ntp, nnew)
   end subroutine passive_t3dmix
 
   ! ------------------------------------------------------ open boundaries

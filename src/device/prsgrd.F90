@@ -261,6 +261,7 @@ contains
       ! with the edge copies folded into the face selection), the harmonic
       ! averages (former wrk3c/wrk3d) and the update, all per point with the
       ! same expressions: bit-identical to the multi-kernel version.
+      ! Scalar call arguments parenthesized: see rho_eos (fixed single-block launch otherwise).
       im_lo = i_fc_lo; im_hi = i_fc_hi
 #ifdef USE_CUDA
       !$cuf kernel do(3) <<<*,*>>>
@@ -280,17 +281,17 @@ contains
             za_p = apply_mask(z_r(ii, j, k) - z_r(ii - 1, j, k), umask(ii, j))
             ra_p = apply_mask(adiabatic_diff(rho1(ii, j, k), rho1(ii - 1, j, k), qp1(ii, j, k), qp1(ii - 1, j, k), &
                                              z_r(ii, j, k), z_r(ii - 1, j, k)), umask(ii, j))
-            zc_m = harmonic_avg(za_m, za_0)
-            rc_m = harmonic_avg(ra_m, ra_0)
+            zc_m = harmonic_avg((za_m), (za_0))
+            rc_m = harmonic_avg((ra_m), (ra_0))
             rc_m = rc_m - qp1(i - 1, j, k) * zc_m * (1.0_rp + 2.0_rp * qp2 * z_r(i - 1, j, k))
-            zc_0 = harmonic_avg(za_0, za_p)
-            rc_0 = harmonic_avg(ra_0, ra_p)
+            zc_0 = harmonic_avg((za_0), (za_p))
+            rc_0 = harmonic_avg((ra_0), (ra_p))
             rc_0 = rc_0 - qp1(i, j, k) * zc_0 * (1.0_rp + 2.0_rp * qp2 * z_r(i, j, k))
             ru(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j) * ( &
                           P(i - 1, j, k) - P(i, j, k) - HalfGRho * dens_jacobian( &
                           rho(i, j, k), rho(i - 1, j, k), &
                           z_r(i, j, k), z_r(i - 1, j, k), &
-                          rc_0, rc_m, zc_0, zc_m))
+                          (rc_0), (rc_m), (zc_0), (zc_m)))
           enddo
         enddo
       enddo
@@ -312,17 +313,17 @@ contains
             za_p = apply_mask(z_r(i, ii, k) - z_r(i, ii - 1, k), vmask(i, ii))
             ra_p = apply_mask(adiabatic_diff(rho1(i, ii, k), rho1(i, ii - 1, k), qp1(i, ii, k), qp1(i, ii - 1, k), &
                                              z_r(i, ii, k), z_r(i, ii - 1, k)), vmask(i, ii))
-            zc_m = harmonic_avg(za_m, za_0)
-            rc_m = harmonic_avg(ra_m, ra_0)
+            zc_m = harmonic_avg((za_m), (za_0))
+            rc_m = harmonic_avg((ra_m), (ra_0))
             rc_m = rc_m - qp1(i, j - 1, k) * zc_m * (1.0_rp + 2.0_rp * qp2 * z_r(i, j - 1, k))
-            zc_0 = harmonic_avg(za_0, za_p)
-            rc_0 = harmonic_avg(ra_0, ra_p)
+            zc_0 = harmonic_avg((za_0), (za_p))
+            rc_0 = harmonic_avg((ra_0), (ra_p))
             rc_0 = rc_0 - qp1(i, j, k) * zc_0 * (1.0_rp + 2.0_rp * qp2 * z_r(i, j, k))
             rv(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j) * ( &
                           P(i, j - 1, k) - P(i, j, k) - HalfGRho * dens_jacobian( &
                           rho(i, j, k), rho(i, j - 1, k), &
                           z_r(i, j, k), z_r(i, j - 1, k), &
-                          rc_0, rc_m, zc_0, zc_m))
+                          (rc_0), (rc_m), (zc_0), (zc_m)))
           enddo
         enddo
       enddo

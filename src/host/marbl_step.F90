@@ -112,25 +112,25 @@ contains
 
   ! Saved state from the initial/restart file (CPU names). Missing
   ! variables leave the pH at 0 = "no previous solution".
-  subroutine marbl_gpu_load_state(ncid, rec, i0, j0, nxi, neta)
-    integer, intent(in) :: ncid, rec, i0, j0, nxi, neta
+  subroutine marbl_gpu_load_state(ncid, rec, i0, j0, nxi, neta, fi0, fj0)
+    integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, fi0, fj0
     real(rp), allocatable :: t2(:,:), t3(:,:,:)
     if (.not. marbl_on) return
     allocate(t2(nxi, neta), t3(nxi, neta, decomp%nz))
     if (nc_has_var(ncid, 'MARBL_PH_SURF')) then
-      call nc_read_2d(ncid, 'MARBL_PH_SURF', t2, nxi, neta, rec)
+      call nc_read_2d(ncid, 'MARBL_PH_SURF', t2, nxi, neta, rec, i0f=fi0, j0f=fj0)
       sf_ph(i0:i0+nxi-1, j0:j0+neta-1) = t2
     endif
     if (nc_has_var(ncid, 'MARBL_PH_SURF_ALT_CO2')) then
-      call nc_read_2d(ncid, 'MARBL_PH_SURF_ALT_CO2', t2, nxi, neta, rec)
+      call nc_read_2d(ncid, 'MARBL_PH_SURF_ALT_CO2', t2, nxi, neta, rec, i0f=fi0, j0f=fj0)
       sf_ph_alt(i0:i0+nxi-1, j0:j0+neta-1) = t2
     endif
     if (nc_has_var(ncid, 'MARBL_PH_3D')) then
-      call nc_read_3d(ncid, 'MARBL_PH_3D', t3, nxi, neta, decomp%nz, rec)
+      call nc_read_3d(ncid, 'MARBL_PH_3D', t3, nxi, neta, decomp%nz, rec, i0f=fi0, j0f=fj0)
       it_ph(i0:i0+nxi-1, j0:j0+neta-1, :) = t3
     endif
     if (nc_has_var(ncid, 'MARBL_PH_3D_ALT_CO2')) then
-      call nc_read_3d(ncid, 'MARBL_PH_3D_ALT_CO2', t3, nxi, neta, decomp%nz, rec)
+      call nc_read_3d(ncid, 'MARBL_PH_3D_ALT_CO2', t3, nxi, neta, decomp%nz, rec, i0f=fi0, j0f=fj0)
       it_pha(i0:i0+nxi-1, j0:j0+neta-1, :) = t3
     endif
     deallocate(t2, t3)
@@ -223,20 +223,20 @@ contains
     enddo
   end subroutine marbl_gpu_define_his
 
-  subroutine marbl_gpu_stage_his(i0, i1, j0, j1)
-    integer, intent(in) :: i0, i1, j0, j1
+  subroutine marbl_gpu_stage_his(i0, i1, j0, j1, di, dj)
+    integer, intent(in) :: i0, i1, j0, j1, di, dj
     integer :: n, nz
     if (.not. marbl_on) return
     nz = decomp%nz
     do n = 1, NHIS
-      call io_stage_2d(trim(his_name(n)), sf_diag(decomp%is, decomp%js, his_slot(n)), i0, i1, j0, j1)
+      call io_stage_2d(trim(his_name(n)), sf_diag(decomp%is, decomp%js, his_slot(n)), i0, i1, j0, j1, di, dj)
     enddo
-    call io_stage_2d(trim(his2i_name(1)), it_zsatc(decomp%is, decomp%js), i0, i1, j0, j1)
-    call io_stage_2d(trim(his2i_name(2)), it_zsata(decomp%is, decomp%js), i0, i1, j0, j1)
-    call io_stage_3d(trim(his3_name(1)), it_co3(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1)
-    call io_stage_3d(trim(his3_name(2)), it_co3a(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1)
-    call io_stage_3d(trim(his3_name(3)), it_co3sat(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1)
-    call io_stage_3d(trim(his3_name(4)), it_co3sata(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1)
+    call io_stage_2d(trim(his2i_name(1)), it_zsatc(decomp%is, decomp%js), i0, i1, j0, j1, di, dj)
+    call io_stage_2d(trim(his2i_name(2)), it_zsata(decomp%is, decomp%js), i0, i1, j0, j1, di, dj)
+    call io_stage_3d(trim(his3_name(1)), it_co3(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1, di, dj)
+    call io_stage_3d(trim(his3_name(2)), it_co3a(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1, di, dj)
+    call io_stage_3d(trim(his3_name(3)), it_co3sat(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1, di, dj)
+    call io_stage_3d(trim(his3_name(4)), it_co3sata(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1, di, dj)
   end subroutine marbl_gpu_stage_his
 
   subroutine marbl_gpu_define_rst(ncid, d_xi, d_eta, d_s, d_t)
@@ -249,18 +249,19 @@ contains
     id = nc_def_var(ncid, 'MARBL_PH_3D_ALT_CO2', (/d_xi, d_eta, d_s, d_t/))
   end subroutine marbl_gpu_define_rst
 
-  subroutine marbl_gpu_write_rst(ncid, rec, i0, i1, j0, j1)
-    integer, intent(in) :: ncid, rec, i0, i1, j0, j1
+  subroutine marbl_gpu_write_rst(ncid, rec, i0, i1, j0, j1, fi0, fj0)
+    ! fi0, fj0: 1-based global file offsets of this tile's first interior point
+    integer, intent(in) :: ncid, rec, i0, i1, j0, j1, fi0, fj0
     real(rp), allocatable :: t2(:,:), t3(:,:,:)
     integer :: nxi, neta
     if (.not. marbl_on) return
     nxi = i1 - i0 + 1; neta = j1 - j0 + 1
     call sync_arch()
     allocate(t2(nxi, neta), t3(nxi, neta, decomp%nz))
-    t2 = sf_ph(i0:i1, j0:j1);     call nc_put_2d_rec(ncid, 'MARBL_PH_SURF', t2, rec)
-    t2 = sf_ph_alt(i0:i1, j0:j1); call nc_put_2d_rec(ncid, 'MARBL_PH_SURF_ALT_CO2', t2, rec)
-    t3 = it_ph(i0:i1, j0:j1, :);  call nc_put_3d_rec(ncid, 'MARBL_PH_3D', t3, rec)
-    t3 = it_pha(i0:i1, j0:j1, :); call nc_put_3d_rec(ncid, 'MARBL_PH_3D_ALT_CO2', t3, rec)
+    t2 = sf_ph(i0:i1, j0:j1);     call nc_put_2d_rec(ncid, 'MARBL_PH_SURF', t2, rec, fi0, fj0)
+    t2 = sf_ph_alt(i0:i1, j0:j1); call nc_put_2d_rec(ncid, 'MARBL_PH_SURF_ALT_CO2', t2, rec, fi0, fj0)
+    t3 = it_ph(i0:i1, j0:j1, :);  call nc_put_3d_rec(ncid, 'MARBL_PH_3D', t3, rec, fi0, fj0)
+    t3 = it_pha(i0:i1, j0:j1, :); call nc_put_3d_rec(ncid, 'MARBL_PH_3D_ALT_CO2', t3, rec, fi0, fj0)
     deallocate(t2, t3)
   end subroutine marbl_gpu_write_rst
 

@@ -241,28 +241,36 @@ contains
     character(len=*), intent(in)    :: vname, gtype
     real(rp),         intent(inout) :: dest(decomp%is:, decomp%js:)
     real(rp), allocatable :: tmp(:,:)
-    integer :: i0, j0
-    allocate(tmp(n1, n2))
-    call nc_read_2d(ncid, vname, tmp, n1, n2, rec)
+    integer :: i0, j0, c1, c2, fi0, fj0
+    ! a field on the global grid: read only this tile's window (same stagger rules as the loader)
+    c1 = n1; c2 = n2; fi0 = 1; fj0 = 1
+    if ((n1 == decomp%gnx + 2 .or. n1 == decomp%gnx + 1 .or. n1 == decomp%gnx) .and. &
+        (n2 == decomp%gny + 2 .or. n2 == decomp%gny + 1 .or. n2 == decomp%gny)) then
+      c1 = n1 - int(decomp%gnx) + int(decomp%nx)
+      c2 = n2 - int(decomp%gny) + int(decomp%ny)
+      fi0 = int(decomp%i0); fj0 = int(decomp%j0)
+    endif
+    allocate(tmp(c1, c2))
+    call nc_read_2d(ncid, vname, tmp, c1, c2, rec, fi0, fj0)
     where (is_nan(tmp)) tmp = 0.0_rp
-    if (gtype == 'r' .and. n1 == decomp%nx + 2 .and. n2 == decomp%ny + 2) then
+    if (gtype == 'r' .and. c1 == decomp%nx + 2 .and. c2 == decomp%ny + 2) then
       dest(0:decomp%nx+1, 0:decomp%ny+1) = tmp
-    elseif (gtype == 'u' .and. n1 == decomp%nx + 1 .and. n2 == decomp%ny + 2) then
+    elseif (gtype == 'u' .and. c1 == decomp%nx + 1 .and. c2 == decomp%ny + 2) then
       dest(1:decomp%nx+1, 0:decomp%ny+1) = tmp
-    elseif (gtype == 'u' .and. n1 == decomp%nx + 1 .and. n2 == decomp%ny) then
+    elseif (gtype == 'u' .and. c1 == decomp%nx + 1 .and. c2 == decomp%ny) then
       dest(1:decomp%nx+1, 1:decomp%ny) = tmp
-    elseif (gtype == 'v' .and. n1 == decomp%nx + 2 .and. n2 == decomp%ny + 1) then
+    elseif (gtype == 'v' .and. c1 == decomp%nx + 2 .and. c2 == decomp%ny + 1) then
       dest(0:decomp%nx+1, 1:decomp%ny+1) = tmp
-    elseif (gtype == 'v' .and. n1 == decomp%nx .and. n2 == decomp%ny + 1) then
+    elseif (gtype == 'v' .and. c1 == decomp%nx .and. c2 == decomp%ny + 1) then
       dest(1:decomp%nx, 1:decomp%ny+1) = tmp
-    elseif (gtype == 'r' .and. n1 == decomp%nx .and. n2 == decomp%ny) then
+    elseif (gtype == 'r' .and. c1 == decomp%nx .and. c2 == decomp%ny) then
       dest(1:decomp%nx, 1:decomp%ny) = tmp
     else
       i0 = 0; j0 = 0
       if (gtype == 'u') i0 = 1
       if (gtype == 'v') j0 = 1
-      dest(i0:i0+min(n1, size(dest,1))-1, j0:j0+min(n2, size(dest,2))-1) = &
-           tmp(1:min(n1, size(dest,1)), 1:min(n2, size(dest,2)))
+      dest(i0:i0+min(c1, size(dest,1))-1, j0:j0+min(c2, size(dest,2))-1) = &
+           tmp(1:min(c1, size(dest,1)), 1:min(c2, size(dest,2)))
     endif
     deallocate(tmp)
   end subroutine load2

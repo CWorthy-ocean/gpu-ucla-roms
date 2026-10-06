@@ -30,6 +30,7 @@ module frc_io
     character(len=64)  :: tname = ''
     character(len=1)   :: gtype = 'r'
     integer :: ntot = 0, it1 = 1, it2 = 2, n1 = 0, n2 = 0, time_axis = 3
+    integer :: fi0 = 1, fj0 = 1   ! file start of this tile's window (on-grid fields)
     logical :: ready = .false.
     ! climatology: cycle_length attribute of the time axis (<= 0: none);
     ! t1e/t2e are the shifted record times of the current bracket
@@ -213,6 +214,15 @@ contains
         ntot = ntot + max(nrec, 1)
         if (s%n1 == 0) then
           s%n1 = nxi; s%n2 = neta; s%time_axis = tax
+          ! a field on the global model grid: this tile reads only its window
+          if ((gtype == 'r' .and. nxi == decomp%gnx + 2 .and. neta == decomp%gny + 2) .or. &
+              (gtype == 'u' .and. nxi == decomp%gnx + 1 .and. neta == decomp%gny) .or. &
+              (gtype == 'v' .and. nxi == decomp%gnx .and. neta == decomp%gny + 1) .or. &
+              (gtype == 'r' .and. nxi == decomp%gnx .and. neta == decomp%gny)) then
+            s%n1 = nxi - int(decomp%gnx) + int(decomp%nx)
+            s%n2 = neta - int(decomp%gny) + int(decomp%ny)
+            s%fi0 = int(decomp%i0); s%fj0 = int(decomp%j0)
+          endif
         endif
       endif
       call nc_close(ncid)
@@ -305,7 +315,7 @@ contains
     ! netCDF writing straight into managed memory faults page by page.
     allocate(tmp(s%n1, s%n2))
     call nc_open_read(s%paths(idx), ncid)
-    call nc_read_forcing_2d(ncid, s%vname, tmp, s%n1, s%n2, s%irec(idx), s%time_axis)
+    call nc_read_forcing_2d(ncid, s%vname, tmp, s%n1, s%n2, s%irec(idx), s%time_axis, s%fi0, s%fj0)
     call nc_close(ncid)
 #ifdef USE_CUDA
     ierr = cudaMemcpy(s%buf(:,:,slot), tmp, s%n1 * s%n2, cudaMemcpyHostToDevice)

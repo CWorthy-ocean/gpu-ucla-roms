@@ -12,6 +12,7 @@ module case_io
   use tide_io, only: read_tide_namelist, init_tides, set_tides
   use his_io, only: read_output_namelist, set_output_root, init_output
   use comm_mod, only: comm_rank, comm_size
+  use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
   use formulas, only: rho0_eos => rho0
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name
   use marbl_gpu, only: marbl_on, read_marbl_namelist, marbl_gpu_setup_tracers, marbl_gpu_init_forcing, &
@@ -19,6 +20,9 @@ module case_io
   implicit none
   private
   logical :: passive_loaded = .false.
+  ! file start indices of this tile's local point 0 (rho) / 1 (u,v): the same
+  ! pair for every stagger; 1 for a single tile
+  integer :: tile_fi0 = 1, tile_fj0 = 1
 
   character(len=512), public :: case_nml = ''
   character(len=512), public :: case_grdname = ''
@@ -214,6 +218,7 @@ contains
     endif
     call init_decomp(case_llm, case_mmm, case_nz, 2_ip, npx, npy, comm_rank(), &
                      periodic_x, periodic_y)
+    tile_fi0 = int(decomp%i0); tile_fj0 = int(decomp%j0)
   end subroutine apply_decomp
 
   subroutine read_s_coord(unit, theta_s_in, theta_b_in, hc_in)
@@ -287,10 +292,6 @@ contains
     real(rp), parameter :: omega_earth = 4.0_rp * 3.14159265358979323846_rp / (23.9344699_rp * 3600.0_rp)
 
     call read_namelist(nml_path)
-    if (decomp%npx * decomp%npy > 1) then
-      write(*,*) 'tiled NetCDF I/O is not wired; run MiniPac on 1 MPI rank'
-      error stop 'load_case'
-    endif
     call alloc_state(nt)
     if (marbl_on) call marbl_gpu_setup_tracers()
     call alloc_passive()
@@ -302,11 +303,11 @@ contains
     write(*,'(a,a)') 'grid file: ', trim(case_grdname)
     write(*,'(a,2i6,a,2i4)') '  xi_rho, eta_rho =', xi_rho, eta_rho, '  mapped i0,j0 =', i0, j0
 
-    call host_read_2d(ncid, 'h', h(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta)
-    call host_read_2d(ncid, 'pm', pm(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta)
-    call host_read_2d(ncid, 'pn', pn(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta)
+    call host_read_2d(ncid, 'h', h(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, i0f=tile_fi0, j0f=tile_fj0)
+    call host_read_2d(ncid, 'pm', pm(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, i0f=tile_fi0, j0f=tile_fj0)
+    call host_read_2d(ncid, 'pn', pn(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, i0f=tile_fi0, j0f=tile_fj0)
     if (nc_has_var(ncid, 'mask_rho')) then
-      call host_read_2d(ncid, 'mask_rho', rmask(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta)
+      call host_read_2d(ncid, 'mask_rho', rmask(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, i0f=tile_fi0, j0f=tile_fj0)
     else
       rmask = 1.0_rp
     endif
@@ -314,17 +315,17 @@ contains
     ! day, not from the grid file (whose f may use a 24 h day).
     had_lat = nc_has_var(ncid, 'lat_rho')
     if (had_lat) then
-      call host_read_2d(ncid, 'lat_rho', latr(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta)
+      call host_read_2d(ncid, 'lat_rho', latr(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, i0f=tile_fi0, j0f=tile_fj0)
     endif
     had_f = nc_has_var(ncid, 'f') .and. .not. had_lat
     if (had_f) then
-      call host_read_2d(ncid, 'f', f(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta)
+      call host_read_2d(ncid, 'f', f(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, i0f=tile_fi0, j0f=tile_fj0)
     endif
     if (nc_has_var(ncid, 'lon_rho')) then
-      call host_read_2d(ncid, 'lon_rho', lonr(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta)
+      call host_read_2d(ncid, 'lon_rho', lonr(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, i0f=tile_fi0, j0f=tile_fj0)
     endif
     if (nc_has_var(ncid, 'angle')) then
-      call host_read_2d(ncid, 'angle', angler(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta)
+      call host_read_2d(ncid, 'angle', angler(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, i0f=tile_fi0, j0f=tile_fj0)
     endif
     call nc_close(ncid)
     if (.not. had_f) then
@@ -334,6 +335,7 @@ contains
 
     call sanitize_land()
     call pad_physical_halo()
+    call fill_static_halos()
     call setup_metrics()
     visc2_r = visc2
     visc2_p = visc2
@@ -344,8 +346,9 @@ contains
 
     call nc_open_read(case_inifile, ncid)
     write(*,'(a,a)') 'init file: ', trim(case_inifile)
-    xi_u = nc_dim_len(ncid, 'xi_u')
-    eta_v = nc_dim_len(ncid, 'eta_v')
+    ! tile extents of the staggered fields (the file dims are global)
+    xi_u = merge(nxi, nxi - 1, case_periodic_x)
+    eta_v = merge(neta, neta - 1, case_periodic_y)
     s_rho = nc_dim_len(ncid, 's_rho')
     if (s_rho /= decomp%nz) then
       write(*,*) 's_rho', s_rho, '/= namelist nz', decomp%nz
@@ -356,6 +359,7 @@ contains
 
     call sanitize_land()
     call pad_physical_halo()
+    call fill_static_halos()
     do k = 2, 4
       zeta(:, :, k) = zeta(:, :, 1)
       ubar(:, :, k) = ubar(:, :, 1)
@@ -498,6 +502,7 @@ contains
       write(*,'(a,f12.4,a,i0)') 'get_init :: Read initial conditions for day =', &
            start_time * sec2day, ' record =', rec
     endif
+    call fill_loaded_halos()
   end subroutine load_init_records
 
   logical function has_coupling_fields(ncid) result(ok)
@@ -509,14 +514,14 @@ contains
 
   subroutine load_2d_record(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
     integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, xi_u, eta_v
-    call host_read_2d(ncid, 'zeta', zeta(i0:i0+nxi-1, j0:j0+neta-1, 1), nxi, neta, rec)
-    call host_read_2d(ncid, 'ubar', ubar(i0+1:i0+xi_u, j0:j0+neta-1, 1), xi_u, neta, rec)
-    call host_read_2d(ncid, 'vbar', vbar(i0:i0+nxi-1, j0+1:j0+eta_v, 1), nxi, eta_v, rec)
+    call host_read_2d(ncid, 'zeta', zeta(i0:i0+nxi-1, j0:j0+neta-1, 1), nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call host_read_2d(ncid, 'ubar', ubar(i0+1:i0+xi_u, j0:j0+neta-1, 1), xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call host_read_2d(ncid, 'vbar', vbar(i0:i0+nxi-1, j0+1:j0+eta_v, 1), nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
     if (nc_has_var(ncid, 'hbls')) then
-      call host_read_2d(ncid, 'hbls', hbls(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, rec)
+      call host_read_2d(ncid, 'hbls', hbls(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
     endif
     if (nc_has_var(ncid, 'hbbl')) then
-      call host_read_2d(ncid, 'hbbl', hbbl(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, rec)
+      call host_read_2d(ncid, 'hbbl', hbbl(i0:i0+nxi-1, j0:j0+neta-1), nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
     endif
   end subroutine load_2d_record
 
@@ -525,37 +530,37 @@ contains
     integer :: itp
     real(rp), allocatable :: tmp(:,:,:)
     call host_read_3d(ncid, 'u', u(i0+1:i0+xi_u, j0:j0+neta-1, :, tindx), &
-                      xi_u, neta, decomp%nz, rec)
+                      xi_u, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     call host_read_3d(ncid, 'v', v(i0:i0+nxi-1, j0+1:j0+eta_v, :, tindx), &
-                      nxi, eta_v, decomp%nz, rec)
+                      nxi, eta_v, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     call host_read_3d(ncid, 'temp', t(i0:i0+nxi-1, j0:j0+neta-1, :, tindx, 1), &
-                      nxi, neta, decomp%nz, rec)
+                      nxi, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     call host_read_3d(ncid, 'salt', t(i0:i0+nxi-1, j0:j0+neta-1, :, tindx, 2), &
-                      nxi, neta, decomp%nz, rec)
+                      nxi, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
     ! Passive tracers, when the file carries them (float32 in restarts).
     if (ntp > 0) then
       if (nc_has_var(ncid, trim(passive_name(1)))) then
         allocate(tmp(nxi, neta, decomp%nz))
         do itp = 1, ntp
           if (.not. nc_has_var(ncid, trim(passive_name(itp)))) exit
-          call nc_read_3d(ncid, trim(passive_name(itp)), tmp, nxi, neta, decomp%nz, rec)
+          call nc_read_3d(ncid, trim(passive_name(itp)), tmp, nxi, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
           tp(itp, i0:i0+nxi-1, j0:j0+neta-1, :, tindx) = real(tmp, pp)
         enddo
         deallocate(tmp)
         passive_loaded = .true.
       endif
     endif
-    if (marbl_on .and. tindx == 1) call marbl_gpu_load_state(ncid, rec, i0, j0, nxi, neta)
+    if (marbl_on .and. tindx == 1) call marbl_gpu_load_state(ncid, rec, i0, j0, nxi, neta, tile_fi0, tile_fj0)
   end subroutine load_3d_record
 
   subroutine load_coupling_fields(ncid, rec, i0, j0, nxi, neta, xi_u, eta_v)
     integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, xi_u, eta_v
-    call host_read_2d(ncid, 'DU_avg1', DU_avg1(i0+1:i0+xi_u, j0:j0+neta-1), xi_u, neta, rec)
-    call host_read_2d(ncid, 'DV_avg1', DV_avg1(i0:i0+nxi-1, j0+1:j0+eta_v), nxi, eta_v, rec)
-    call host_read_2d(ncid, 'DU_avg2', DU_avg2(i0+1:i0+xi_u, j0:j0+neta-1), xi_u, neta, rec)
-    call host_read_2d(ncid, 'DV_avg2', DV_avg2(i0:i0+nxi-1, j0+1:j0+eta_v), nxi, eta_v, rec)
-    call host_read_2d(ncid, 'DU_avg_bak', DU_avg_bak(i0+1:i0+xi_u, j0:j0+neta-1), xi_u, neta, rec)
-    call host_read_2d(ncid, 'DV_avg_bak', DV_avg_bak(i0:i0+nxi-1, j0+1:j0+eta_v), nxi, eta_v, rec)
+    call host_read_2d(ncid, 'DU_avg1', DU_avg1(i0+1:i0+xi_u, j0:j0+neta-1), xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call host_read_2d(ncid, 'DV_avg1', DV_avg1(i0:i0+nxi-1, j0+1:j0+eta_v), nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call host_read_2d(ncid, 'DU_avg2', DU_avg2(i0+1:i0+xi_u, j0:j0+neta-1), xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call host_read_2d(ncid, 'DV_avg2', DV_avg2(i0:i0+nxi-1, j0+1:j0+eta_v), nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call host_read_2d(ncid, 'DU_avg_bak', DU_avg_bak(i0+1:i0+xi_u, j0:j0+neta-1), xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+    call host_read_2d(ncid, 'DV_avg_bak', DV_avg_bak(i0:i0+nxi-1, j0+1:j0+eta_v), nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
     DU_avg1 = DU_avg1 * umask
     DV_avg1 = DV_avg1 * vmask
     DU_avg2 = DU_avg2 * umask
@@ -582,9 +587,9 @@ contains
       return
     endif
     call host_read_2d(ncid, trim(uname), rufrc_bak(i0+1:i0+xi_u, j0:j0+neta-1, tindx), &
-                      xi_u, neta, rec)
+                      xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
     call host_read_2d(ncid, trim(vname), rvfrc_bak(i0:i0+nxi-1, j0+1:j0+eta_v, tindx), &
-                      nxi, eta_v, rec)
+                      nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
     rufrc_bak(:, :, tindx) = rufrc_bak(:, :, tindx) * umask
     rvfrc_bak(:, :, tindx) = rvfrc_bak(:, :, tindx) * vmask
   end subroutine load_rufrc_slot
@@ -598,10 +603,12 @@ contains
       i0 = 0; j0 = 0
       case_periodic_x = .false.
       case_periodic_y = .false.
+      nxi = int(decomp%nx) + 2; neta = int(decomp%ny) + 2   ! this tile's window of the global grid
     elseif (xi_rho == case_llm .and. eta_rho == case_mmm) then
       i0 = 1; j0 = 1
       case_periodic_x = .true.
       case_periodic_y = .true.
+      nxi = int(decomp%nx); neta = int(decomp%ny)
     else
       write(*,*) 'grid dims', xi_rho, eta_rho, 'do not match LLm,MMm', case_llm, case_mmm
       error stop 'infer_layout'
@@ -611,6 +618,7 @@ contains
       call free_state()
       call apply_decomp(case_periodic_x, case_periodic_y)
       call alloc_state(nt)
+      nxi = int(decomp%nx); neta = int(decomp%ny)
     endif
   end subroutine infer_layout
 
@@ -722,6 +730,48 @@ contains
       hbbl(i, jdst) = 0.0_rp
     end subroutine zero_row_state
   end subroutine pad_physical_halo
+
+  subroutine fill_static_halos()
+    ! Tile halos of the grid fields: the window read covers local 0..nx+1
+    ! and pad_physical_halo the physical edges; the two halo points toward a
+    ! neighbor tile come from that neighbor. No-op on a single tile.
+    call halo_fill_2d(h, STAGGER_RHO)
+    call halo_fill_2d(pm, STAGGER_RHO)
+    call halo_fill_2d(pn, STAGGER_RHO)
+    call halo_fill_2d(rmask, STAGGER_RHO)
+    call halo_fill_2d(f, STAGGER_RHO)
+    call halo_fill_2d(lonr, STAGGER_RHO)
+    call halo_fill_2d(latr, STAGGER_RHO)
+    call halo_fill_2d(angler, STAGGER_RHO)
+  end subroutine fill_static_halos
+
+  subroutine fill_loaded_halos()
+    ! Tile halos of every state field read from the initial/restart file
+    ! (slots 1 and 2; slot 2 only matters for an exact restart). No-op on a
+    ! single tile.
+    integer(ip) :: n, itrc
+    do n = 1, 2
+      call halo_fill_2d_s(zeta, STAGGER_RHO, n)
+      call halo_fill_2d_s(ubar, STAGGER_U, n)
+      call halo_fill_2d_s(vbar, STAGGER_V, n)
+      call halo_fill_3d_s(u, STAGGER_U, n)
+      call halo_fill_3d_s(v, STAGGER_V, n)
+      do itrc = 1, nt
+        call halo_fill_3d_t(t, STAGGER_RHO, n, itrc)
+      enddo
+      if (ntp > 0) call halo_fill_3d_tp(tp, ntp, n)
+    enddo
+    call halo_fill_2d(hbls, STAGGER_RHO)
+    call halo_fill_2d(hbbl, STAGGER_RHO)
+    call halo_fill_2d(DU_avg1, STAGGER_U)
+    call halo_fill_2d(DV_avg1, STAGGER_V)
+    call halo_fill_2d(DU_avg2, STAGGER_U)
+    call halo_fill_2d(DV_avg2, STAGGER_V)
+    call halo_fill_2d(DU_avg_bak, STAGGER_U)
+    call halo_fill_2d(DV_avg_bak, STAGGER_V)
+    call halo_fill_2d(rufrc, STAGGER_U)
+    call halo_fill_2d(rvfrc, STAGGER_V)
+  end subroutine fill_loaded_halos
 
   subroutine report_loaded_case()
     integer(ip) :: nwet, i, j, k

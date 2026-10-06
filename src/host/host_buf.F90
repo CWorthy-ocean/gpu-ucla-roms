@@ -11,26 +11,26 @@ module host_buf
 
 contains
 
-  subroutine host_read_2d(ncid, name, dest, nxi, neta, rec)
+  subroutine host_read_2d(ncid, name, dest, nxi, neta, rec, i0f, j0f)
     integer,          intent(in)    :: ncid, nxi, neta
     character(len=*), intent(in)    :: name
     real(rp),         intent(inout) :: dest(nxi, neta)
-    integer,          intent(in), optional :: rec
+    integer,          intent(in), optional :: rec, i0f, j0f
     real(rp), allocatable :: buf(:,:)
     allocate(buf(nxi, neta))
-    call nc_read_2d(ncid, name, buf, nxi, neta, rec)
+    call nc_read_2d(ncid, name, buf, nxi, neta, rec, i0f, j0f)
     dest = buf
     deallocate(buf)
   end subroutine host_read_2d
 
-  subroutine host_read_3d(ncid, name, dest, nxi, neta, nz, rec)
+  subroutine host_read_3d(ncid, name, dest, nxi, neta, nz, rec, i0f, j0f)
     integer,          intent(in)    :: ncid, nxi, neta, nz
     character(len=*), intent(in)    :: name
     real(rp),         intent(inout) :: dest(nxi, neta, nz)
-    integer,          intent(in), optional :: rec
+    integer,          intent(in), optional :: rec, i0f, j0f
     real(rp), allocatable :: buf(:,:,:)
     allocate(buf(nxi, neta, nz))
-    call nc_read_3d(ncid, name, buf, nxi, neta, nz, rec)
+    call nc_read_3d(ncid, name, buf, nxi, neta, nz, rec, i0f, j0f)
     dest = buf
     deallocate(buf)
   end subroutine host_read_3d

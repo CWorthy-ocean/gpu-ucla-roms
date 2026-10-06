@@ -19,6 +19,9 @@ module comm_mod
   integer(ip) :: nproc = 1
   integer :: world_rank = 0, world_size = 1
   integer :: world_comm = 0, compute_comm = 0
+  ! GPU-aware MPI (Cray MPICH + libmpi_gtl_cuda): device buffers go straight
+  ! to MPI_Sendrecv when MPICH_GPU_SUPPORT_ENABLED=1 is set for the job.
+  logical :: comm_gpu_direct = .false.
   integer :: io_rank_w = -1          ! world rank of the I/O server, -1 = none
   logical :: io_rank_flag = .false.
   logical :: ready = .false.
@@ -28,12 +31,17 @@ module comm_mod
   public :: comm_rank
   public :: comm_size
   public :: comm_exchange2
+  public :: comm_sendrecv_raw
+  public :: comm_sendrecv_dev
+  public :: comm_gpu_direct
   public :: comm_exchange3
   public :: have_io_server
   public :: is_io_rank
   public :: io_server_rank
   public :: comm_world
   public :: comm_world_rank
+  public :: comm_world_size
+  public :: compute_barrier
 
 contains
 
@@ -68,6 +76,10 @@ contains
     call MPI_Comm_size(compute_comm, n, ierr)
     my_rank = int(r, ip)
     nproc = int(n, ip)
+    call get_environment_variable('MPICH_GPU_SUPPORT_ENABLED', val, status=stat)
+    comm_gpu_direct = (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '1')
+    if (my_rank == 0 .and. .not. io_rank_flag) &
+         write(*,'(a,l1)') 'comm: GPU-direct halo exchange (MPICH_GPU_SUPPORT_ENABLED) = ', comm_gpu_direct
 #endif
     ready = .true.
   end subroutine init_comm
@@ -85,6 +97,18 @@ contains
     io_rank_w = -1
     io_rank_flag = .false.
   end subroutine finalize_comm
+
+  integer function comm_world_size()
+    comm_world_size = world_size
+  end function comm_world_size
+
+  subroutine compute_barrier()
+    ! Barrier over the compute ranks (no-op on one rank).
+#ifdef USE_MPI
+    integer :: ierr
+    if (comm_size() > 1) call MPI_Barrier(compute_comm, ierr)
+#endif
+  end subroutine compute_barrier
 
   integer(ip) function comm_rank()
     comm_rank = my_rank
@@ -127,6 +151,63 @@ contains
     mpi_dest = -1
 #endif
   end function mpi_dest
+
+  subroutine comm_sendrecv_raw(nbr_lo, nbr_hi, n, s_lo, s_hi, r_lo, r_hi)
+    ! The two neighbor exchanges on contiguous host buffers of n values
+    ! (no allocation or reshape; the caller stages device data into pinned
+    ! memory). A missing neighbor is MPI_PROC_NULL: its receive buffer is
+    ! left untouched and the caller does not read it.
+    integer(ip), intent(in) :: nbr_lo, nbr_hi
+    integer,     intent(in) :: n
+    real(rp),    intent(in)    :: s_lo(*), s_hi(*)
+    real(rp),    intent(inout) :: r_lo(*), r_hi(*)
+#ifdef USE_MPI
+    integer :: dest_lo, dest_hi, ierr, stat(MPI_STATUS_SIZE)
+    if (.not. ready) call init_comm()
+    dest_lo = mpi_dest(nbr_lo)
+    dest_hi = mpi_dest(nbr_hi)
+    call MPI_Sendrecv(s_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 301, &
+                      r_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 301, &
+                      compute_comm, stat, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_sendrecv_raw: lo'
+    call MPI_Sendrecv(s_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 302, &
+                      r_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 302, &
+                      compute_comm, stat, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_sendrecv_raw: hi'
+#else
+    if (nbr_lo >= 0 .or. nbr_hi >= 0) error stop 'comm_sendrecv_raw: MPI neighbor without USE_MPI'
+#endif
+  end subroutine comm_sendrecv_raw
+
+  subroutine comm_sendrecv_dev(nbr_lo, nbr_hi, n, s_lo, s_hi, r_lo, r_hi)
+    ! As comm_sendrecv_raw on DEVICE buffers (GPU-aware MPI); the caller has
+    ! synchronized the stream that packed them.
+    integer(ip), intent(in) :: nbr_lo, nbr_hi
+    integer,     intent(in) :: n
+#ifdef USE_CUDA
+    real(rp), device, intent(in)    :: s_lo(*), s_hi(*)
+    real(rp), device, intent(inout) :: r_lo(*), r_hi(*)
+#else
+    real(rp), intent(in)    :: s_lo(*), s_hi(*)
+    real(rp), intent(inout) :: r_lo(*), r_hi(*)
+#endif
+#ifdef USE_MPI
+    integer :: dest_lo, dest_hi, ierr, stat(MPI_STATUS_SIZE)
+    if (.not. ready) call init_comm()
+    dest_lo = mpi_dest(nbr_lo)
+    dest_hi = mpi_dest(nbr_hi)
+    call MPI_Sendrecv(s_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 311, &
+                      r_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 311, &
+                      compute_comm, stat, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_sendrecv_dev: lo'
+    call MPI_Sendrecv(s_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 312, &
+                      r_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 312, &
+                      compute_comm, stat, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_sendrecv_dev: hi'
+#else
+    if (nbr_lo >= 0 .or. nbr_hi >= 0) error stop 'comm_sendrecv_dev: MPI neighbor without USE_MPI'
+#endif
+  end subroutine comm_sendrecv_dev
 
   subroutine comm_exchange2(nbr_lo, nbr_hi, send_lo, send_hi, recv_lo, recv_hi)
     integer(ip), intent(in) :: nbr_lo, nbr_hi

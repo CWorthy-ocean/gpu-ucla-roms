@@ -7,7 +7,10 @@ module halo_mod
   use kinds
   use decomp_mod, only: decomp
   use time_state, only: fast, nt
-  use comm_mod, only: comm_exchange2, comm_exchange3
+  use comm_mod, only: comm_exchange2, comm_exchange3, comm_sendrecv_raw, comm_sendrecv_dev, comm_gpu_direct
+#ifdef USE_CUDA
+  use cudafor
+#endif
   use arch_mod, only: sync_arch
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
@@ -15,13 +18,39 @@ module halo_mod
   implicit none
   private
 
-  real(rp), WORK_ATTR allocatable :: ew_slo(:,:,:), ew_shi(:,:,:)
-  real(rp), WORK_ATTR allocatable :: ew_rlo(:,:,:), ew_rhi(:,:,:)
-  real(rp), WORK_ATTR allocatable :: ns_slo(:,:,:), ns_shi(:,:,:)
-  real(rp), WORK_ATTR allocatable :: ns_rlo(:,:,:), ns_rhi(:,:,:)
+  ! Exchange buffers are plain device arrays (not managed): the pack and
+  ! unpack kernels fill them, and the MPI path moves them with cudaMemcpy
+  ! to and from pinned host memory, so no page migrates between the host
+  ! and the device on an exchange.
+#ifdef USE_CUDA
+  real(rp), device, allocatable :: ew_slo(:,:,:), ew_shi(:,:,:)
+  real(rp), device, allocatable :: ew_rlo(:,:,:), ew_rhi(:,:,:)
+  real(rp), device, allocatable :: ns_slo(:,:,:), ns_shi(:,:,:)
+  real(rp), device, allocatable :: ns_rlo(:,:,:), ns_rhi(:,:,:)
+#else
+  real(rp), allocatable :: ew_slo(:,:,:), ew_shi(:,:,:)
+  real(rp), allocatable :: ew_rlo(:,:,:), ew_rhi(:,:,:)
+  real(rp), allocatable :: ns_slo(:,:,:), ns_shi(:,:,:)
+  real(rp), allocatable :: ns_rlo(:,:,:), ns_rhi(:,:,:)
+#endif
   real(rp), WORK_ATTR allocatable :: work2d(:,:)
   real(rp), WORK_ATTR allocatable :: work3d(:,:,:)
   real(rp), WORK_ATTR allocatable :: work3dw(:,:,:)
+#ifdef USE_CUDA
+  ! Pinned host staging for the MPI path: packed device buffers are copied
+  ! here asynchronously on work_stream, exchanged, and copied back. No
+  ! managed-memory page migration and no per-call allocation.
+  real(rp), pinned, allocatable :: hs_lo(:), hs_hi(:), hr_lo(:), hr_hi(:)
+  integer :: hbuf_n = 0
+#endif
+  ! All-tracer passive exchange buffers: (h, js:je, nz*ntr) and (is:ie, h, nz*ntr)
+#ifdef USE_CUDA
+  real(rp), device, allocatable :: tew_slo(:,:,:), tew_shi(:,:,:), tew_rlo(:,:,:), tew_rhi(:,:,:)
+  real(rp), device, allocatable :: tns_slo(:,:,:), tns_shi(:,:,:), tns_rlo(:,:,:), tns_rhi(:,:,:)
+#else
+  real(rp), allocatable :: tew_slo(:,:,:), tew_shi(:,:,:), tew_rlo(:,:,:), tew_rhi(:,:,:)
+  real(rp), allocatable :: tns_slo(:,:,:), tns_shi(:,:,:), tns_rlo(:,:,:), tns_rhi(:,:,:)
+#endif
 
   public :: halo_fill_2d
   public :: halo_fill_2d_n
@@ -31,6 +60,7 @@ module halo_mod
   public :: halo_fill_3d
   public :: halo_fill_3d_s
   public :: halo_fill_3d_t
+  public :: halo_fill_3d_tp
   public :: halo_fill_3d_w
   public :: halo_fill_3d_w_s
   public :: halo_ensure
@@ -73,6 +103,8 @@ contains
     if (allocated(work2d)) deallocate(work2d)
     if (allocated(work3d)) deallocate(work3d)
     if (allocated(work3dw)) deallocate(work3dw)
+    if (allocated(tew_slo)) deallocate(tew_slo, tew_shi, tew_rlo, tew_rhi)
+    if (allocated(tns_slo)) deallocate(tns_slo, tns_shi, tns_rlo, tns_rhi)
   end subroutine halo_free
 
   subroutine halo_fill_2d(a, stagger)
@@ -252,6 +284,115 @@ contains
     enddo
   end subroutine halo_fill_3d_t
 
+  subroutine halo_fill_3d_tp(a, ntr, slot)
+    ! Passive tracers, tracer-innermost layout a(ntr, is:ie, js:je, nz, 3):
+    ! one exchange of all tracers in slot `slot` at rho points. Pure copies,
+    ! so a tiled run reproduces the single-tile interior bit for bit. The
+    ! combined buffer index is kk = (k-1)*ntr + itr; east-west first, then
+    ! north-south including the east-west halo columns (as halo_fill_3d).
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    integer(ip), intent(in) :: ntr, slot
+    integer(ip) :: i, j, k, kk, m, itr, n, h, nz, nk, i1, i2, j1, j2, ilo, ihi, is, ie, js, je
+    if (no_neighbors()) return
+    if (ntr <= 0) return
+    h = decomp%halo; nz = decomp%nz; nk = nz * ntr; n = slot
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+    if (allocated(tew_slo)) then
+      if (ubound(tew_slo, 3) /= nk .or. lbound(tew_slo, 2) /= js .or. ubound(tew_slo, 2) /= je .or. &
+          lbound(tns_slo, 1) /= is .or. ubound(tns_slo, 1) /= ie) then
+        deallocate(tew_slo, tew_shi, tew_rlo, tew_rhi, tns_slo, tns_shi, tns_rlo, tns_rhi)
+      endif
+    endif
+    if (.not. allocated(tew_slo)) then
+      allocate(tew_slo(h, js:je, nk), tew_shi(h, js:je, nk), tew_rlo(h, js:je, nk), tew_rhi(h, js:je, nk))
+      allocate(tns_slo(is:ie, h, nk), tns_shi(is:ie, h, nk), tns_rlo(is:ie, h, nk), tns_rhi(is:ie, h, nk))
+      tew_slo = 0.0_rp; tew_shi = 0.0_rp; tew_rlo = 0.0_rp; tew_rhi = 0.0_rp
+      tns_slo = 0.0_rp; tns_shi = 0.0_rp; tns_rlo = 0.0_rp; tns_rhi = 0.0_rp
+    endif
+    ! ---- east-west
+    if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
+      CUF_DO3
+      do kk = 1, nk
+        do j = j1, j2
+          do m = 1, h
+            k = (kk - 1) / ntr + 1
+            itr = kk - (k - 1) * ntr
+            tew_slo(m, j, kk) = real(a(itr, i1 + m - 1, j, k, n), rp)
+            tew_shi(m, j, kk) = real(a(itr, i2 - h + m, j, k, n), rp)
+          enddo
+        enddo
+      enddo
+      call deliver3(decomp%nbr_w, decomp%nbr_e, tew_slo, tew_shi, tew_rlo, tew_rhi)
+      if (decomp%nbr_w /= NBR_NONE) then
+        CUF_DO3
+        do kk = 1, nk
+          do j = j1, j2
+            do m = 1, h
+              k = (kk - 1) / ntr + 1
+              itr = kk - (k - 1) * ntr
+              a(itr, i1 - h + m - 1, j, k, n) = real(tew_rlo(m, j, kk), pp)
+            enddo
+          enddo
+        enddo
+      endif
+      if (decomp%nbr_e /= NBR_NONE) then
+        CUF_DO3
+        do kk = 1, nk
+          do j = j1, j2
+            do m = 1, h
+              k = (kk - 1) / ntr + 1
+              itr = kk - (k - 1) * ntr
+              a(itr, i2 + m, j, k, n) = real(tew_rhi(m, j, kk), pp)
+            enddo
+          enddo
+        enddo
+      endif
+      call sync_arch()
+    endif
+    ! ---- north-south, including the east-west halo columns
+    if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
+      ilo = i1 - h; ihi = i2 + h
+      CUF_DO3
+      do kk = 1, nk
+        do m = 1, h
+          do i = ilo, ihi
+            k = (kk - 1) / ntr + 1
+            itr = kk - (k - 1) * ntr
+            tns_slo(i, m, kk) = real(a(itr, i, j1 + m - 1, k, n), rp)
+            tns_shi(i, m, kk) = real(a(itr, i, j2 - h + m, k, n), rp)
+          enddo
+        enddo
+      enddo
+      call deliver3(decomp%nbr_s, decomp%nbr_n, tns_slo, tns_shi, tns_rlo, tns_rhi)
+      if (decomp%nbr_s /= NBR_NONE) then
+        CUF_DO3
+        do kk = 1, nk
+          do m = 1, h
+            do i = ilo, ihi
+              k = (kk - 1) / ntr + 1
+              itr = kk - (k - 1) * ntr
+              a(itr, i, j1 - h + m - 1, k, n) = real(tns_rlo(i, m, kk), pp)
+            enddo
+          enddo
+        enddo
+      endif
+      if (decomp%nbr_n /= NBR_NONE) then
+        CUF_DO3
+        do kk = 1, nk
+          do m = 1, h
+            do i = ilo, ihi
+              k = (kk - 1) / ntr + 1
+              itr = kk - (k - 1) * ntr
+              a(itr, i, j2 + m, k, n) = real(tns_rhi(i, m, kk), pp)
+            enddo
+          enddo
+        enddo
+      endif
+      call sync_arch()
+    endif
+  end subroutine halo_fill_3d_tp
+
   subroutine halo_fill_3d_w_s(a, stagger, slot)
     real(rp), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, 0:decomp%nz, 2)
     integer(ip), intent(in) :: stagger, slot
@@ -290,12 +431,16 @@ contains
   subroutine interior_bounds(stagger, i1, i2, j1, j2)
     integer(ip), intent(in)  :: stagger
     integer(ip), intent(out) :: i1, i2, j1, j2
+    ! Exchange bounds are the rho-cell range for every stagger. A u (v)
+    ! face on a seam is the interior point 1 of the east (north) tile and
+    ! the point nx+1 (ny+1) of the west (south) tile: the kernels compute it
+    ! on the east/north side (uv_rhs stops at nx toward a neighbor), so the
+    ! exchange carries it, with one more point beyond, to the west/south
+    ! tile as its halo a(nx+1), a(nx+2). Periodic wrap gives a(nx+1) = a(1).
     i1 = 1
     j1 = 1
     i2 = decomp%nx
     j2 = decomp%ny
-    if (stagger == STAGGER_U) i2 = decomp%nx + 1
-    if (stagger == STAGGER_V) j2 = decomp%ny + 1
   end subroutine interior_bounds
 
   subroutine exchange_ew_2d(a, i1, i2, j1, j2)
@@ -926,9 +1071,13 @@ contains
     integer(ip) :: i, j, lo, hi, h, js, je
     if (nbr_lo == NBR_NONE .and. nbr_hi == NBR_NONE) return
     if (nbr_lo >= 0 .or. nbr_hi >= 0) then
+#ifdef USE_CUDA
+      call deliver_dev(nbr_lo, nbr_hi, ew_slo(:,:,0:0), ew_shi(:,:,0:0), ew_rlo(:,:,0:0), ew_rhi(:,:,0:0))
+#else
       call sync_arch()
       call comm_exchange2(nbr_lo, nbr_hi, ew_slo(:,:,0), ew_shi(:,:,0), &
                           ew_rlo(:,:,0), ew_rhi(:,:,0))
+#endif
       return
     endif
     h = decomp%halo
@@ -958,9 +1107,13 @@ contains
     integer(ip) :: i, m, lo, hi, h, is, ie
     if (nbr_lo == NBR_NONE .and. nbr_hi == NBR_NONE) return
     if (nbr_lo >= 0 .or. nbr_hi >= 0) then
+#ifdef USE_CUDA
+      call deliver_dev(nbr_lo, nbr_hi, ns_slo(:,:,0:0), ns_shi(:,:,0:0), ns_rlo(:,:,0:0), ns_rhi(:,:,0:0))
+#else
       call sync_arch()
       call comm_exchange2(nbr_lo, nbr_hi, ns_slo(:,:,0), ns_shi(:,:,0), &
                           ns_rlo(:,:,0), ns_rhi(:,:,0))
+#endif
       return
     endif
     h = decomp%halo
@@ -987,13 +1140,22 @@ contains
 
   subroutine deliver3(nbr_lo, nbr_hi, send_lo, send_hi, recv_lo, recv_hi)
     integer(ip), intent(in) :: nbr_lo, nbr_hi
-    real(rp), WORK_ATTR intent(inout) :: send_lo(:,:,:), send_hi(:,:,:)
-    real(rp), WORK_ATTR intent(inout) :: recv_lo(:,:,:), recv_hi(:,:,:)
+#ifdef USE_CUDA
+    real(rp), device, intent(inout), contiguous :: send_lo(:,:,:), send_hi(:,:,:)
+    real(rp), device, intent(inout), contiguous :: recv_lo(:,:,:), recv_hi(:,:,:)
+#else
+    real(rp), intent(inout), contiguous :: send_lo(:,:,:), send_hi(:,:,:)
+    real(rp), intent(inout), contiguous :: recv_lo(:,:,:), recv_hi(:,:,:)
+#endif
     integer(ip) :: i, j, k, n1, n2, n3, lo, hi
     if (nbr_lo == NBR_NONE .and. nbr_hi == NBR_NONE) return
     if (nbr_lo >= 0 .or. nbr_hi >= 0) then
+#ifdef USE_CUDA
+      call deliver_dev(nbr_lo, nbr_hi, send_lo, send_hi, recv_lo, recv_hi)
+#else
       call sync_arch()
       call comm_exchange3(nbr_lo, nbr_hi, send_lo, send_hi, recv_lo, recv_hi)
+#endif
       return
     endif
     n1 = size(send_lo, 1)
@@ -1019,5 +1181,44 @@ contains
       enddo
     enddo
   end subroutine deliver3
+
+#ifdef USE_CUDA
+  subroutine deliver_dev(nbr_lo, nbr_hi, s_lo, s_hi, r_lo, r_hi)
+    ! MPI delivery of packed device buffers through pinned host memory,
+    ! stream-ordered after the pack kernels and before the unpack kernels.
+    integer(ip), intent(in) :: nbr_lo, nbr_hi
+    real(rp), device, intent(inout), contiguous :: s_lo(:,:,:), s_hi(:,:,:)
+    real(rp), device, intent(inout), contiguous :: r_lo(:,:,:), r_hi(:,:,:)
+    integer :: n, ierr
+    n = size(s_lo)
+    if (size(s_hi) /= n .or. size(r_lo) /= n .or. size(r_hi) /= n) &
+         error stop 'deliver_dev: buffer size mismatch'
+    if (comm_gpu_direct) then
+      ! GPU-aware MPI: the pack kernels (work_stream) must have completed;
+      ! the blocking Sendrecv returns with r_lo/r_hi filled on the device.
+      ierr = cudaStreamSynchronize(work_stream)
+      if (ierr /= 0) error stop 'deliver_dev: stream sync'
+      call comm_sendrecv_dev(nbr_lo, nbr_hi, n, s_lo, s_hi, r_lo, r_hi)
+      return
+    endif
+    if (hbuf_n < n) then
+      if (allocated(hs_lo)) deallocate(hs_lo, hs_hi, hr_lo, hr_hi)
+      allocate(hs_lo(n), hs_hi(n), hr_lo(n), hr_hi(n))
+      hbuf_n = n
+    endif
+    ! Synchronous copies: the legacy default stream orders them after the
+    ! pack kernels and before the unpack kernels on work_stream (a blocking
+    ! stream). cudaMemcpyAsync does not resolve for these managed dummies.
+    ierr = cudaMemcpy(hs_lo, s_lo, n)
+    if (ierr /= 0) error stop 'deliver_dev: D2H lo'
+    ierr = cudaMemcpy(hs_hi, s_hi, n)
+    if (ierr /= 0) error stop 'deliver_dev: D2H hi'
+    call comm_sendrecv_raw(nbr_lo, nbr_hi, n, hs_lo, hs_hi, hr_lo, hr_hi)
+    ierr = cudaMemcpy(r_lo, hr_lo, n)
+    if (ierr /= 0) error stop 'deliver_dev: H2D lo'
+    ierr = cudaMemcpy(r_hi, hr_hi, n)
+    if (ierr /= 0) error stop 'deliver_dev: H2D hi'
+  end subroutine deliver_dev
+#endif
 
 end module halo_mod

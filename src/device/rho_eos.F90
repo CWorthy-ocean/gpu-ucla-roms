@@ -53,6 +53,11 @@ contains
     cffg = g / rho0
     cff1 = 1.0_rp / rho0
 #ifdef USE_CUDA
+    ! Scalar call arguments are passed as parenthesized expressions: a loop
+    ! scalar passed by reference makes the CUF compiler treat it as shared
+    ! ("implicit copyin") and launch the kernel with a fixed single block
+    ! (161 ms on a 2x2 tile instead of 0.4 ms; results unaffected). The
+    ! temporaries carry identical values, so the arithmetic is unchanged.
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = j0, j1
@@ -65,14 +70,14 @@ contains
         else
           Ts = 35.0_rp
         endif
-        r1 = jackett_rho1(Tt, Ts)
-        q1 = jackett_qp1(Tt, Ts, r1)
-        r1u = apply_mask(r1, rm)
-        q1u = apply_mask(q1, rm)
+        r1 = jackett_rho1((Tt), (Ts))
+        q1 = jackett_qp1((Tt), (Ts), (r1))
+        r1u = apply_mask((r1), (rm))
+        q1u = apply_mask((q1), (rm))
         zru = z_r(i, j, nz)
         rho1(i, j, nz) = r1u
         qp1(i, j, nz) = q1u
-        rho(i, j, nz) = apply_mask(split_eos_insitu(r1u, q1u, zru), rm)
+        rho(i, j, nz) = apply_mask(split_eos_insitu((r1u), (q1u), (zru)), (rm))
         dpth = -zru
         cff = Hz(i, j, nz) * (r1u + q1u * dpth * (1.0_rp - qp2 * dpth))
         rS = 0.5_rp * cff * Hz(i, j, nz)
@@ -86,16 +91,16 @@ contains
           else
             Ts = 35.0_rp
           endif
-          r1 = jackett_rho1(Tt, Ts)
-          q1 = jackett_qp1(Tt, Ts, r1)
-          r1m = apply_mask(r1, rm)
-          q1m = apply_mask(q1, rm)
+          r1 = jackett_rho1((Tt), (Ts))
+          q1 = jackett_qp1((Tt), (Ts), (r1))
+          r1m = apply_mask((r1), (rm))
+          q1m = apply_mask((q1), (rm))
           zrk = z_r(i, j, k)
           rho1(i, j, k) = r1m
           qp1(i, j, k) = q1m
-          rho(i, j, k) = apply_mask(split_eos_insitu(r1m, q1m, zrk), rm)
-          bv = apply_mask(-cffg * adiabatic_diff(r1u, r1m, q1u, q1m, zru, zrk) / &
-               max(zru - zrk, 1.0e-30_rp), rm)
+          rho(i, j, k) = apply_mask(split_eos_insitu((r1m), (q1m), (zrk)), (rm))
+          bv = apply_mask(-cffg * adiabatic_diff((r1u), (r1m), (q1u), (q1m), (zru), (zrk)) / &
+               max(zru - zrk, 1.0e-30_rp), (rm))
           bvf(i, j, k) = bv
           if (k == nz - 1) bvf(i, j, nz) = bv
           dpth = -zrk
@@ -106,8 +111,8 @@ contains
         enddo
         bvf(i, j, 0) = bv
         cff = 1.0_rp / max(z_w(i, j, nz) - z_w(i, j, 0), 1.0e-30_rp)
-        rhoA(i, j) = apply_mask(cff * cff1 * rA, rm)
-        rhoS(i, j) = apply_mask(2.0_rp * cff * cff * cff1 * rS, rm)
+        rhoA(i, j) = apply_mask(cff * cff1 * rA, (rm))
+        rhoS(i, j) = apply_mask(2.0_rp * cff * cff * cff1 * rS, (rm))
       enddo
     enddo
     call sync_arch()

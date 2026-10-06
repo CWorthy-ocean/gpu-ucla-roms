@@ -25,6 +25,7 @@ module arch_mod
 #endif
 
   public :: init_arch
+  public :: select_device
   public :: on_gpu
   public :: sync_arch
   public :: arch_name
@@ -52,6 +53,20 @@ contains
     arch = ARCH_CPU
 #endif
   end subroutine init_arch
+
+  subroutine select_device(rank)
+    ! One GPU per compute rank: device = rank modulo the visible device count.
+    integer, intent(in) :: rank
+#ifdef USE_CUDA
+    integer :: ierr, ndev, dev
+    ierr = cudaGetDeviceCount(ndev)
+    if (ierr /= 0 .or. ndev < 1) error stop 'select_device: no CUDA device'
+    dev = mod(rank, ndev)
+    ierr = cudaSetDevice(dev)
+    if (ierr /= 0) error stop 'select_device: cudaSetDevice'
+    write(*,'(a,i0,a,i0,a,i0)') 'arch: rank ', rank, ' -> GPU ', dev, ' of ', ndev
+#endif
+  end subroutine select_device
 
   logical function on_gpu()
     on_gpu = (arch == ARCH_GPU)

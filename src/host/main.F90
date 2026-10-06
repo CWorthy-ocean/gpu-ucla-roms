@@ -6,7 +6,7 @@ program roms_gpu
   use step_driver
   use case_io, only: load_case, report_loaded_case
   use his_io, only: maybe_wrt_output
-  use arch_mod, only: init_arch, arch_name
+  use arch_mod, only: init_arch, arch_name, select_device
   use comm_mod, only: init_comm, finalize_comm, comm_rank, comm_size, is_io_rank
   use io_server, only: io_server_run, io_finalize
   implicit none
@@ -26,6 +26,7 @@ program roms_gpu
     call finalize_comm()
     stop
   endif
+  call select_device(comm_rank())
   call init_arch()
 
   ! Ideal-box defaults stay one tile. A loaded case uses namelist

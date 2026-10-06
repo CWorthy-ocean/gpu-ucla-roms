@@ -182,8 +182,11 @@ contains
     call halo_ensure()
     call step2d_pre()
     call host_zeta_obc()
+    call halo_fill_2d_n(zeta, STAGGER_RHO)   ! halo rows next to a physical edge see the OBC values
     call step2d_mid()
     call host_uv_obc()
+    call halo_fill_2d_n(ubar, STAGGER_U)     ! every fast step, as the CPU step2d exchange
+    call halo_fill_2d_n(vbar, STAGGER_V)
     if (fast_is_last_h) then
       call step2d_last_zeta()
       call halo_fill_2d_n(zeta, STAGGER_RHO)
@@ -349,7 +352,6 @@ contains
         ko = fast%kold
         if (i >= 1 .and. i <= nx .and. j >= 1 .and. j <= ny) zeta(i, j, kn) = zeta_new(i, j)
         zk = zeta(i, j, kn)
-        Dnew(i, j) = h(i, j) + zk
         if (first) then
           ! FIRST_2D_STEP: bak over istrR:iendR / jstrR:jendR (the north
           ! U-row j=ny+1 that set_HUV1 reads included), then zero the
@@ -372,6 +374,22 @@ contains
              DU_avg2(i, j) = DU_avg2(i, j) + fast%w2 * DUon(i, j)
         if (i >= iv0 .and. i <= iv1 .and. j >= 1 .and. j <= ny + 1) &
              DV_avg2(i, j) = DV_avg2(i, j) + fast%w2 * DVom(i, j)
+      enddo
+    enddo
+    ! The seam halo of zeta(knew) must be current before Dnew and the PGF
+    ! state are formed at the halo points (the east/north tile's u(1)/v(1)
+    ! update uses Dnew(0) and rzeta(0)). Same per-point arithmetic as the
+    ! former single launch; on one tile the exchange is a no-op.
+    call halo_fill_2d_n(zeta, STAGGER_RHO)
+    CUF_DO2
+    do j = js, je
+      do i = is, ie
+        kn = fast%knew
+        ks = fast%kstp
+        kb = fast%kbak
+        ko = fast%kold
+        zk = zeta(i, j, kn)
+        Dnew(i, j) = h(i, j) + zk
         ! fill_pgf_state(.false.)
         z_old = zeta(i, j, ks)
         zwrk(i, j) = fast%bkw_new * zk + fast%bkw * z_old &
@@ -381,7 +399,6 @@ contains
         rzeta2(i, j) = rzeta(i, j) * zwrk(i, j)
       enddo
     enddo
-    call halo_fill_2d_n(zeta, STAGGER_RHO)
 
     ! apply_pgf(.false.) for u and v, plus DUon = h + zeta(kstp).
     CUF_DO2
@@ -618,7 +635,7 @@ contains
     ! One launch over the longest edge; the four edges write disjoint
     ! cells, so the pieces of the former per-edge kernels run together.
     real(rp), intent(in) :: cff1
-    integer(ip) :: m, nx, ny, kn, mmax
+    integer(ip) :: m, nx, ny, kn, mmax, jr0, jr1, ir0, ir1, jv_lo, iu_lo
     real(rp) :: w
     logical :: ew, ee, es, en
     nx = decomp%nx
@@ -628,39 +645,52 @@ contains
     ew = decomp%edge_w; ee = decomp%edge_e; es = decomp%edge_s; en = decomp%edge_n
     if (.not. (ew .or. ee .or. es .or. en)) return
     mmax = max(nx, ny) + 1
-    ! Match CPU step2d: WEST/EAST DU_avg1 over jstrR:jendR (j=0:ny+1),
-    ! DV_avg1 over jstrV:jend (j=2:ny on a south edge); NORTH/SOUTH
-    ! DU_avg1 over istrU:iend (i=2:nx), DV_avg1 over istrR:iendR (i=0:nx+1).
+    ! Match CPU step2d: WEST/EAST DU_avg1 over jstrR:jendR, DV_avg1 over
+    ! jstrV:jend; NORTH/SOUTH DU_avg1 over istrU:iend, DV_avg1 over
+    ! istrR:iendR. The CPU tile ranges: jstrR = 0 / jstrV = 2 only at a
+    ! physical south edge (else 1: the seam row is this tile's interior),
+    ! jendR = ny+1 only at a physical north edge (else ny), and likewise in i.
+    call rho_bounds_r(ir0, ir1, jr0, jr1)
+    jv_lo = merge(2, 1, es)
+    iu_lo = merge(2, 1, ew)
     CUF_DO1
     do m = 0, mmax
-      if (m <= ny + 1) then
+      if (m >= jr0 .and. m <= jr1) then
         if (ew) then
           DU_avg1(1, m) = DU_avg1(1, m) + w * (Dnew(1, m) + Dnew(0, m)) * &
                           ubar(1, m, kn) * dn_u(1, m)
-          if (m >= 2 .and. m <= ny) &
-               DV_avg1(0, m) = DV_avg1(0, m) + w * (Dnew(0, m) + Dnew(0, m - 1)) * &
-                               vbar(0, m, kn) * dm_v(0, m)
         endif
         if (ee) then
           DU_avg1(nx + 1, m) = DU_avg1(nx + 1, m) + w * (Dnew(nx + 1, m) + Dnew(nx, m)) * &
                                ubar(nx + 1, m, kn) * dn_u(nx + 1, m)
-          if (m >= 2 .and. m <= ny) &
-               DV_avg1(nx + 1, m) = DV_avg1(nx + 1, m) + w * (Dnew(nx + 1, m) + Dnew(nx + 1, m - 1)) * &
-                                    vbar(nx + 1, m, kn) * dm_v(nx + 1, m)
         endif
       endif
-      if (m <= nx + 1) then
+      if (m >= jv_lo .and. m <= ny) then
+        if (ew) then
+          DV_avg1(0, m) = DV_avg1(0, m) + w * (Dnew(0, m) + Dnew(0, m - 1)) * &
+                          vbar(0, m, kn) * dm_v(0, m)
+        endif
+        if (ee) then
+          DV_avg1(nx + 1, m) = DV_avg1(nx + 1, m) + w * (Dnew(nx + 1, m) + Dnew(nx + 1, m - 1)) * &
+                               vbar(nx + 1, m, kn) * dm_v(nx + 1, m)
+        endif
+      endif
+      if (m >= iu_lo .and. m <= nx) then
         if (es) then
-          if (m >= 2 .and. m <= nx) &
-               DU_avg1(m, 0) = DU_avg1(m, 0) + w * (Dnew(m, 0) + Dnew(m - 1, 0)) * &
-                               ubar(m, 0, kn) * dn_u(m, 0)
+          DU_avg1(m, 0) = DU_avg1(m, 0) + w * (Dnew(m, 0) + Dnew(m - 1, 0)) * &
+                          ubar(m, 0, kn) * dn_u(m, 0)
+        endif
+        if (en) then
+          DU_avg1(m, ny + 1) = DU_avg1(m, ny + 1) + w * (Dnew(m, ny + 1) + Dnew(m - 1, ny + 1)) * &
+                               ubar(m, ny + 1, kn) * dn_u(m, ny + 1)
+        endif
+      endif
+      if (m >= ir0 .and. m <= ir1) then
+        if (es) then
           DV_avg1(m, 1) = DV_avg1(m, 1) + w * (Dnew(m, 1) + Dnew(m, 0)) * &
                           vbar(m, 1, kn) * dm_v(m, 1)
         endif
         if (en) then
-          if (m >= 2 .and. m <= nx) &
-               DU_avg1(m, ny + 1) = DU_avg1(m, ny + 1) + w * (Dnew(m, ny + 1) + Dnew(m - 1, ny + 1)) * &
-                                    ubar(m, ny + 1, kn) * dn_u(m, ny + 1)
           DV_avg1(m, ny + 1) = DV_avg1(m, ny + 1) + w * (Dnew(m, ny + 1) + Dnew(m, ny)) * &
                                vbar(m, ny + 1, kn) * dm_v(m, ny + 1)
         endif

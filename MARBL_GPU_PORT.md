@@ -209,6 +209,101 @@ module fixed it. CUF kernel bodies cannot hold local arrays (per-thread
 tracer blocks need an explicit kernel). Never run two makes concurrently
 in `build_gpu`.
 
+## Multi-GPU tiling (2026-10-06)
+
+MiniPac on four A100s of one node: `np_xi = np_eta = 2` compute ranks,
+one GPU each (`select_device(rank)` before `init_arch`), plus the I/O
+server on the last world rank (`mpiexec -n 5 -ppn 5`, qsub
+`select=1:ncpus=64:mpiprocs=5:ngpus=4`). Output stays in single files:
+every tile reads its window of the global grid, forcing, boundary and
+tide files (`decomp%i0/j0` is the file index of local point 0, the same
+pair for every stagger), and writes its owned slab at the matching global
+offset, either through the server (history) or rank by rank into one
+NetCDF file (restart). The 4-step and the 3-day 2x2 runs are bit-identical
+to the 1x1 runs in history and restart (`tools/gpu_bitwise_pair.py 4r 4q`,
+`3dv3 3dq`), and the 1x1 run is unchanged against the committed reference.
+
+Seam bugs that had to be fixed (none of them visible on one tile, which
+is why the earlier single-rank validation never caught them):
+
+1. Static grid fields and every field read from the initial/restart file
+   were read over the tile window only; their two halo points toward a
+   neighbor were never filled (`fill_static_halos`, `fill_loaded_halos`
+   in case_io.F90).
+2. The u/v exchange never carried the seam face. Convention: the halo
+   exchange uses the rho-cell range for every stagger, so the seam face
+   u(nx+1)/v(ny+1) is the east/north tile's point 1 and arrives on the
+   west/south tile as a halo (plus one more point). uv_rhs and prsgrd
+   compute the face on both sides, step3d_uv and rufrc only on the
+   east/north side; the exchange makes them consistent. The old sends
+   were off by one for the staggered direction (also for periodic wrap).
+3. The fast barotropic loop exchanged zeta only. ubar/vbar are now
+   exchanged every fast step after the OBC, zeta again after its OBC, and
+   the step2d_mid kernel was split so Dnew and the PGF state at the halo
+   points use the exchanged zeta(knew) (the east/north tile's u(1)/v(1)
+   update reads them).
+4. Loop ranges that were the CPU single-domain ranges: the boundary-column
+   accumulation of DU/DV_avg1 (`jstrV:jend` = 2:ny only at a physical
+   south edge) and the bulk_coare current-feedback loops (stop at nx/ny
+   only at a physical east/north edge).
+5. Writers wrote each tile's full local range including halos; the last
+   arrival won, which showed up only in arrays that are never exchanged
+   (DU/DV_avg*, MARBL pH state, MARBL diagnostics). `set_write_bounds`
+   now writes owned points only and each slab carries its file start
+   shift (rho axes +ir0/+jr0, u/v axes 0) through `io_stage_*(…, di, dj)`
+   and the restart `put_*` helpers.
+
+How they were found: per-step history runs of both cases
+(`output_period_his = 900`, cases `4r1`/`4q1`) and
+`scratchpad/seam_map.py <rec>`, which counts differing columns per field
+by signed offset from the seams (file i = 257, j = 217 for MiniPac). The
+first record that differs, the fields in it and the offset pattern
+(e.g. hbls differing at W nx-1, nx and E 1 only; vbar zero at the
+boundary column on the seam row) pointed at each bug directly.
+
+Exchange cost: the original delivery (`comm_exchange2/3`: managed send
+and receive buffers read and written on the host with allocate+reshape
+and a cudaDeviceSynchronize per exchange) costs ~19 ms per 3-D exchange
+and ~1.2 ms per 2-D one; with 60 fast steps the 2x2 step took 7.5 s
+against 0.69 s on one GPU. `deliver_dev` (halo.F90) now packs on the
+device, copies the packed buffers with cudaMemcpy into pinned host
+buffers, exchanges them with `comm_sendrecv_raw` (contiguous, no
+allocation) and copies back before the unpack kernels; pure copies, so
+bit-identity is unaffected: 7.3 -> 1.43 s per step. The rest was two
+kernels (rho_eos column kernel, the two fused prsgrd kernels) that the
+CUF runtime launched with a single block on tiles only (161 / 117 / 85 ms
+instead of 1.5 / 1.8 / 1.2 ms; the strided loop still covered the tile, so
+results were unaffected). Cause: loop scalars passed by reference to the
+formulas device functions (`-Minfo=accel`: "implicit copyin",
+"Reference argument passing prevents parallelization", launch reported as
+`<<< (1,1), (32,4) >>>`); the binary holds two variants of such a kernel
+and the runtime picked the single-block one on tiles. Parenthesizing the
+scalar call arguments (`jackett_rho1((Tt), (Ts))`) passes temporaries,
+restores a runtime grid and is bit-identical. 2x2 four-step last step
+(with the hourly MARBL call): 0.536 s against 0.580 s on one GPU; the
+3-day mean step: 0.151 s on 2x2 tiles against 0.389 s on one GPU (2.6x
+on 4 GPUs; 288 steps in 43.5 s of step time, history every 6 h), with the
+3-day 2x2 run bit-identical to the 1x1 run. The remaining gap to 4x is
+per-exchange latency: ~1800 exchanges per step (the fast loop alone does
+60 x 4 fills), each with four synchronous staging copies and two
+MPI_Sendrecv calls; GPU busy time is ~0.27 s of a 0.8 s MARBL step.
+GPU-aware MPI on the device buffers (`comm_sendrecv_dev`, used when the
+job sets MPICH_GPU_SUPPORT_ENABLED=1 and the binary is linked with
+`-L/opt/cray/pe/mpich/8.1.32/gtl/lib -lmpi_gtl_cuda`; `deliver_dev` falls
+back to pinned staging otherwise) and one 3-D exchange for the smoothed
+Richardson number in lmd (was nz-1 2-D exchanges) bring the 3-day mean
+step to 0.144 s (2.7x on 4 GPUs; 9.7 min of walltime for the 3-day case),
+still bit-identical in history and restart. The per-rank step totals are
+now unequal (28 to 41.5 s over 288 steps): the slowest tile sets the
+pace, so load balance (wet columns per tile) and the remaining ~1800
+exchanges per step are the next levers, followed by multi-node runs and
+the CPU-vs-GPU benchmark at equal node counts.
+
+Case files (cases/GPU): `namelist_roms_gpu_marbl4q.nml` /
+`submit_roms_gpu_marbl4q.sh` (4 steps, restart after 4 steps),
+`…4q1` (history every step), `…3dq` (3 days, 6-hourly history, 50 min
+walltime with the old exchange); 1x1 counterparts `4r`, `4r1`, `3dv3`.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;
