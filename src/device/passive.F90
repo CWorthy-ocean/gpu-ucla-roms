@@ -165,10 +165,12 @@ contains
     real(rp), intent(in) :: dtau, cf_stp, cf_bak
     integer(ip), intent(in) :: n_stp, n_new, indx
     if (ntp <= 0) return
-    call halo_fill_3d_tp(tp, ntp, nrhs)
+    ! Slot nrhs (= nstp) is the previous step's nnew, exchanged after its
+    ! t3dmix (or at load); nothing writes tp in between, so no exchange
+    ! here. Slot n_new is exchanged by pre_step3d after passive_t3dbc, and
+    ! nothing reads its halo before that (t3dbc reads slot nstp).
     call passive_horiz_run(tp, ntp, 1_ip, nrhs, n_stp, n_new, indx, cf_stp, cf_bak, dtau)
     call passive_column_run(tp, ntp, nrhs, n_new, dtau, 1_ip, .true., passive_mirror)
-    call halo_fill_3d_tp(tp, ntp, n_new)
   end subroutine passive_predictor
 
   ! --------------------------------------------------------- corrector
@@ -182,7 +184,8 @@ contains
     call passive_horiz_run(tp, ntp, 2_ip, nrhs, nnew, nnew, nnew, 0.0_rp, 0.0_rp, dt_in)
     call passive_column_run(tp, ntp, nrhs, nnew, dt_in, 0_ip, .false., passive_mirror)
     call passive_t3dbc()
-    call halo_fill_3d_tp(tp, ntp, nnew)
+    ! No exchange of slot nnew here: MARBL and t3dmix read it at the point
+    ! only (t3dmix's stencil is slot nrhs) and passive_t3dmix exchanges it.
   end subroutine passive_corrector
 
   ! ------------------------------------------------ lateral diffusion

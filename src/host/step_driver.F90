@@ -561,10 +561,23 @@ contains
   end subroutine step_timer_lap
 
   subroutine step_mark(msg)
+    ! Phase stamps: each one drains the device (cudaDeviceSynchronize) and
+    ! prints; by default only the end-of-step stamp is kept (its cumul is
+    ! the step time). ROMS_GPU_STEP_MARKS=1 restores every phase stamp.
     character(len=*), intent(in) :: msg
     integer :: now
     real(rp) :: dt_sec, tot_sec
+    logical, save :: checked = .false., all_marks = .false.
+    character(len=16) :: val
+    integer :: stat
 
+    if (.not. checked) then
+      checked = .true.
+      call get_environment_variable('ROMS_GPU_STEP_MARKS', val, status=stat)
+      all_marks = (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) /= '0')
+      if (.not. all_marks) write(*,'(a)') 'step_driver: phase stamps off (ROMS_GPU_STEP_MARKS=1 to print them)'
+    endif
+    if (.not. all_marks .and. msg /= 'baroclinic step') return
     call sync_arch()
     if (clock_rate <= 0) then
       write(*,'(a,a)') 'step: ', trim(msg)

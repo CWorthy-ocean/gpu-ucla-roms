@@ -44,6 +44,9 @@ module par_read
   end type sb_t
   type(ent_t), save :: q(MAXQ)
   integer :: nq = 0, inext = 0, mode = 0   ! mode 0 idle, 1 queueing, 2 taking
+  ! ROMS_GPU_PAR_READ = 'mpiio': every rank reads its windows collectively
+  ! through parallel NetCDF (MPI-IO) instead of the whole-variable scheme.
+  logical :: use_mpiio = .false., mode_checked = .false.
   ! device staging for the stores (grown to the largest window)
 #ifdef USE_CUDA
   real(rp), device, allocatable :: dstage(:)
@@ -219,17 +222,28 @@ contains
     ! reads it whole and sends every tile its window; all ranks receive
     ! their windows of the batch's variables.
     integer, intent(in) :: ncid
-    integer :: nc, me, nb, b, iv, jv, jv0, jv1, t, n, gx, gy, k
+    integer :: nc, me, nb, b, iv, jv, t, n, k, cur, prv, stat
+    character(len=8) :: val
+    integer :: gx(2), gy(2)
     integer(8) :: c0, c1, c2, crate
-    real(rp), allocatable :: fbuf(:)
+    type(sb_t) :: fbuf(2)
 #ifdef USE_MPI
-    integer :: comm, ierr, ntot, src
-    integer, allocatable :: win(:,:,:), mine(:,:), rreq(:), sreq(:), nqs(:)
-    type(sb_t), allocatable :: sb(:)
+    integer :: comm, ierr, src
+    integer, allocatable :: win(:,:,:), mine(:,:), rreq(:), sreq(:,:), nqs(:)
+    type(sb_t), allocatable :: sb(:,:)
 #endif
     if (mode /= 1) error stop 'pr_flush: not in the queueing phase'
     nc = comm_size(); me = comm_rank()
+    if (.not. mode_checked) then
+      call get_environment_variable('ROMS_GPU_PAR_READ', val, status=stat)
+      use_mpiio = (stat == 0 .and. val(1:5) == 'mpiio')
+      mode_checked = .true.
+    endif
 #ifdef USE_MPI
+    if (use_mpiio .and. nc > 1) then
+      if (flush_mpiio(ncid)) return
+      if (me == 0) write(*,'(a)') 'par_read: parallel (MPI-IO) open not available for this file; using whole-variable reads'
+    endif
     comm = comm_compute()
     allocate(nqs(0:nc - 1))
     call MPI_Allgather(nq, 1, MPI_INTEGER, nqs, 1, MPI_INTEGER, comm, ierr)
@@ -243,57 +257,122 @@ contains
     call MPI_Allgather(mine, 4 * nq, MPI_INTEGER, win, 4 * nq, MPI_INTEGER, comm, ierr)
     deallocate(mine)
     nb = (nq + nc - 1) / nc
-    allocate(rreq(nc), sreq(0:nc - 1), sb(0:nc - 1))
+    ! Every window is received into its own buffer, so post all receives
+    ! now; then read one variable per batch and send its windows without
+    ! waiting, keeping one batch of send buffers in flight behind the reads.
+    allocate(rreq(nq))
+    do jv = 1, nq
+      n = q(jv)%n1 * q(jv)%n2 * q(jv)%n3
+      allocate(q(jv)%buf(n))
+      src = jv - 1 - ((jv - 1) / nc) * nc
+      call MPI_Irecv(q(jv)%buf, n, MPI_REAL8, src, jv, comm, rreq(jv), ierr)
+    enddo
+    allocate(sreq(0:nc - 1, 2), sb(0:nc - 1, 2))
+    sreq = MPI_REQUEST_NULL
     do b = 0, nb - 1
       iv = b * nc + me + 1
-      jv0 = b * nc + 1
-      jv1 = min(nq, (b + 1) * nc)
+      cur = mod(b, 2) + 1
+      prv = 3 - cur
       call system_clock(c0, crate)
-      if (iv <= nq) call read_full(ncid, q(iv), fbuf, gx, gy)
+      if (iv <= nq) call read_full(ncid, q(iv), fbuf(cur)%b, gx(cur), gy(cur))
       call system_clock(c1, crate)
       t_read = t_read + real(c1 - c0, 8) / real(crate, 8)
-      rreq = MPI_REQUEST_NULL
-      do jv = jv0, jv1
-        n = q(jv)%n1 * q(jv)%n2 * q(jv)%n3
-        allocate(q(jv)%buf(n))
-        src = jv - 1 - b * nc
-        call MPI_Irecv(q(jv)%buf, n, MPI_REAL8, src, jv, comm, rreq(jv - jv0 + 1), ierr)
-      enddo
-      sreq = MPI_REQUEST_NULL
       if (iv <= nq) then
         do t = 0, nc - 1
           n = win(1, iv, t) * win(2, iv, t) * q(iv)%n3
-          allocate(sb(t)%b(n))
-          call pack_window(fbuf, gx, gy, q(iv)%n3, win(3, iv, t), win(4, iv, t), &
-                           win(1, iv, t), win(2, iv, t), sb(t)%b)
-          call MPI_Isend(sb(t)%b, n, MPI_REAL8, t, iv, comm, sreq(t), ierr)
+          allocate(sb(t, cur)%b(n))
+          call pack_window(fbuf(cur)%b, gx(cur), gy(cur), q(iv)%n3, win(3, iv, t), win(4, iv, t), &
+                           win(1, iv, t), win(2, iv, t), sb(t, cur)%b)
+          call MPI_Isend(sb(t, cur)%b, n, MPI_REAL8, t, iv, comm, sreq(t, cur), ierr)
         enddo
       endif
-      call MPI_Waitall(jv1 - jv0 + 1, rreq, MPI_STATUSES_IGNORE, ierr)
-      if (iv <= nq) call MPI_Waitall(nc, sreq, MPI_STATUSES_IGNORE, ierr)
+      ! the previous batch's sends must be done before its buffers go
+      call MPI_Waitall(nc, sreq(:, prv), MPI_STATUSES_IGNORE, ierr)
+      sreq(:, prv) = MPI_REQUEST_NULL
+      do t = 0, nc - 1
+        if (allocated(sb(t, prv)%b)) deallocate(sb(t, prv)%b)
+      enddo
+      if (allocated(fbuf(prv)%b)) deallocate(fbuf(prv)%b)
       call system_clock(c2, crate)
       t_comm = t_comm + real(c2 - c1, 8) / real(crate, 8)
-      if (iv <= nq) then
-        do t = 0, nc - 1
-          deallocate(sb(t)%b)
-        enddo
-        deallocate(fbuf)
-      endif
     enddo
+    call system_clock(c1, crate)
+    do cur = 1, 2
+      call MPI_Waitall(nc, sreq(:, cur), MPI_STATUSES_IGNORE, ierr)
+      do t = 0, nc - 1
+        if (allocated(sb(t, cur)%b)) deallocate(sb(t, cur)%b)
+      enddo
+      if (allocated(fbuf(cur)%b)) deallocate(fbuf(cur)%b)
+    enddo
+    call MPI_Waitall(nq, rreq, MPI_STATUSES_IGNORE, ierr)
+    call system_clock(c2, crate)
+    t_comm = t_comm + real(c2 - c1, 8) / real(crate, 8)
     deallocate(rreq, sreq, sb, win)
     write(*,'(a,i0,a,i0,a,f7.2,a,f7.2,a)') 'par_read: rank ', me, '  vars ', nq, '  whole-variable reads ', t_read, &
          ' s  redistribution ', t_comm, ' s'
     t_read = 0.0d0; t_comm = 0.0d0
 #else
     do iv = 1, nq
-      call read_full(ncid, q(iv), fbuf, gx, gy)
+      call read_full(ncid, q(iv), fbuf(1)%b, gx(1), gy(1))
       n = q(iv)%n1 * q(iv)%n2 * q(iv)%n3
       allocate(q(iv)%buf(n))
-      call pack_window(fbuf, gx, gy, q(iv)%n3, q(iv)%i0f, q(iv)%j0f, q(iv)%n1, q(iv)%n2, q(iv)%buf)
-      deallocate(fbuf)
+      call pack_window(fbuf(1)%b, gx(1), gy(1), q(iv)%n3, q(iv)%i0f, q(iv)%j0f, q(iv)%n1, q(iv)%n2, q(iv)%buf)
+      deallocate(fbuf(1)%b)
     enddo
 #endif
   end subroutine pr_flush
+
+#ifdef USE_MPI
+  logical function flush_mpiio(ncid) result(ok)
+    ! Collective window reads: the file is opened once more in parallel mode
+    ! on the compute communicator and every queued window is read by its
+    ! rank with collective access (same variable order on every rank).
+    integer, intent(in) :: ncid
+    integer :: pncid, varid, ndims, k, n, ierr, nvars, v
+    integer(8) :: c0, c1, crate
+    character(len=1024) :: path
+    integer, allocatable :: start(:), cnt(:)
+    call nc_check(nf90_inq_path(ncid, n, path), 'inq_path')
+    call system_clock(c0, crate)
+    ok = .false.
+    ierr = nf90_open(trim(path), ior(nf90_nowrite, nf90_mpiio), pncid, comm=comm_compute(), info=MPI_INFO_NULL)
+    if (ierr /= nf90_noerr) return
+    call nc_check(nf90_inquire(pncid, nvariables=nvars), 'inquire')
+    do v = 1, nvars
+      ierr = nf90_var_par_access(pncid, v, nf90_collective)
+      if (ierr /= nf90_noerr) then
+        ierr = nf90_close(pncid)
+        return
+      endif
+    enddo
+    ok = .true.
+    do k = 1, nq
+      n = q(k)%n1 * q(k)%n2 * q(k)%n3
+      allocate(q(k)%buf(n))
+      call nc_check(nf90_inq_varid(pncid, trim(q(k)%name), varid), 'var '//trim(q(k)%name))
+      call nc_check(nf90_inquire_variable(pncid, varid, ndims=ndims), 'ndims '//trim(q(k)%name))
+      if (q(k)%n3 == 1) then
+        if (q(k)%rec > 0 .and. ndims >= 3) then
+          allocate(start(3), cnt(3)); start = (/q(k)%i0f, q(k)%j0f, q(k)%rec/); cnt = (/q(k)%n1, q(k)%n2, 1/)
+        else
+          allocate(start(2), cnt(2)); start = (/q(k)%i0f, q(k)%j0f/); cnt = (/q(k)%n1, q(k)%n2/)
+        endif
+      else
+        if (q(k)%rec > 0 .and. ndims >= 4) then
+          allocate(start(4), cnt(4)); start = (/q(k)%i0f, q(k)%j0f, 1, q(k)%rec/); cnt = (/q(k)%n1, q(k)%n2, q(k)%n3, 1/)
+        else
+          allocate(start(3), cnt(3)); start = (/q(k)%i0f, q(k)%j0f, 1/); cnt = (/q(k)%n1, q(k)%n2, q(k)%n3/)
+        endif
+      endif
+      call nc_check(nf90_get_var(pncid, varid, q(k)%buf, start=start, count=cnt), 'get '//trim(q(k)%name))
+      deallocate(start, cnt)
+    enddo
+    call nc_check(nf90_close(pncid), 'close parallel')
+    call system_clock(c1, crate)
+    write(*,'(a,i0,a,i0,a,f7.2,a)') 'par_read: rank ', comm_rank(), '  vars ', nq, '  collective MPI-IO window reads ', &
+         real(c1 - c0, 8) / real(crate, 8), ' s'
+  end function flush_mpiio
+#endif
 
   subroutine stage_to_device(k, n)
     ! The taken window k (host) into the device staging buffer.

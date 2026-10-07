@@ -3,10 +3,14 @@ module nc_io
   use kinds
   use netcdf
   implicit none
+#ifdef USE_MPI
+  include 'mpif.h'
+#endif
   private
 
   public :: nc_open_read
   public :: nc_open_write
+  public :: nc_open_write_par, nc_set_par_access
   public :: nc_create
   public :: nc_sync
   public :: nc_def_var_f
@@ -46,6 +50,7 @@ contains
     character(len=*), intent(in) :: where
     if (ierr /= nf90_noerr) then
       write(*,*) 'netcdf error in ', trim(where), ': ', trim(nf90_strerror(ierr))
+      flush(6)
       error stop 'nc_io'
     endif
   end subroutine nc_check
@@ -61,6 +66,60 @@ contains
     integer,          intent(out) :: ncid
     call nc_check(nf90_open(trim(path), nf90_write, ncid), 'openw '//trim(path))
   end subroutine nc_open_write
+
+  subroutine nc_open_write_par(path, ncid, comm)
+    ! Open for writing from several ranks at once (parallel NetCDF-4 /
+    ! HDF5, collective over comm); every variable set to independent access
+    ! so each writer puts its own variables without the others.
+    character(len=*), intent(in)  :: path
+    integer,          intent(out) :: ncid
+    integer,          intent(in)  :: comm
+#ifdef USE_MPI
+    integer :: nvars, v
+    call nc_check(nf90_open(trim(path), ior(nf90_write, nf90_mpiio), ncid, comm=comm, info=MPI_INFO_NULL), &
+                  'parallel open '//trim(path))
+    call nc_check(nf90_inquire(ncid, nvariables=nvars), 'inquire '//trim(path))
+    do v = 1, nvars
+      call nc_check(nf90_var_par_access(ncid, v, nf90_independent), 'par_access')
+    enddo
+#else
+    error stop 'nc_open_write_par: needs MPI'
+#endif
+  end subroutine nc_open_write_par
+
+  subroutine nc_set_par_access(ncid, collective)
+    ! All variables collective (.true.) or independent (parallel NetCDF).
+    integer, intent(in) :: ncid
+    logical, intent(in) :: collective
+#ifdef USE_MPI
+    integer :: nvars, v, mode
+    mode = nf90_independent
+    if (collective) mode = nf90_collective
+    call nc_check(nf90_inquire(ncid, nvariables=nvars), 'inquire')
+    do v = 1, nvars
+      call nc_check(nf90_var_par_access(ncid, v, mode), 'par_access')
+    enddo
+#endif
+  end subroutine nc_set_par_access
+
+  subroutine nc_chunk_one_record(ncid, varid, dimids)
+    integer, intent(in) :: ncid, varid, dimids(:)
+    integer :: i, n, unlim, chunks(size(dimids))
+    logical :: has_rec
+    call nc_check(nf90_inquire(ncid, unlimitedDimId=unlim), 'inquire unlimited')
+    has_rec = .false.
+    do i = 1, size(dimids)
+      if (dimids(i) == unlim) then
+        chunks(i) = 1
+        has_rec = .true.
+      else
+        call nc_check(nf90_inquire_dimension(ncid, dimids(i), len=n), 'dim len')
+        chunks(i) = n
+      endif
+    enddo
+    if (has_rec .and. size(dimids) >= 2) &
+         call nc_check(nf90_def_var_chunking(ncid, varid, nf90_chunked, chunks), 'chunking')
+  end subroutine nc_chunk_one_record
 
   subroutine nc_create(path, ncid)
     character(len=*), intent(in)  :: path
@@ -193,6 +252,10 @@ contains
     integer,          intent(in) :: ncid, dimids(:)
     character(len=*), intent(in) :: name
     call nc_check(nf90_def_var(ncid, trim(name), nf90_double, dimids, varid), 'def_var '//trim(name))
+    ! Record variables chunked as one record (as the float history
+    ! variables): one chunk per put, and parallel HDF5 can then write a
+    ! record independently once it has been extended collectively.
+    call nc_chunk_one_record(ncid, varid, dimids)
   end function nc_def_var
 
   integer function nc_def_var_f(ncid, name, dimids) result(varid)

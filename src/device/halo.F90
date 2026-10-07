@@ -13,6 +13,7 @@ module halo_mod
                        rufrc, rvfrc, wrk3a, wrk3b, ubar, vbar, zeta
 #ifdef USE_CUDA
   use cudafor
+  use iso_c_binding, only: c_f_pointer
 #endif
   use arch_mod, only: sync_arch
 #ifdef USE_CUDA
@@ -42,7 +43,17 @@ module halo_mod
   ! Group exchange state and buffers (device; grown on demand).
   integer, parameter :: HG_MAX = 40
   integer :: hg_n = 0, hg_nlev_tot = 0
+  logical :: hg_batch = .true., hg_batch_checked = .false.    ! ROMS_GPU_HG_BATCH=n fields per launch (0: off)
+  integer :: hg_stat, hg_per_launch = 4
+  character(len=4) :: hg_val
   integer :: hg_id(HG_MAX), hg_slot(HG_MAX), hg_itr(HG_MAX), hg_lev0(HG_MAX), hg_nlev(HG_MAX)
+#ifdef USE_CUDA
+  ! device address and level range of each registered field, so one kernel
+  ! can pack/unpack up to HG_PER_LAUNCH fields with the same level range
+  integer, parameter :: HG_PER_LAUNCH = 4
+  type(c_devptr) :: hg_ptr(HG_MAX)
+  integer(ip) :: hg_kb(HG_MAX), hg_ke(HG_MAX)
+#endif
 #ifdef USE_CUDA
   real(rp), device, allocatable :: gew_slo(:,:,:), gew_shi(:,:,:), gew_rlo(:,:,:), gew_rhi(:,:,:)
   real(rp), device, allocatable :: gns_slo(:,:,:), gns_shi(:,:,:), gns_rlo(:,:,:), gns_rhi(:,:,:)
@@ -289,6 +300,40 @@ contains
       gns_slo = 0.0_rp; gns_shi = 0.0_rp; gns_rlo = 0.0_rp; gns_rhi = 0.0_rp
       hg_cap = L
     endif
+#ifdef USE_CUDA
+    if (.not. hg_batch_checked) then
+      call get_environment_variable('ROMS_GPU_HG_BATCH', hg_val, status=hg_stat)
+      ! default: 4 fields per launch; ROMS_GPU_HG_BATCH=0 restores one launch per field
+      hg_batch = .true.
+      if (hg_stat == 0 .and. len_trim(hg_val) > 0) then
+        read(hg_val, *, iostat=hg_stat) hg_per_launch
+        if (hg_stat /= 0) hg_per_launch = HG_PER_LAUNCH
+        hg_batch = (hg_per_launch >= 1)
+      endif
+      hg_per_launch = max(1, min(hg_per_launch, HG_PER_LAUNCH))
+      hg_batch_checked = .true.
+    endif
+    if (.not. hg_batch) then
+      call hg_end_single(i1, i2, j1, j2, L)
+      hg_n = 0; hg_nlev_tot = 0
+      return
+    endif
+    do k = 1, hg_n
+      call hg_resolve(int(k))
+    enddo
+    if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
+      call hg_run_phase(1, i1, i2, j1, j2)
+      call deliver3(decomp%nbr_w, decomp%nbr_e, gew_slo(:, :, 1:L), gew_shi(:, :, 1:L), &
+                    gew_rlo(:, :, 1:L), gew_rhi(:, :, 1:L))
+      call hg_run_phase(2, i1, i2, j1, j2)
+    endif
+    if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
+      call hg_run_phase(3, i1, i2, j1, j2)
+      call deliver3(decomp%nbr_s, decomp%nbr_n, gns_slo(:, :, 1:L), gns_shi(:, :, 1:L), &
+                    gns_rlo(:, :, 1:L), gns_rhi(:, :, 1:L))
+      call hg_run_phase(4, i1, i2, j1, j2)
+    endif
+#else
     if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
       do k = 1, hg_n
         call hg_dispatch(k, 1, i1, i2, j1, j2)
@@ -309,8 +354,233 @@ contains
         call hg_dispatch(k, 4, i1, i2, j1, j2)
       enddo
     endif
+#endif
     hg_n = 0; hg_nlev_tot = 0
   end subroutine hg_end
+
+#ifdef USE_CUDA
+  subroutine hg_resolve(k)
+    ! Device address + level range of field k (same table as hg_dispatch).
+    integer, intent(in) :: k
+    integer(ip) :: is, js, nz, sl, it
+    is = decomp%is; js = decomp%js; nz = decomp%nz
+    sl = hg_slot(k); it = hg_itr(k)
+    select case (hg_id(k))
+    case (F_HZ); hg_ptr(k) = c_devloc(Hz(is, js, 1)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_ZR); hg_ptr(k) = c_devloc(z_r(is, js, 1)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_ZW); hg_ptr(k) = c_devloc(z_w(is, js, 0)); hg_kb(k) = 0_ip; hg_ke(k) = nz
+    case (F_FLXU); hg_ptr(k) = c_devloc(FlxU(is, js, 1)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_FLXV); hg_ptr(k) = c_devloc(FlxV(is, js, 1)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_WE); hg_ptr(k) = c_devloc(We(is, js, 0)); hg_kb(k) = 0_ip; hg_ke(k) = nz
+    case (F_WI); hg_ptr(k) = c_devloc(Wi(is, js, 0)); hg_kb(k) = 0_ip; hg_ke(k) = nz
+    case (F_U); hg_ptr(k) = c_devloc(u(is, js, 1, sl)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_V); hg_ptr(k) = c_devloc(v(is, js, 1, sl)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_T); hg_ptr(k) = c_devloc(t(is, js, 1, sl, it)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_RHO1); hg_ptr(k) = c_devloc(rho1(is, js, 1)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_QP1); hg_ptr(k) = c_devloc(qp1(is, js, 1)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_RHO); hg_ptr(k) = c_devloc(rho(is, js, 1)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_BVF); hg_ptr(k) = c_devloc(bvf(is, js, 0)); hg_kb(k) = 0_ip; hg_ke(k) = nz
+    case (F_RHOA); hg_ptr(k) = c_devloc(rhoA(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_RHOS); hg_ptr(k) = c_devloc(rhoS(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_RU); hg_ptr(k) = c_devloc(ru(is, js, 1)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_RV); hg_ptr(k) = c_devloc(rv(is, js, 1)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_UMASK); hg_ptr(k) = c_devloc(umask(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_VMASK); hg_ptr(k) = c_devloc(vmask(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_RMASK); hg_ptr(k) = c_devloc(rmask(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_SUSTR); hg_ptr(k) = c_devloc(sustr(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_SVSTR); hg_ptr(k) = c_devloc(svstr(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_STFLX); hg_ptr(k) = c_devloc(stflx(is, js, it)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_SRFLX); hg_ptr(k) = c_devloc(srflx(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_F); hg_ptr(k) = c_devloc(f(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_HBLS); hg_ptr(k) = c_devloc(hbls(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_HBBL); hg_ptr(k) = c_devloc(hbbl(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_AKV); hg_ptr(k) = c_devloc(Akv(is, js, 0)); hg_kb(k) = 0_ip; hg_ke(k) = nz
+    case (F_AKT); hg_ptr(k) = c_devloc(Akt(is, js, 0, it)); hg_kb(k) = 0_ip; hg_ke(k) = nz
+    case (F_GHAT); hg_ptr(k) = c_devloc(ghat(is, js, 0)); hg_kb(k) = 0_ip; hg_ke(k) = nz
+    case (F_RUFRC); hg_ptr(k) = c_devloc(rufrc(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_RVFRC); hg_ptr(k) = c_devloc(rvfrc(is, js)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_WRK3A); hg_ptr(k) = c_devloc(wrk3a(is, js, 0)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_WRK3B); hg_ptr(k) = c_devloc(wrk3b(is, js, 0)); hg_kb(k) = 1_ip; hg_ke(k) = nz
+    case (F_UBAR); hg_ptr(k) = c_devloc(ubar(is, js, sl)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_VBAR); hg_ptr(k) = c_devloc(vbar(is, js, sl)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case (F_ZETA); hg_ptr(k) = c_devloc(zeta(is, js, sl)); hg_kb(k) = 1_ip; hg_ke(k) = 1_ip
+    case default
+      error stop 'hg_resolve: unknown field id'
+    end select
+  end subroutine hg_resolve
+
+  subroutine hg_run_phase(phase, i1, i2, j1, j2)
+    ! Fields with the same level range, up to HG_PER_LAUNCH at a time, in
+    ! one kernel launch each.
+    integer, intent(in) :: phase
+    integer(ip), intent(in) :: i1, i2, j1, j2
+    integer :: k, n, g
+    integer(ip) :: ni, nj, nel
+    ! contiguous: pass the base address, never a device temporary (an
+    ! intent(inout) temporary would lose the unpacked halos)
+    real(rp), device, pointer, contiguous :: p1(:), p2(:), p3(:), p4(:)
+    ni = decomp%ie - decomp%is + 1; nj = decomp%je - decomp%js + 1
+    k = 1
+    do while (k <= hg_n)
+      n = 1
+      do while (k + n <= hg_n .and. n < hg_per_launch)
+        if (hg_kb(k + n) /= hg_kb(k) .or. hg_ke(k + n) /= hg_ke(k)) exit
+        n = n + 1
+      enddo
+      nel = ni * nj * (hg_ke(k) - hg_kb(k) + 1)
+      call c_f_pointer(hg_ptr(k), p1, (/nel/))
+      p2 => p1; p3 => p1; p4 => p1
+      if (n >= 2) call c_f_pointer(hg_ptr(k + 1), p2, (/nel/))
+      if (n >= 3) call c_f_pointer(hg_ptr(k + 2), p3, (/nel/))
+      if (n >= 4) call c_f_pointer(hg_ptr(k + 3), p4, (/nel/))
+      g = min(n, HG_PER_LAUNCH)
+      call hg_slab4(g, p1, p2, p3, p4, hg_kb(k), hg_ke(k), hg_lev0(k), hg_lev0(min(k + 1, hg_n)), &
+                    hg_lev0(min(k + 2, hg_n)), hg_lev0(min(k + 3, hg_n)), phase, i1, i2, j1, j2)
+      k = k + n
+    enddo
+  end subroutine hg_run_phase
+
+  subroutine hg_slab4(n, a1, a2, a3, a4, kb, ke, l1, l2, l3, l4, phase, i1, i2, j1, j2)
+    ! Pack / unpack up to four slabs with the same level range kb:ke at the
+    ! group level offsets l1..l4 (pure copies, as hg_slab).
+    integer, intent(in) :: n, phase, l1, l2, l3, l4
+    integer(ip), intent(in) :: kb, ke, i1, i2, j1, j2
+    real(rp), device, intent(inout) :: a1(decomp%is:decomp%ie, decomp%js:decomp%je, kb:ke)
+    real(rp), device, intent(inout) :: a2(decomp%is:decomp%ie, decomp%js:decomp%je, kb:ke)
+    real(rp), device, intent(inout) :: a3(decomp%is:decomp%ie, decomp%js:decomp%je, kb:ke)
+    real(rp), device, intent(inout) :: a4(decomp%is:decomp%ie, decomp%js:decomp%je, kb:ke)
+    integer(ip) :: i, j, m, kk, h, ilo, ihi, c
+    integer :: nn
+    h = decomp%halo
+    ilo = i1 - h; ihi = i2 + h
+    nn = n
+    select case (phase)
+    case (1)
+      CUF_DO3
+      do kk = kb, ke
+        do j = j1, j2
+          do m = 1, h
+            c = kk - kb + 1
+            gew_slo(m, j, l1 + c) = a1(i1 + m - 1, j, kk); gew_shi(m, j, l1 + c) = a1(i2 - h + m, j, kk)
+            if (nn >= 2) then
+              gew_slo(m, j, l2 + c) = a2(i1 + m - 1, j, kk); gew_shi(m, j, l2 + c) = a2(i2 - h + m, j, kk)
+            endif
+            if (nn >= 3) then
+              gew_slo(m, j, l3 + c) = a3(i1 + m - 1, j, kk); gew_shi(m, j, l3 + c) = a3(i2 - h + m, j, kk)
+            endif
+            if (nn >= 4) then
+              gew_slo(m, j, l4 + c) = a4(i1 + m - 1, j, kk); gew_shi(m, j, l4 + c) = a4(i2 - h + m, j, kk)
+            endif
+          enddo
+        enddo
+      enddo
+    case (2)
+      if (decomp%nbr_w /= NBR_NONE) then
+        CUF_DO3
+        do kk = kb, ke
+          do j = j1, j2
+            do m = 1, h
+              c = kk - kb + 1
+              a1(i1 - h + m - 1, j, kk) = gew_rlo(m, j, l1 + c)
+              if (nn >= 2) a2(i1 - h + m - 1, j, kk) = gew_rlo(m, j, l2 + c)
+              if (nn >= 3) a3(i1 - h + m - 1, j, kk) = gew_rlo(m, j, l3 + c)
+              if (nn >= 4) a4(i1 - h + m - 1, j, kk) = gew_rlo(m, j, l4 + c)
+            enddo
+          enddo
+        enddo
+      endif
+      if (decomp%nbr_e /= NBR_NONE) then
+        CUF_DO3
+        do kk = kb, ke
+          do j = j1, j2
+            do m = 1, h
+              c = kk - kb + 1
+              a1(i2 + m, j, kk) = gew_rhi(m, j, l1 + c)
+              if (nn >= 2) a2(i2 + m, j, kk) = gew_rhi(m, j, l2 + c)
+              if (nn >= 3) a3(i2 + m, j, kk) = gew_rhi(m, j, l3 + c)
+              if (nn >= 4) a4(i2 + m, j, kk) = gew_rhi(m, j, l4 + c)
+            enddo
+          enddo
+        enddo
+      endif
+    case (3)
+      CUF_DO3
+      do kk = kb, ke
+        do m = 1, h
+          do i = ilo, ihi
+            c = kk - kb + 1
+            gns_slo(i, m, l1 + c) = a1(i, j1 + m - 1, kk); gns_shi(i, m, l1 + c) = a1(i, j2 - h + m, kk)
+            if (nn >= 2) then
+              gns_slo(i, m, l2 + c) = a2(i, j1 + m - 1, kk); gns_shi(i, m, l2 + c) = a2(i, j2 - h + m, kk)
+            endif
+            if (nn >= 3) then
+              gns_slo(i, m, l3 + c) = a3(i, j1 + m - 1, kk); gns_shi(i, m, l3 + c) = a3(i, j2 - h + m, kk)
+            endif
+            if (nn >= 4) then
+              gns_slo(i, m, l4 + c) = a4(i, j1 + m - 1, kk); gns_shi(i, m, l4 + c) = a4(i, j2 - h + m, kk)
+            endif
+          enddo
+        enddo
+      enddo
+    case (4)
+      if (decomp%nbr_s /= NBR_NONE) then
+        CUF_DO3
+        do kk = kb, ke
+          do m = 1, h
+            do i = ilo, ihi
+              c = kk - kb + 1
+              a1(i, j1 - h + m - 1, kk) = gns_rlo(i, m, l1 + c)
+              if (nn >= 2) a2(i, j1 - h + m - 1, kk) = gns_rlo(i, m, l2 + c)
+              if (nn >= 3) a3(i, j1 - h + m - 1, kk) = gns_rlo(i, m, l3 + c)
+              if (nn >= 4) a4(i, j1 - h + m - 1, kk) = gns_rlo(i, m, l4 + c)
+            enddo
+          enddo
+        enddo
+      endif
+      if (decomp%nbr_n /= NBR_NONE) then
+        CUF_DO3
+        do kk = kb, ke
+          do m = 1, h
+            do i = ilo, ihi
+              c = kk - kb + 1
+              a1(i, j2 + m, kk) = gns_rhi(i, m, l1 + c)
+              if (nn >= 2) a2(i, j2 + m, kk) = gns_rhi(i, m, l2 + c)
+              if (nn >= 3) a3(i, j2 + m, kk) = gns_rhi(i, m, l3 + c)
+              if (nn >= 4) a4(i, j2 + m, kk) = gns_rhi(i, m, l4 + c)
+            enddo
+          enddo
+        enddo
+      endif
+    end select
+  end subroutine hg_slab4
+#endif
+
+  subroutine hg_end_single(i1, i2, j1, j2, L)
+    ! One launch per field and phase (the validated path).
+    integer(ip), intent(in) :: i1, i2, j1, j2
+    integer, intent(in) :: L
+    integer(ip) :: k
+    if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
+      do k = 1, hg_n
+        call hg_dispatch(k, 1, i1, i2, j1, j2)
+      enddo
+      call deliver3(decomp%nbr_w, decomp%nbr_e, gew_slo(:, :, 1:L), gew_shi(:, :, 1:L), &
+                    gew_rlo(:, :, 1:L), gew_rhi(:, :, 1:L))
+      do k = 1, hg_n
+        call hg_dispatch(k, 2, i1, i2, j1, j2)
+      enddo
+    endif
+    if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
+      do k = 1, hg_n
+        call hg_dispatch(k, 3, i1, i2, j1, j2)
+      enddo
+      call deliver3(decomp%nbr_s, decomp%nbr_n, gns_slo(:, :, 1:L), gns_shi(:, :, 1:L), &
+                    gns_rlo(:, :, 1:L), gns_rhi(:, :, 1:L))
+      do k = 1, hg_n
+        call hg_dispatch(k, 4, i1, i2, j1, j2)
+      enddo
+    endif
+  end subroutine hg_end_single
 
   subroutine hg_dispatch(k, phase, i1, i2, j1, j2)
     ! Resolve the field id to its slab (first element + level range) and run

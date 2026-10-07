@@ -495,6 +495,9 @@ Case: `cases/GPU/namelist_roms_gpu_pac3d8.nml` + `submit_roms_gpu_pac3d8.sh`
 | stepping per rank | 330 s | 166-172 s | 119 s | 1020 s |
 | walltime | 9:54 | 7:14 - 8:42 | 6:36 | 25:55 |
 
+With four writer ranks (2026-10-07, "Next levers"): 8 GPUs 5:16 walltime at
+0.51 s per step (p50).
+
 Final-binary verification (edge-row exchange + cap): MiniPac 4r/4ref,
 4q/4r, 8q/4r, 3dq/3dv3, 3d8q/3dv3 bit-identical; Pac 8-tile and 16-tile
 3-day histories bit-identical to each other; Pac 8-tile vs the CPU
@@ -530,6 +533,154 @@ MiniPac noise-floor levels.
   complete, MiniPac 2x2 bit-identical. A writer slower than the output
   cadence still costs partial-chunk writes; several writer ranks or
   parallel NetCDF remain the real fix.
+
+## Next levers (2026-10-07): writer ranks, exchange batching, initialization
+
+Build now links the parallel NetCDF module (`module load netcdf-mpi` AFTER
+`cray-mpich`; `LIBS` adds `-L$(nc-config --prefix)/lib64 -lnetcdf`); the
+serial paths are unchanged. All results bit-identical to the references.
+
+- Several writer ranks (`ROMS_GPU_IO_SERVERS=n`, default 1; the last n
+  world ranks; `comm_writers()`). Each compute rank sends every record
+  header to every writer and variable iv's slab to writer mod(iv-1, n);
+  each writer assembles and writes its own variables. Parallel HDF5 only
+  extends a record variable collectively, so `write_assembled` first does
+  a collective round (ocean_time, then one element per variable at
+  x = writer index + 1, then a barrier) and the owners put their variables
+  independently in parallel. Files are opened lazily when the first record
+  for them is written, so that writers reach the collective open in record
+  order (an eager open at CMD_OPEN deadlocked against another writer's
+  record write). Restart (double) variables are now chunked one record per
+  chunk (`nc_chunk_one_record`); with default chunking the independent
+  writes had to allocate chunks and the sync failed with "HDF error".
+  Slot overrun with several writers is an error (collective order) and an
+  incomplete record at quit is dropped with a warning.
+  MiniPac 2x2, 2 writers: history record 6.1 -> 3.7 s, restart 10.5 -> 5.5 s
+  per writer. Pac 8 GPUs, 4 writers (ROMS_GPU_IO_SERVERS=4, node 2 with
+  mpiprocs=8): 30 GB history record 60 -> 20 s per writer, 55 GB restart
+  90 -> 31 s, 3-day walltime 7:14-8:42 -> 5:16, history bit-identical to
+  the single-writer run. A deadlock found on the way: compute ranks sent
+  record headers with blocking MPI_Send; a writer in the collective round
+  does not receive, the compute rank blocks on that header, and another
+  writer waits for that rank's data (posted after the headers). Now the
+  data Isends are posted first and the headers are Isends too (buffers in
+  the staging set, `nreq = nvars + up to 5 per writer`).
+  A single process writes at 0.6 GB/s whatever the striping (24 stripes
+  tested), so writers are the lever, not Lustre layout.
+  Writer-count rule (no manual setting): the model takes the compute rank
+  count from the namelist (np_xi x np_eta, scanned in `init_comm`) and every
+  extra launched rank becomes a writer (`ROMS_GPU_IO_SERVERS` overrides).
+  `tools/gpu_layout.py <namelist>` sizes the history record from the grid and
+  the write flags and picks the fewest writers that write one record in
+  about 15 s at 0.6 GB/s each (1..8), printing the PBS select line and the
+  rank count; `cases/submit_gpu.sh <submit_script> [NWRITERS=n] [EXE=...]`
+  submits with them (the submit scripts launch `mpiexec -n ${NRANKS:-...}`).
+  MiniPac -> 1 writer, Pac at daily output -> 4.
+- Exchange batching: `hg_end` resolves every registered field to a device
+  address (`c_devloc`, kept in `hg_ptr`), and `hg_run_phase` packs/unpacks
+  up to 4 fields with the same level range per launch (`hg_slab4`: device
+  pointers from `c_f_pointer`, CONTIGUOUS so the explicit-shape device
+  dummies get the base address). Default on; `ROMS_GPU_HG_BATCH=0` restores
+  one launch per field, `=n` sets the group size. Lesson: the kernels must
+  run on `work_stream` (the CUF_DO macros); on the default stream they
+  raced the model kernels and filled the halos with garbage, with 1 field
+  per launch as well. Gain: 2x2 0.170 -> 0.168 s per step, 4x2 two-node
+  0.125 -> 0.123 s (launch count 354 -> ~120 per step; the exchange is
+  latency-bound, not launch-bound).
+- Initialization: the double-precision restart staging is pageable and
+  allocated at the first restart write (two pinned 12 GB sets cost ~10 s
+  per rank at init on Pac: output init 15.7 -> 6.2 s; the restart stage
+  itself now takes 3 s). Overlapping the whole-variable reads with the
+  window redistribution (`pr_flush` posts all receives, keeps one batch of
+  sends in flight) changed nothing: the reads are the limit (~2.4 GB/s
+  aggregate with 8 streams, 3.6 with 16). A collective MPI-IO read mode
+  (`ROMS_GPU_PAR_READ=mpiio`, `flush_mpiio`) exists but needs pnetcdf for
+  classic-format files, which netcdf-mpi lacks, so it falls back.
+
+## Restart read through collective MPI-IO (2026-10-07): measured, not adopted
+
+The question was whether every rank reading its own windows collectively
+(parallel HDF5 through netcdf-mpi, `ROMS_GPU_PAR_READ=mpiio`) beats the
+whole-variable reader (each rank reads whole variables and redistributes
+the windows). Collective reads need NetCDF-4 files, so the CPU restarts
+were converted once with `nccopy -k 4` (one record per chunk, 24 Lustre
+stripes, 118 GB Pac file in 5 minutes) and the GPU-written restart was
+used as is. All runs 4 steps, "ini read" segment of the init stamps, 8
+GPUs for Pac, 4 for MiniPac; every pair restart bit-identical.
+
+| restart file | whole-variable reads | collective MPI-IO reads |
+|---|---|---|
+| Pac, CPU restart, 87 variables, classic -> converted NetCDF-4 | 51.5 s | 86.7 s |
+| Pac, GPU-written NetCDF-4 restart, 53 variables | 52.8 s | 38.7 s |
+| MiniPac, CPU restart, classic -> converted NetCDF-4 | 13.7 s | 23.5 s |
+
+Collective reads win only on the GPU-written file and lose elsewhere, so
+whole-variable reads stay the default and `mpiio` stays opt-in. Two
+observations for later: HDF5 whole-variable reads run at about half the
+rate of classic-format reads (0.64 vs 0.33 s per 1.4 GB variable), so the
+GPU-written restart reads slower than the CPU one; and the collective read
+is a strided window read (one short row per (j, k)) that HDF5/ROMIO
+aggregate poorly. Tile-friendly chunking of the restart (e.g. nz x 128 x
+128 chunks, independent of the tiling) and MPI-IO hints are the untested
+knobs; neither is geometry-free enough to adopt blind.
+
+## Pipeline hygiene (2026-10-07): what a steady Pac step is made of
+
+Fresh nsys profile of rank 0 (8 GPUs, 4 writers, batching on;
+`tools/nsys_step_breakdown.py <report.sqlite> [step]`), steady step:
+
+| item | per step |
+|---|---|
+| step wall time | 0.42-0.45 s |
+| GPU busy | 0.30 s (71%) |
+| kernel launches | 3161, of which 2666 under 20 us (~25 ms of GPU time) |
+| GPU idle at the all-tracer exchange (`halo_fill_3d_tp`, 5 per step) | 62 ms |
+| GPU idle at the group exchanges | 13-35 ms |
+| memsets | none |
+| end-of-step diagnostics (`check_mode_coupling`, `step_maxima`) | ~2 ms |
+
+So hygiene is worth 2-3% at most; the all-tracer exchange (five ~50 MB
+GPU-direct exchanges per step with nothing queued on the GPU meanwhile) is
+the largest remaining lever at ~15% of the step (exchange overlap).
+
+Changes (bit-identical by construction):
+- `step_mark`: the 19 per-phase stamps (each a cudaDeviceSynchronize + print
+  + flush) are off by default; only the `baroclinic step` stamp remains
+  (its cumul is the step time the tools read). `ROMS_GPU_STEP_MARKS=1`
+  restores them.
+- `set_tides`: one kernel per target set (west/east, south/north, potential)
+  with the constituent loop inside, host cos/sin in `tide_c/tide_s`
+  (device cos/sin would differ in the last bit); the per-element sum runs
+  in the original constituent order with the same rounded products.
+  92 launches -> 6 per step.
+- Redundant all-tracer exchanges removed (3 of the 5 `halo_fill_3d_tp` per
+  step). Slot rotation: predictor reads nstp, writes 3; corrector reads 3,
+  writes 3-nstp; the next step's nstp is that slot. So (1) the exchange of
+  nstp at the predictor start repeats the previous step's post-t3dmix
+  exchange (nothing writes tp in between; the load exchanges slots 1 and
+  2); (2) the exchange of slot 3 right after the predictor kernels is
+  repeated by pre_step3d after passive_t3dbc, and nothing reads the slot-3
+  halo in between (passive_t3dbc reads slot nstp at tangential neighbours
+  and writes slot nn; its closed-boundary copy writes halo rows of column
+  0 that the following NS exchange overwrites either way); (3) the
+  exchange of nnew after the corrector feeds only pointwise code (MARBL
+  columns, t3dmix's stencil is slot 3) before passive_t3dmix exchanges it.
+  Left: pre_step3d (slot 3 after t3dbc) and passive_t3dmix (nnew).
+  The T/S exchanges have the same pattern (per-tracer after the predictor,
+  then the group after t3dbc; after the corrector, then after t3dmix) but
+  carry 2 fields instead of 32; left for the exchange-overlap round.
+
+Results (every pair bit-identical: MiniPac 2x2 vs 1x1 4r history+restart;
+Pac 8 GPUs 4-step restart vs pac8; Pac 3-day history vs pac3d8w4m):
+
+| run | MiniPac non-output step | Pac 3-day: p50 step, per-rank stepping, walltime |
+|---|---|---|
+| main (b6f7621 + writers) | 0.1224 s | 0.511 s, 142.2 s, 5:29 |
+| stamps off + fused tides | 0.1216 s | 0.510 s, 141.9 s, 5:03 |
+| + 3 tracer exchanges removed | 0.1168 s | 0.488 s, 136.7 s, 5:04 |
+
+Net 4.5% per step on Pac, 4.6% on MiniPac; the walltime difference between
+the first two rows is init/queue noise (init 86 vs 83-93 s).
 
 ## Toolchain lessons (nvfortran 25.9)
 

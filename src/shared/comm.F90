@@ -22,7 +22,8 @@ module comm_mod
   ! GPU-aware MPI (Cray MPICH + libmpi_gtl_cuda): device buffers go straight
   ! to MPI_Sendrecv when MPICH_GPU_SUPPORT_ENABLED=1 is set for the job.
   logical :: comm_gpu_direct = .false.
-  integer :: io_rank_w = -1          ! world rank of the I/O server, -1 = none
+  integer :: io_rank_w = -1          ! world rank of the first I/O server rank, -1 = none
+  integer :: io_nserv = 0            ! number of I/O server (writer) ranks, the last world ranks
   logical :: io_rank_flag = .false.
   logical :: ready = .false.
 
@@ -38,6 +39,7 @@ module comm_mod
   public :: have_io_server
   public :: is_io_rank
   public :: io_server_rank
+  public :: io_server_count, io_server_index, comm_writers
   public :: comm_world
   public :: comm_world_rank
   public :: comm_world_size
@@ -60,12 +62,27 @@ contains
     call MPI_Comm_rank(world_comm, world_rank, ierr)
     call MPI_Comm_size(world_comm, world_size, ierr)
     io_rank_w = -1
+    io_nserv = 0
     if (world_size >= 2) then
       call get_environment_variable('ROMS_GPU_IO_SERVER', val, status=stat)
-      if (.not. (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '0')) &
-           io_rank_w = world_size - 1
+      if (.not. (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '0')) then
+        ! ROMS_GPU_IO_SERVERS = number of writer ranks (default 1); they are
+        ! the last world ranks and share the output files (parallel NetCDF
+        ! when more than one).
+        ! Rule: the compute ranks are np_xi x np_eta from the namelist and
+        ! every extra launched rank is a writer. ROMS_GPU_IO_SERVERS overrides.
+        io_nserv = 1
+        n = namelist_tiles()
+        if (n >= 1 .and. world_size > n) io_nserv = world_size - n
+        call get_environment_variable('ROMS_GPU_IO_SERVERS', val, status=stat)
+        if (stat == 0 .and. len_trim(val) > 0) then
+          read(val, *, iostat=stat) n
+          if (stat == 0 .and. n >= 1 .and. n < world_size) io_nserv = n
+        endif
+        io_rank_w = world_size - io_nserv
+      endif
     endif
-    io_rank_flag = (world_rank == io_rank_w)
+    io_rank_flag = (world_rank >= io_rank_w .and. io_rank_w >= 0)
     if (io_rank_w >= 0) then
       color = merge(1, 0, io_rank_flag)
       call MPI_Comm_split(world_comm, color, world_rank, compute_comm, ierr)
@@ -84,6 +101,50 @@ contains
 #endif
     ready = .true.
   end subroutine init_comm
+
+  integer function namelist_tiles() result(ntile)
+    ! np_xi * np_eta from the namelist named on the command line (argument
+    ! 2 of 'run' / 'load'), by a plain text scan; 0 when unavailable.
+    character(len=512) :: path, line
+    character(len=16) :: mode
+    integer :: unit, ios, npx, npy, k
+    ntile = 0
+    if (command_argument_count() < 2) return
+    call get_command_argument(1, mode)
+    if (trim(mode) /= 'run' .and. trim(mode) /= 'load') return
+    call get_command_argument(2, path)
+    open(newunit=unit, file=trim(path), status='old', action='read', iostat=ios)
+    if (ios /= 0) return
+    npx = 0; npy = 0
+    do
+      read(unit, '(a)', iostat=ios) line
+      if (ios /= 0) exit
+      k = index(line, '!')
+      if (k > 0) line = line(1:k - 1)
+      call grab(line, 'np_xi', npx)
+      call grab(line, 'np_eta', npy)
+    enddo
+    close(unit)
+    if (npx >= 1 .and. npy >= 1) ntile = npx * npy
+  contains
+    subroutine grab(l, key, v)
+      character(len=*), intent(in) :: l, key
+      integer, intent(inout) :: v
+      integer :: i, j, ios2
+      i = index(l, key)
+      if (i == 0) return
+      if (i > 1) then
+        if (l(i-1:i-1) /= ' ' .and. l(i-1:i-1) /= ',') return
+      endif
+      j = i + len(key)
+      if (j > len(l)) return
+      if (l(j:j) /= ' ' .and. l(j:j) /= '=') return
+      j = index(l(i:), '=')
+      if (j == 0) return
+      read(l(i + j:), *, iostat=ios2) v
+      if (ios2 /= 0) v = 0
+    end subroutine grab
+  end function namelist_tiles
 
   subroutine finalize_comm()
 #ifdef USE_MPI
@@ -135,6 +196,21 @@ contains
   integer function io_server_rank()
     io_server_rank = io_rank_w
   end function io_server_rank
+
+  integer function io_server_count()
+    io_server_count = io_nserv
+  end function io_server_count
+
+  integer function io_server_index()
+    ! 0 .. nserv-1 on a writer rank, -1 elsewhere
+    io_server_index = -1
+    if (io_rank_flag) io_server_index = world_rank - io_rank_w
+  end function io_server_index
+
+  integer function comm_writers()
+    ! The writer ranks' own communicator (the split gives it to colour 1).
+    comm_writers = compute_comm
+  end function comm_writers
 
   integer function comm_world()
     comm_world = world_comm

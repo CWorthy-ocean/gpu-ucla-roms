@@ -33,6 +33,7 @@ module tide_io
   real(rp), WORK_ATTR allocatable :: utide_r(:,:,:), utide_i(:,:,:)
   real(rp), WORK_ATTR allocatable :: vtide_r(:,:,:), vtide_i(:,:,:)
   real(rp), WORK_ATTR allocatable :: ptide_r(:,:,:), ptide_i(:,:,:)
+  real(rp), WORK_ATTR allocatable :: tide_c(:), tide_s(:)   ! per-step cos/sin per constituent
 
   public :: read_tide_namelist
   public :: init_tides
@@ -95,6 +96,7 @@ contains
     if (ntides < 1) ntides = nrec
     ntides = min(ntides, max(nrec, 1))
     allocate(ftide(ntides))
+    allocate(tide_c(ntides), tide_s(ntides))
     call nc_get_1d(ncid, 'omega', ftide)
     if (bry_tides) then
       allocate(ztide_r(is:ie,js:je,ntides), ztide_i(is:ie,js:je,ntides))
@@ -139,7 +141,7 @@ contains
     ! One small device kernel per constituent and target (c, s are
     ! kernel arguments), in the same order as the host loops it replaces.
     integer(ip) :: it, i, j, nx, ny, ip, is, ie, js, je, n
-    real(rp) :: omT, c, s, z0, v0
+    real(rp) :: omT, c, s, z0, v0, zw, ze, uw, ue, vw, ve
     logical :: want_dump
     if (.not. tides_ready) return
     nx = decomp%nx; ny = decomp%ny
@@ -152,57 +154,72 @@ contains
       z0 = zeta_north(ip)
       v0 = vbar_north(ip)
     endif
+    ! Host cos/sin per constituent (device cos/sin would differ in the last
+    ! bit); one kernel per target sums the constituents in the same order
+    ! as the per-constituent kernels it replaces (same rounded products).
+    do it = 1, ntides
+      omT = ftide(it) * (time + 0.5_rp * dt)
+      tide_c(it) = cos(omT)
+      tide_s(it) = sin(omT)
+    enddo
+    n = ntides
+    if (bry_tides) then
+#ifdef USE_CUDA
+      !$cuf kernel do(1) <<<*,*>>>
+#endif
+      do j = 0, ny + 1
+        zw = zeta_west(j); ze = zeta_east(j)
+        uw = ubar_west(j); ue = ubar_east(j)
+        vw = vbar_west(j); ve = vbar_east(j)
+        do it = 1, n
+          c = tide_c(it); s = tide_s(it)
+          zw = zw + TMUL(ztide_r(0, j, it), c) - TMUL(ztide_i(0, j, it), s)
+          ze = ze + TMUL(ztide_r(nx + 1, j, it), c) - TMUL(ztide_i(nx + 1, j, it), s)
+          uw = uw + TMUL(utide_r(1, j, it), c) - TMUL(utide_i(1, j, it), s)
+          ue = ue + TMUL(utide_r(nx + 1, j, it), c) - TMUL(utide_i(nx + 1, j, it), s)
+          vw = vw + TMUL(vtide_r(0, j, it), c) - TMUL(vtide_i(0, j, it), s)
+          ve = ve + TMUL(vtide_r(nx + 1, j, it), c) - TMUL(vtide_i(nx + 1, j, it), s)
+        enddo
+        zeta_west(j) = zw; zeta_east(j) = ze
+        ubar_west(j) = uw; ubar_east(j) = ue
+        vbar_west(j) = vw; vbar_east(j) = ve
+      enddo
+#ifdef USE_CUDA
+      !$cuf kernel do(1) <<<*,*>>>
+#endif
+      do i = 0, nx + 1
+        zw = zeta_south(i); ze = zeta_north(i)
+        uw = ubar_south(i); ue = ubar_north(i)
+        vw = vbar_south(i); ve = vbar_north(i)
+        do it = 1, n
+          c = tide_c(it); s = tide_s(it)
+          zw = zw + TMUL(ztide_r(i, 0, it), c) - TMUL(ztide_i(i, 0, it), s)
+          ze = ze + TMUL(ztide_r(i, ny + 1, it), c) - TMUL(ztide_i(i, ny + 1, it), s)
+          uw = uw + TMUL(utide_r(i, 0, it), c) - TMUL(utide_i(i, 0, it), s)
+          ue = ue + TMUL(utide_r(i, ny + 1, it), c) - TMUL(utide_i(i, ny + 1, it), s)
+          vw = vw + TMUL(vtide_r(i, 1, it), c) - TMUL(vtide_i(i, 1, it), s)
+          ve = ve + TMUL(vtide_r(i, ny + 1, it), c) - TMUL(vtide_i(i, ny + 1, it), s)
+        enddo
+        zeta_south(i) = zw; zeta_north(i) = ze
+        ubar_south(i) = uw; ubar_north(i) = ue
+        vbar_south(i) = vw; vbar_north(i) = ve
+      enddo
+    endif
     if (pot_tides) then
 #ifdef USE_CUDA
       !$cuf kernel do(2) <<<*,*>>>
 #endif
       do j = js, je
         do i = is, ie
-          ptide(i, j) = 0.0_rp
+          ! CPU tides.F90 writes ptide unmasked; prsgrd uses it on land.
+          zw = 0.0_rp
+          do it = 1, n
+            zw = zw + TMUL(ptide_r(i, j, it), tide_c(it)) - TMUL(ptide_i(i, j, it), tide_s(it))
+          enddo
+          ptide(i, j) = zw
         enddo
       enddo
     endif
-    do it = 1, ntides
-      omT = ftide(it) * (time + 0.5_rp * dt)
-      c = cos(omT)
-      s = sin(omT)
-      n = it
-      if (bry_tides) then
-#ifdef USE_CUDA
-        !$cuf kernel do(1) <<<*,*>>>
-#endif
-        do j = 0, ny + 1
-          zeta_west(j) = zeta_west(j) + TMUL(ztide_r(0, j, n), c) - TMUL(ztide_i(0, j, n), s)
-          zeta_east(j) = zeta_east(j) + TMUL(ztide_r(nx + 1, j, n), c) - TMUL(ztide_i(nx + 1, j, n), s)
-          ubar_west(j) = ubar_west(j) + TMUL(utide_r(1, j, n), c) - TMUL(utide_i(1, j, n), s)
-          ubar_east(j) = ubar_east(j) + TMUL(utide_r(nx + 1, j, n), c) - TMUL(utide_i(nx + 1, j, n), s)
-          vbar_west(j) = vbar_west(j) + TMUL(vtide_r(0, j, n), c) - TMUL(vtide_i(0, j, n), s)
-          vbar_east(j) = vbar_east(j) + TMUL(vtide_r(nx + 1, j, n), c) - TMUL(vtide_i(nx + 1, j, n), s)
-        enddo
-#ifdef USE_CUDA
-        !$cuf kernel do(1) <<<*,*>>>
-#endif
-        do i = 0, nx + 1
-          zeta_south(i) = zeta_south(i) + TMUL(ztide_r(i, 0, n), c) - TMUL(ztide_i(i, 0, n), s)
-          zeta_north(i) = zeta_north(i) + TMUL(ztide_r(i, ny + 1, n), c) - TMUL(ztide_i(i, ny + 1, n), s)
-          ubar_south(i) = ubar_south(i) + TMUL(utide_r(i, 0, n), c) - TMUL(utide_i(i, 0, n), s)
-          ubar_north(i) = ubar_north(i) + TMUL(utide_r(i, ny + 1, n), c) - TMUL(utide_i(i, ny + 1, n), s)
-          vbar_south(i) = vbar_south(i) + TMUL(vtide_r(i, 1, n), c) - TMUL(vtide_i(i, 1, n), s)
-          vbar_north(i) = vbar_north(i) + TMUL(vtide_r(i, ny + 1, n), c) - TMUL(vtide_i(i, ny + 1, n), s)
-        enddo
-      endif
-      if (pot_tides) then
-#ifdef USE_CUDA
-        !$cuf kernel do(2) <<<*,*>>>
-#endif
-        do j = js, je
-          do i = is, ie
-            ! CPU tides.F90 writes ptide unmasked; prsgrd uses it on land.
-            ptide(i, j) = ptide(i, j) + TMUL(ptide_r(i, j, n), c) - TMUL(ptide_i(i, j, n), s)
-          enddo
-        enddo
-      endif
-    enddo
     if (want_dump) call sync_arch()
     call dump_tide_north(z0, v0)
   end subroutine set_tides

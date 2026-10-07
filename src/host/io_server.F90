@@ -35,6 +35,7 @@ module io_server
   integer, parameter :: CMD_OPEN = 1, CMD_PUT = 2, CMD_QUIT = 3
   integer, parameter :: TAG_CMD = 900, TAG_STR = 901, TAG_TIME = 902, TAG_DATA = 910
   integer, parameter :: MAXV = 96, NAMELEN = 32, PATHLEN = 512   ! MARBL: 32 tracers + diagnostics
+  integer, parameter :: MAXW = 16                                 ! max writer ranks
   integer, parameter :: NHDR = 8 + 6 * MAXV
   integer, parameter :: NSET = 2
 
@@ -48,7 +49,12 @@ module io_server
     integer :: n1(MAXV) = 0, n2(MAXV) = 0, n3(MAXV) = 0, nrank(MAXV) = 0, off(MAXV) = 0
     integer :: i0f(MAXV) = 1, j0f(MAXV) = 1   ! file start of this tile's slab (global offsets)
     integer :: nreq = 0
-    integer :: reqs(MAXV) = 0
+    integer :: reqs(MAXV + 5 * MAXW) = 0
+    ! header messages are non-blocking too (a blocking header send to a
+    ! writer busy in a collective deadlocked the writers); their buffers
+    ! live here until wait_sends
+    integer :: hdr(NHDR) = 0, ohdr(NHDR) = 0
+    character(len=NAMELEN * MAXV) :: namebuf = ''
   end type rec_t
 
   type(rec_t) :: pend(NSET)
@@ -70,13 +76,14 @@ module io_server
   logical, allocatable :: tfill(:,:)                ! (0:ncompute-1, NSLOT)
   integer :: slot_key(3, NSLOT) = -1                ! (fkind, nfile, rec) per slot
   integer :: slot_n(NSLOT) = 0                      ! parts received per slot
+  integer :: nserv = 1, me_w = 0                     ! writer ranks; this writer's index (server side)
   real(4), allocatable :: gbuf(:)                   ! one assembled variable
   real(8), allocatable :: gbuf8(:)                  ! one assembled double variable
   logical :: quit_sent = .false.   ! CMD_QUIT sent to the I/O rank (io_finalize may run twice)
 #ifdef USE_CUDA
   real(4), pinned, allocatable :: hpin1(:), hpin2(:)
   real(4), device, allocatable :: dstage(:)
-  real(8), pinned, allocatable :: hpin8_1(:), hpin8_2(:)
+  real(8), allocatable :: hpin8_1(:), hpin8_2(:)   ! pageable: restarts are rare, pinning 2 sets cost ~10 s at init
   real(8), device, allocatable :: dstage8(:)
   type(cudaEvent) :: ev(NSET)
 #else
@@ -376,7 +383,7 @@ contains
 
   subroutine io_finalize()
 #ifdef USE_MPI
-    integer :: hdr(NHDR), ierr
+    integer :: hdr(NHDR), ierr, w
 #endif
     ! The I/O rank waits for commands from start-up, so it must be told to
     ! quit even when no history was ever staged (hcap == 0); otherwise the
@@ -386,7 +393,9 @@ contains
     if (have_io_server() .and. .not. is_io_rank() .and. .not. quit_sent) then
       hdr = 0
       hdr(1) = CMD_QUIT
-      call MPI_Send(hdr, NHDR, MPI_INTEGER, io_server_rank(), TAG_CMD, comm_world(), ierr)
+      do w = 0, io_server_count() - 1
+        call MPI_Send(hdr, NHDR, MPI_INTEGER, io_server_rank() + w, TAG_CMD, comm_world(), ierr)
+      enddo
       quit_sent = .true.
     endif
 #endif
@@ -448,26 +457,18 @@ contains
   subroutine send_set(idx)
     integer, intent(in) :: idx
 #ifdef USE_MPI
-    integer :: hdr(NHDR), ierr, iv, n, dest, comm
-    character(len=NAMELEN * MAXV) :: namebuf
-    dest = io_server_rank()
+    integer :: ierr, iv, n, dest, comm, nw, w, nr
     comm = comm_world()
-    if (len_trim(pend(idx)%open_path) > 0) then
-      hdr = 0
-      hdr(1) = CMD_OPEN
-      hdr(2) = pend(idx)%fkind
-      call MPI_Send(hdr, NHDR, MPI_INTEGER, dest, TAG_CMD, comm, ierr)
-      call MPI_Send(pend(idx)%open_path, PATHLEN, MPI_CHARACTER, dest, TAG_STR, comm, ierr)
-    endif
-    call pack_hdr(pend(idx), hdr)
-    namebuf = ''
+    nw = io_server_count()
+    if (nw > MAXW) error stop 'io: too many writer ranks (raise MAXW)'
+    call pack_hdr(pend(idx), pend(idx)%hdr)
+    pend(idx)%namebuf = ''
     do iv = 1, pend(idx)%nvars
-      namebuf((iv - 1) * NAMELEN + 1:iv * NAMELEN) = pend(idx)%names(iv)
+      pend(idx)%namebuf((iv - 1) * NAMELEN + 1:iv * NAMELEN) = pend(idx)%names(iv)
     enddo
-    call MPI_Send(hdr, NHDR, MPI_INTEGER, dest, TAG_CMD, comm, ierr)
-    call MPI_Send(namebuf, NAMELEN * MAXV, MPI_CHARACTER, dest, TAG_STR, comm, ierr)
-    call MPI_Send(pend(idx)%time, 1, MPI_DOUBLE_PRECISION, dest, TAG_TIME, comm, ierr)
+    ! data first (variable iv to writer mod(iv-1, nw)), all non-blocking
     do iv = 1, pend(idx)%nvars
+      dest = io_server_rank() + mod(iv - 1, nw)
       n = pend(idx)%n1(iv) * pend(idx)%n2(iv) * pend(idx)%n3(iv)
       if (pend(idx)%dbl) then
         if (idx == 1) then
@@ -484,24 +485,70 @@ contains
         call MPI_Isend(hpin2(pend(idx)%off(iv)), n, MPI_REAL4, dest, TAG_DATA + iv, comm, &
                        pend(idx)%reqs(iv), ierr)
       endif
-      if (ierr /= MPI_SUCCESS) error stop 'io: MPI_Isend'
     enddo
-    pend(idx)%nreq = pend(idx)%nvars
+    nr = pend(idx)%nvars
+    ! every writer gets the (optional) open command and the record header
+    do w = 0, nw - 1
+      dest = io_server_rank() + w
+      if (len_trim(pend(idx)%open_path) > 0) then
+        pend(idx)%ohdr = 0
+        pend(idx)%ohdr(1) = CMD_OPEN
+        pend(idx)%ohdr(2) = pend(idx)%fkind
+        nr = nr + 1
+        call MPI_Isend(pend(idx)%ohdr, NHDR, MPI_INTEGER, dest, TAG_CMD, comm, pend(idx)%reqs(nr), ierr)
+        nr = nr + 1
+        call MPI_Isend(pend(idx)%open_path, PATHLEN, MPI_CHARACTER, dest, TAG_STR, comm, pend(idx)%reqs(nr), ierr)
+      endif
+      nr = nr + 1
+      call MPI_Isend(pend(idx)%hdr, NHDR, MPI_INTEGER, dest, TAG_CMD, comm, pend(idx)%reqs(nr), ierr)
+      nr = nr + 1
+      call MPI_Isend(pend(idx)%namebuf, NAMELEN * MAXV, MPI_CHARACTER, dest, TAG_STR, comm, pend(idx)%reqs(nr), ierr)
+      nr = nr + 1
+      call MPI_Isend(pend(idx)%time, 1, MPI_DOUBLE_PRECISION, dest, TAG_TIME, comm, pend(idx)%reqs(nr), ierr)
+    enddo
+    pend(idx)%nreq = nr
 #else
     error stop 'io: server requested without MPI'
 #endif
   end subroutine send_set
 
+  logical function mine(iv)
+    ! Variable iv of a record belongs to writer mod(iv-1, nserv).
+    integer, intent(in) :: iv
+    mine = (mod(iv - 1, nserv) == me_w)
+  end function mine
+
   subroutine write_assembled(ncid, isl)
     ! Assemble each variable of record slot isl from the tiles' slabs into
     ! one global array and write it once; global extents from the slabs.
     integer, intent(in) :: ncid, isl
-    integer :: iv, t, gx, gy, n3, i, j, k, n1, n2, i0, j0, off, ntile
+    integer :: iv, t, gx, gy, n3, i, j, k, n1, n2, i0, j0, off, ntile, ierr
+    real(4) :: zero1(1, 1, 1)
     type(rec_t) :: r0
+    zero1 = 0.0
     ntile = size(tbuf, 1)
     r0 = tmeta(0, isl)
-    call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
+    if (nserv > 1) then
+      ! Parallel NetCDF: a record variable may only be extended collectively,
+      ! so every writer first extends every variable of this record with a
+      ! one-element put at its own position (overwritten below), then the
+      ! owners write their variables independently and in parallel.
+      call nc_set_par_access(ncid, .true.)
+      call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
+      do iv = 1, r0%nvars
+        if (r0%nrank(iv) == 2) then
+          call nc_put_2d_rec_f(ncid, trim(r0%names(iv)), zero1, 1, 1, r0%rec, me_w + 1, 1)
+        else
+          call nc_put_3d_rec_f(ncid, trim(r0%names(iv)), zero1, 1, 1, 1, r0%rec, me_w + 1, 1)
+        endif
+      enddo
+      call MPI_Barrier(comm_writers(), ierr)
+      call nc_set_par_access(ncid, .false.)
+    else
+      call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
+    endif
     do iv = 1, r0%nvars
+      if (.not. mine(iv)) cycle
       gx = 0; gy = 0; n3 = r0%n3(iv)
       do t = 0, ntile - 1
         if (trim(tmeta(t, isl)%names(iv)) /= trim(r0%names(iv))) error stop 'io_server: tiles disagree on the variable list'
@@ -596,9 +643,14 @@ contains
     if (hcap8 > 0) return
     hcap8 = max(cap_record, 1)
     dcap8 = max(cap_field, 1)
-    allocate(hpin8_1(hcap8), hpin8_2(hcap8), dstage8(dcap8))
-    write(*,'(a,f6.2,a)') 'io: double-precision staging ', 2.0 * real(hcap8) * 8.0 / 2.0**30, ' GB pinned (restart records)'
+    write(*,'(a,f6.2,a)') 'io: double-precision staging ', 2.0 * real(hcap8) * 8.0 / 2.0**30, &
+         ' GB host (pageable, allocated at the first restart write)'
   end subroutine io_init8
+
+  subroutine ensure_stage8()
+    if (.not. allocated(hpin8_1)) allocate(hpin8_1(hcap8), hpin8_2(hcap8))
+    if (.not. allocated(dstage8)) allocate(dstage8(dcap8))
+  end subroutine ensure_stage8
 
   subroutine io_stage8_begin(fkind, rec, nfile, time, open_path)
     integer, intent(in) :: fkind, rec, nfile
@@ -606,6 +658,7 @@ contains
     character(len=*), intent(in) :: open_path
     if (hcap8 == 0) error stop 'io_stage8_begin: io_init8 not called'
     if (hcap == 0) error stop 'io_stage8_begin: io_init not called'
+    call ensure_stage8()
     call io_stage_begin(fkind, rec, nfile, time, open_path)
     pend(cur)%dbl = .true.
   end subroutine io_stage8_begin
@@ -766,16 +819,20 @@ contains
     integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), src, comm, iv, off, n, b, k, ntot, nquit, ncompute, isl
     real :: trecv(NSLOT)
     character(len=PATHLEN) :: open_name(2)
+    logical :: open_pending(2)
     integer :: c0, c1, c2, rate
     character(len=PATHLEN) :: path
     character(len=NAMELEN * MAXV) :: namebuf
     type(rec_t) :: r
     comm = comm_world()
-    ncompute = comm_world_size() - 1   ! every compute rank sends its own slabs and its own quit
+    nserv = io_server_count()
+    me_w = io_server_index()
+    ncompute = comm_world_size() - nserv   ! every compute rank sends its own slabs and its own quit
     trecv = 0.0
     nquit = 0
     open_name = ''
-    write(*,'(a,i0)') 'io_server: ready on world rank ', comm_world_rank()
+    open_pending = .false.
+    write(*,'(a,i0,a,i0,a,i0)') 'io_server: ready on world rank ', comm_world_rank(), '  writer ', me_w, ' of ', nserv
     flush(6)
     do
       call MPI_Recv(hdr, NHDR, MPI_INTEGER, MPI_ANY_SOURCE, TAG_CMD, comm, stat, ierr)
@@ -785,14 +842,13 @@ contains
       case (CMD_OPEN)
         call MPI_Recv(path, PATHLEN, MPI_CHARACTER, src, TAG_STR, comm, stat, ierr)
         k = hdr(2)
-        if (ncid_open(k) >= 0 .and. trim(path) == trim(open_name(k))) then
-          continue                 ! another tile announcing the file already open
-        else
-          if (ncid_open(k) >= 0) call nc_close(ncid_open(k))
-          call nc_open_write(trim(path), ncid_open(k))
+        ! Only remember the path: the (collective) open happens when the
+        ! first record for it is written, so that several writers reach it
+        ! in the same order as the records (an eager open could pair with
+        ! another writer's record write and deadlock).
+        if (trim(path) /= trim(open_name(k))) then
           open_name(k) = path
-          write(*,'(a,a)') 'io_server: opened ', trim(path)
-          flush(6)
+          open_pending(k) = .true.
         endif
       case (CMD_PUT)
         if (.not. allocated(tbuf)) then
@@ -821,6 +877,8 @@ contains
           enddo
           write(*,'(a,i0,a,i0,a,i0,a)') 'io_server: WARNING all ', NSLOT, ' record slots busy; writing record ', &
                slot_key(3, isl), ' with ', slot_n(isl), ' of its tiles present (output faster than the writer)'
+          if (nserv > 1) error stop 'io_server: record slots overrun with several writers (output faster than the writers): raise NSLOT or lower the output frequency'
+          if (open_pending(tmeta(0, isl)%fkind)) call open_now(tmeta(0, isl)%fkind)
           call flush_slot_partial(isl)
         endif
         slot_key(:, isl) = (/hdr(2), hdr(6), hdr(3)/)
@@ -838,9 +896,13 @@ contains
           r%nrank(iv) = hdr(b + 4)
           r%i0f(iv) = hdr(b + 5); r%j0f(iv) = hdr(b + 6)
           r%names(iv) = namebuf((iv - 1) * NAMELEN + 1:iv * NAMELEN)
-          r%off(iv) = ntot + 1
-          ntot = ntot + r%n1(iv) * r%n2(iv) * r%n3(iv)
+          r%off(iv) = 0                       ! not this writer's variable
+          if (mine(iv)) then
+            r%off(iv) = ntot + 1
+            ntot = ntot + r%n1(iv) * r%n2(iv) * r%n3(iv)
+          endif
         enddo
+        ntot = max(ntot, 1)
         r%dbl = (hdr(7) == 1)
         call system_clock(c0, rate)
         if (r%dbl) then
@@ -849,6 +911,7 @@ contains
           endif
           if (.not. allocated(tbuf(src, isl)%b8)) allocate(tbuf(src, isl)%b8(ntot))
           do iv = 1, r%nvars
+            if (.not. mine(iv)) cycle
             off = r%off(iv)
             n = r%n1(iv) * r%n2(iv) * r%n3(iv)
             call MPI_Recv(tbuf(src, isl)%b8(off), n, MPI_REAL8, src, TAG_DATA + iv, comm, stat, ierr)
@@ -860,6 +923,7 @@ contains
           endif
           if (.not. allocated(tbuf(src, isl)%b)) allocate(tbuf(src, isl)%b(ntot))
           do iv = 1, r%nvars
+            if (.not. mine(iv)) cycle
             off = r%off(iv)
             n = r%n1(iv) * r%n2(iv) * r%n3(iv)
             call MPI_Recv(tbuf(src, isl)%b(off), n, MPI_REAL4, src, TAG_DATA + iv, comm, stat, ierr)
@@ -873,6 +937,9 @@ contains
         trecv(isl) = trecv(isl) + real(c1 - c0) / real(rate)
         if (slot_n(isl) == ncompute) then
           k = r%fkind
+          write(*,'(a,i0,a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' record complete: kind ', k, ' rec ', r%rec, ' file ', r%nfile
+          flush(6)
+          if (open_pending(k)) call open_now(k)
           if (ncid_open(k) < 0) error stop 'io_server: record before file open'
           call system_clock(c1)
           call write_assembled(ncid_open(k), isl)
@@ -885,13 +952,19 @@ contains
         endif
       case (CMD_QUIT)
         nquit = nquit + 1
+        write(*,'(a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' quit ', nquit, ' of ', ncompute
+        flush(6)
         if (nquit < ncompute) cycle
         ! records still assembling: write their arrived tiles before closing
         do k = 1, NSLOT
           if (slot_n(k) > 0) then
             write(*,'(a,i0,a,i0,a)') 'io_server: WARNING record ', slot_key(3, k), ' incomplete at quit (', &
                  slot_n(k), ' tiles); writing what arrived'
-            call flush_slot_partial(k)
+            if (nserv > 1) then
+              write(*,'(a)') 'io_server: (several writers: the incomplete record is dropped to keep the collective order)'
+            else
+              call flush_slot_partial(k)
+            endif
           endif
         enddo
         do k = 1, 2
@@ -906,6 +979,19 @@ contains
       end select
     enddo
 #endif
+  contains
+    subroutine open_now(kind)
+      integer, intent(in) :: kind
+      if (ncid_open(kind) >= 0) call nc_close(ncid_open(kind))
+      if (nserv > 1) then
+        call nc_open_write_par(trim(open_name(kind)), ncid_open(kind), comm_writers())
+      else
+        call nc_open_write(trim(open_name(kind)), ncid_open(kind))
+      endif
+      open_pending(kind) = .false.
+      write(*,'(a,i0,a,a)') 'io_server: writer ', me_w, ' opened ', trim(open_name(kind))
+      flush(6)
+    end subroutine open_now
   end subroutine io_server_run
 
 end module io_server
