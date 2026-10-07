@@ -6,8 +6,9 @@ module halo_mod
   ! EW then NS so corners ride along (ROMS do_corners).
   use kinds
   use decomp_mod, only: decomp
-  use time_state, only: fast, nt
-  use comm_mod, only: comm_exchange2, comm_exchange3, comm_sendrecv_raw, comm_sendrecv_dev, comm_gpu_direct
+  use time_state, only: fast, nt, iic
+  use comm_mod, only: comm_exchange2, comm_exchange3, comm_sendrecv_raw, comm_sendrecv_dev, comm_gpu_direct, &
+                      comm_post_dev, comm_wait_dev, comm_rank
   use gpu_state, only: Hz, z_r, z_w, FlxU, FlxV, We, Wi, u, v, t, rho1, qp1, rho, bvf, rhoA, rhoS, ru, rv, &
                        umask, vmask, rmask, sustr, svstr, stflx, srflx, f, hbls, hbbl, Akv, Akt, ghat, &
                        rufrc, rvfrc, wrk3a, wrk3b, ubar, vbar, zeta
@@ -77,6 +78,17 @@ module halo_mod
   real(rp), allocatable :: tew_slo(:,:,:), tew_shi(:,:,:), tew_rlo(:,:,:), tew_rhi(:,:,:)
   real(rp), allocatable :: tns_slo(:,:,:), tns_shi(:,:,:), tns_rlo(:,:,:), tns_rhi(:,:,:)
 #endif
+  ! Non-blocking all-tracer exchange in flight (halo_tp_start/mid/finish):
+  ! 0 none, 1 east-west posted, 2 north-south posted.
+  integer :: tp_pending = 0, tp_slot_p = 0, tp_ntr_p = 0
+  logical :: tp_ew_posted = .false., tp_ns_posted = .false.
+  integer :: tp_req_ew(4) = 0, tp_req_ns(4) = 0
+#ifdef USE_CUDA
+  real(pp), device, allocatable :: tp_chk(:,:,:,:)   ! ROMS_GPU_TP_CHECK scratch copy of one slot
+#else
+  real(pp), allocatable :: tp_chk(:,:,:,:)
+#endif
+  logical :: tp_devsync = .false.   ! ROMS_GPU_TP_DEVSYNC=1: cudaDeviceSynchronize after each wait (test)
 
   public :: halo_fill_2d
   public :: halo_fill_2d_n
@@ -97,6 +109,7 @@ module halo_mod
   public :: halo_fill_3d_s
   public :: halo_fill_3d_t
   public :: halo_fill_3d_tp
+  public :: halo_tp_start, halo_tp_mid, halo_tp_finish, tp_overlap_on
   public :: halo_fill_3d_w
   public :: halo_fill_3d_w_s
   public :: halo_ensure
@@ -865,20 +878,10 @@ contains
     enddo
   end subroutine halo_fill_3d_t
 
-  subroutine halo_fill_3d_tp(a, ntr, slot)
-    ! Passive tracers, tracer-innermost layout a(ntr, is:ie, js:je, nz, 3):
-    ! one exchange of all tracers in slot `slot` at rho points. Pure copies,
-    ! so a tiled run reproduces the single-tile interior bit for bit. The
-    ! combined buffer index is kk = (k-1)*ntr + itr; east-west first, then
-    ! north-south including the east-west halo columns (as halo_fill_3d).
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
-    integer(ip), intent(in) :: ntr, slot
-    integer(ip) :: i, j, k, kk, m, itr, n, h, nz, nk, i1, i2, j1, j2, ilo, ihi, is, ie, js, je
-    if (no_neighbors()) return
-    if (ntr <= 0) return
-    h = decomp%halo; nz = decomp%nz; nk = nz * ntr; n = slot
-    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
-    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+  subroutine tp_ensure_bufs(nk)
+    integer(ip), intent(in) :: nk
+    integer(ip) :: h, is, ie, js, je
+    h = decomp%halo; is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     if (allocated(tew_slo)) then
       if (ubound(tew_slo, 3) /= nk .or. lbound(tew_slo, 2) /= js .or. ubound(tew_slo, 2) /= je .or. &
           lbound(tns_slo, 1) /= is .or. ubound(tns_slo, 1) /= ie) then
@@ -891,86 +894,297 @@ contains
       tew_slo = 0.0_rp; tew_shi = 0.0_rp; tew_rlo = 0.0_rp; tew_rhi = 0.0_rp
       tns_slo = 0.0_rp; tns_shi = 0.0_rp; tns_rlo = 0.0_rp; tns_rhi = 0.0_rp
     endif
-    ! ---- east-west
-    if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
+  end subroutine tp_ensure_bufs
+
+  subroutine tp_pack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    integer(ip), intent(in) :: ntr, n, nk, h, i1, i2, j1, j2
+    integer(ip) :: kk, j, m, k, itr
+    CUF_DO3
+    do kk = 1, nk
+      do j = j1, j2
+        do m = 1, h
+          k = (kk - 1) / ntr + 1
+          itr = kk - (k - 1) * ntr
+          tew_slo(m, j, kk) = real(a(itr, i1 + m - 1, j, k, n), rp)
+          tew_shi(m, j, kk) = real(a(itr, i2 - h + m, j, k, n), rp)
+        enddo
+      enddo
+    enddo
+  end subroutine tp_pack_ew
+
+  subroutine tp_unpack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    integer(ip), intent(in) :: ntr, n, nk, h, i1, i2, j1, j2
+    integer(ip) :: kk, j, m, k, itr
+    if (decomp%nbr_w /= NBR_NONE) then
       CUF_DO3
       do kk = 1, nk
         do j = j1, j2
           do m = 1, h
             k = (kk - 1) / ntr + 1
             itr = kk - (k - 1) * ntr
-            tew_slo(m, j, kk) = real(a(itr, i1 + m - 1, j, k, n), rp)
-            tew_shi(m, j, kk) = real(a(itr, i2 - h + m, j, k, n), rp)
+            a(itr, i1 - h + m - 1, j, k, n) = real(tew_rlo(m, j, kk), pp)
           enddo
         enddo
       enddo
-      call deliver3(decomp%nbr_w, decomp%nbr_e, tew_slo, tew_shi, tew_rlo, tew_rhi)
-      if (decomp%nbr_w /= NBR_NONE) then
-        CUF_DO3
-        do kk = 1, nk
-          do j = j1, j2
-            do m = 1, h
-              k = (kk - 1) / ntr + 1
-              itr = kk - (k - 1) * ntr
-              a(itr, i1 - h + m - 1, j, k, n) = real(tew_rlo(m, j, kk), pp)
-            enddo
-          enddo
-        enddo
-      endif
-      if (decomp%nbr_e /= NBR_NONE) then
-        CUF_DO3
-        do kk = 1, nk
-          do j = j1, j2
-            do m = 1, h
-              k = (kk - 1) / ntr + 1
-              itr = kk - (k - 1) * ntr
-              a(itr, i2 + m, j, k, n) = real(tew_rhi(m, j, kk), pp)
-            enddo
-          enddo
-        enddo
-      endif
     endif
-    ! ---- north-south, including the east-west halo columns
-    if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
-      ilo = i1 - h; ihi = i2 + h
+    if (decomp%nbr_e /= NBR_NONE) then
+      CUF_DO3
+      do kk = 1, nk
+        do j = j1, j2
+          do m = 1, h
+            k = (kk - 1) / ntr + 1
+            itr = kk - (k - 1) * ntr
+            a(itr, i2 + m, j, k, n) = real(tew_rhi(m, j, kk), pp)
+          enddo
+        enddo
+      enddo
+    endif
+  end subroutine tp_unpack_ew
+
+  subroutine tp_pack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    integer(ip), intent(in) :: ntr, n, nk, h, ilo, ihi, j1, j2
+    integer(ip) :: kk, i, m, k, itr
+    CUF_DO3
+    do kk = 1, nk
+      do m = 1, h
+        do i = ilo, ihi
+          k = (kk - 1) / ntr + 1
+          itr = kk - (k - 1) * ntr
+          tns_slo(i, m, kk) = real(a(itr, i, j1 + m - 1, k, n), rp)
+          tns_shi(i, m, kk) = real(a(itr, i, j2 - h + m, k, n), rp)
+        enddo
+      enddo
+    enddo
+  end subroutine tp_pack_ns
+
+  subroutine tp_unpack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    integer(ip), intent(in) :: ntr, n, nk, h, ilo, ihi, j1, j2
+    integer(ip) :: kk, i, m, k, itr
+    if (decomp%nbr_s /= NBR_NONE) then
       CUF_DO3
       do kk = 1, nk
         do m = 1, h
           do i = ilo, ihi
             k = (kk - 1) / ntr + 1
             itr = kk - (k - 1) * ntr
-            tns_slo(i, m, kk) = real(a(itr, i, j1 + m - 1, k, n), rp)
-            tns_shi(i, m, kk) = real(a(itr, i, j2 - h + m, k, n), rp)
+            a(itr, i, j1 - h + m - 1, k, n) = real(tns_rlo(i, m, kk), pp)
           enddo
         enddo
       enddo
+    endif
+    if (decomp%nbr_n /= NBR_NONE) then
+      CUF_DO3
+      do kk = 1, nk
+        do m = 1, h
+          do i = ilo, ihi
+            k = (kk - 1) / ntr + 1
+            itr = kk - (k - 1) * ntr
+            a(itr, i, j2 + m, k, n) = real(tns_rhi(i, m, kk), pp)
+          enddo
+        enddo
+      enddo
+    endif
+  end subroutine tp_unpack_ns
+
+  subroutine sync_work_stream()
+#ifdef USE_CUDA
+    integer :: ierr
+    ierr = cudaStreamSynchronize(work_stream)
+    if (ierr /= 0) error stop 'halo: work stream sync'
+#endif
+  end subroutine sync_work_stream
+
+  subroutine halo_fill_3d_tp(a, ntr, slot)
+    ! Passive tracers, tracer-innermost layout a(ntr, is:ie, js:je, nz, 3):
+    ! one exchange of all tracers in slot `slot` at rho points. Pure copies,
+    ! so a tiled run reproduces the single-tile interior bit for bit. The
+    ! combined buffer index is kk = (k-1)*ntr + itr; east-west first, then
+    ! north-south including the east-west halo columns (as halo_fill_3d).
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    integer(ip), intent(in) :: ntr, slot
+    integer(ip) :: n, h, nk, i1, i2, j1, j2, ilo, ihi
+    if (no_neighbors()) return
+    if (ntr <= 0) return
+    if (tp_pending /= 0) error stop 'halo_fill_3d_tp: a non-blocking all-tracer exchange is pending'
+    h = decomp%halo; nk = decomp%nz * ntr; n = slot
+    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+    call tp_ensure_bufs(nk)
+    if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
+      call tp_pack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
+      call deliver3(decomp%nbr_w, decomp%nbr_e, tew_slo, tew_shi, tew_rlo, tew_rhi)
+      call tp_unpack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
+    endif
+    if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
+      ilo = i1 - h; ihi = i2 + h
+      call tp_pack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
       call deliver3(decomp%nbr_s, decomp%nbr_n, tns_slo, tns_shi, tns_rlo, tns_rhi)
-      if (decomp%nbr_s /= NBR_NONE) then
-        CUF_DO3
-        do kk = 1, nk
-          do m = 1, h
-            do i = ilo, ihi
-              k = (kk - 1) / ntr + 1
-              itr = kk - (k - 1) * ntr
-              a(itr, i, j1 - h + m - 1, k, n) = real(tns_rlo(i, m, kk), pp)
-            enddo
-          enddo
-        enddo
-      endif
-      if (decomp%nbr_n /= NBR_NONE) then
-        CUF_DO3
-        do kk = 1, nk
-          do m = 1, h
-            do i = ilo, ihi
-              k = (kk - 1) / ntr + 1
-              itr = kk - (k - 1) * ntr
-              a(itr, i, j2 + m, k, n) = real(tns_rhi(i, m, kk), pp)
-            enddo
-          enddo
-        enddo
-      endif
+      call tp_unpack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
     endif
   end subroutine halo_fill_3d_tp
+
+  ! ---- the same exchange in three non-blocking pieces, so that the MPI
+  ! transfers run under unrelated kernels: start packs and posts the
+  ! east-west round; mid waits for it, unpacks, packs and posts the
+  ! north-south round (which carries the east-west halo columns); finish
+  ! waits and unpacks. Between start and finish the slot's interior must
+  ! not change and its halo must not be read. The same call sequence runs
+  ! on every rank. Without GPU-direct MPI, start does the blocking exchange.
+  subroutine halo_tp_start(a, ntr, slot)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    integer(ip), intent(in) :: ntr, slot
+    integer(ip) :: n, h, nk, i1, i2, j1, j2
+    if (no_neighbors()) return
+    if (ntr <= 0) return
+    if (tp_pending /= 0) error stop 'halo_tp_start: the previous all-tracer exchange was not finished'
+    if (.not. comm_gpu_direct) then
+      call halo_fill_3d_tp(a, ntr, slot)
+      return
+    endif
+    if (tp_check_wanted()) continue
+    h = decomp%halo; nk = decomp%nz * ntr; n = slot
+    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+    call tp_ensure_bufs(nk)
+    tp_slot_p = int(slot); tp_ntr_p = int(ntr)
+    tp_ew_posted = .false.; tp_ns_posted = .false.
+    if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
+      call tp_pack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
+      call sync_work_stream()
+      call comm_post_dev(decomp%nbr_w, decomp%nbr_e, int(size(tew_slo)), tew_slo, tew_shi, tew_rlo, tew_rhi, &
+                         321, 322, tp_req_ew)
+      tp_ew_posted = .true.
+    endif
+    tp_pending = 1
+  end subroutine halo_tp_start
+
+  subroutine halo_tp_mid(a, ntr)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    integer(ip), intent(in) :: ntr
+    integer(ip) :: n, h, nk, i1, i2, j1, j2, ilo, ihi
+    if (tp_pending /= 1) return
+    if (int(ntr) /= tp_ntr_p) error stop 'halo_tp_mid: tracer count changed'
+    h = decomp%halo; nk = decomp%nz * ntr; n = int(tp_slot_p, ip)
+    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+    if (tp_ew_posted) then
+      call comm_wait_dev(tp_req_ew)
+      if (tp_devsync) call sync_arch()
+      call tp_unpack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
+    endif
+    if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
+      ilo = i1 - h; ihi = i2 + h
+      call tp_pack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
+      call sync_work_stream()
+      call comm_post_dev(decomp%nbr_s, decomp%nbr_n, int(size(tns_slo)), tns_slo, tns_shi, tns_rlo, tns_rhi, &
+                         323, 324, tp_req_ns)
+      tp_ns_posted = .true.
+      tp_pending = 2
+    else
+      tp_pending = 0
+    endif
+  end subroutine halo_tp_mid
+
+  subroutine halo_tp_finish(a, ntr)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    integer(ip), intent(in) :: ntr
+    integer(ip) :: n, h, nk, i1, i2, j1, j2, ilo, ihi
+    if (tp_pending == 1) call halo_tp_mid(a, ntr)
+    if (tp_pending /= 2) then
+      tp_pending = 0
+      return
+    endif
+    h = decomp%halo; nk = decomp%nz * ntr; n = int(tp_slot_p, ip)
+    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+    ilo = i1 - h; ihi = i2 + h
+    call comm_wait_dev(tp_req_ns)
+    if (tp_devsync) call sync_arch()
+    call tp_unpack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
+    tp_pending = 0
+    if (tp_check_wanted()) call tp_check(a, ntr, n)
+  end subroutine halo_tp_finish
+
+  logical function tp_overlap_on(window)
+    ! ROMS_GPU_TP_OVERLAP bitmask (default 3): bit 1 = the slot-3 exchange
+    ! posted by pre_step3d, bit 2 = the end-of-step exchange posted by
+    ! passive_t3dmix. A window that is off runs the blocking exchange.
+    integer, intent(in) :: window
+    logical, save :: checked = .false.
+    integer, save :: mask = 3
+    character(len=16) :: val
+    integer :: stat
+    if (.not. checked) then
+      checked = .true.
+      call get_environment_variable('ROMS_GPU_TP_OVERLAP', val, status=stat)
+      if (stat == 0 .and. len_trim(val) > 0) then
+        read(val, *, iostat=stat) mask
+        if (stat /= 0) mask = 3
+      endif
+      write(*,'(a,i0)') 'halo: all-tracer exchange overlap mask = ', mask
+    endif
+    tp_overlap_on = (iand(mask, window) /= 0)
+  end function tp_overlap_on
+
+  logical function tp_check_wanted()
+    ! ROMS_GPU_TP_CHECK=1: after every overlapped all-tracer exchange, redo
+    ! it blockingly and report halo cells that differ (debug aid).
+    logical, save :: checked = .false., wanted = .false.
+    character(len=16) :: val
+    integer :: stat
+    if (.not. checked) then
+      checked = .true.
+      call get_environment_variable('ROMS_GPU_TP_CHECK', val, status=stat)
+      wanted = (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '1')
+      if (wanted) write(*,'(a)') 'halo: overlapped all-tracer exchanges are re-checked (ROMS_GPU_TP_CHECK)'
+      call get_environment_variable('ROMS_GPU_TP_DEVSYNC', val, status=stat)
+      tp_devsync = (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '1')
+      if (tp_devsync) write(*,'(a)') 'halo: device sync after each overlapped exchange wait (ROMS_GPU_TP_DEVSYNC)'
+    endif
+    tp_check_wanted = wanted
+  end function tp_check_wanted
+
+  subroutine tp_check(a, ntr, n)
+    ! Exact check: keep a device copy of slot n, redo the exchange
+    ! blockingly, count halo cells that differ (integer reduction).
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    integer(ip), intent(in) :: ntr, n
+    integer(ip) :: i1, i2, j1, j2, i, j, k, itr, nz, is, ie, js, je, nbad
+    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+    nz = decomp%nz; is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    if (.not. allocated(tp_chk)) allocate(tp_chk(ntr, is:ie, js:je, nz))
+    CUF_DO3
+    do k = 1, nz
+      do j = js, je
+        do i = is, ie
+          do itr = 1, ntr
+            tp_chk(itr, i, j, k) = a(itr, i, j, k, n)
+          enddo
+        enddo
+      enddo
+    enddo
+    call sync_work_stream()
+    call halo_fill_3d_tp(a, ntr, n)
+    nbad = 0
+    CUF_DO3
+    do k = 1, nz
+      do j = js, je
+        do i = is, ie
+          if (i < i1 .or. i > i2 .or. j < j1 .or. j > j2) then
+            do itr = 1, ntr
+              if (tp_chk(itr, i, j, k) /= a(itr, i, j, k, n)) nbad = nbad + 1
+            enddo
+          endif
+        enddo
+      enddo
+    enddo
+    call sync_work_stream()
+    if (nbad /= 0) then
+      write(*,'(a,i0,a,i0,a,i0,a,i0)') 'TP EXCHANGE MISMATCH rank ', comm_rank(), ' iic ', iic, &
+           ' slot ', n, ' differing halo values ', nbad
+      flush(6)
+    endif
+  end subroutine tp_check
 
   subroutine halo_fill_3d_w_s(a, stagger, slot)
     real(rp), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, 0:decomp%nz, 2)

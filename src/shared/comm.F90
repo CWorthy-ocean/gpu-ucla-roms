@@ -34,6 +34,7 @@ module comm_mod
   public :: comm_exchange2
   public :: comm_sendrecv_raw
   public :: comm_sendrecv_dev
+  public :: comm_post_dev, comm_wait_dev
   public :: comm_gpu_direct
   public :: comm_exchange3
   public :: have_io_server
@@ -288,6 +289,46 @@ contains
     if (nbr_lo >= 0 .or. nbr_hi >= 0) error stop 'comm_sendrecv_dev: MPI neighbor without USE_MPI'
 #endif
   end subroutine comm_sendrecv_dev
+
+  subroutine comm_post_dev(nbr_lo, nbr_hi, n, s_lo, s_hi, r_lo, r_hi, tag_lo, tag_hi, req)
+    ! Non-blocking form of comm_sendrecv_dev: posts the four requests with
+    ! the caller's tags (distinct from the blocking exchanges, which use
+    ! 301/302 and 311/312, so an exchange in flight cannot be matched by
+    ! one posted later) and returns; comm_wait_dev completes them. The
+    ! buffers must stay untouched until then.
+    integer(ip), intent(in) :: nbr_lo, nbr_hi
+    integer,     intent(in) :: n, tag_lo, tag_hi
+#ifdef USE_CUDA
+    real(rp), device, intent(in)    :: s_lo(*), s_hi(*)
+    real(rp), device, intent(inout) :: r_lo(*), r_hi(*)
+#else
+    real(rp), intent(in)    :: s_lo(*), s_hi(*)
+    real(rp), intent(inout) :: r_lo(*), r_hi(*)
+#endif
+    integer, intent(out) :: req(4)
+#ifdef USE_MPI
+    integer :: dest_lo, dest_hi, ierr
+    if (.not. ready) call init_comm()
+    dest_lo = mpi_dest(nbr_lo)
+    dest_hi = mpi_dest(nbr_hi)
+    call MPI_Irecv(r_hi, n, MPI_DOUBLE_PRECISION, dest_hi, tag_lo, compute_comm, req(1), ierr)
+    call MPI_Irecv(r_lo, n, MPI_DOUBLE_PRECISION, dest_lo, tag_hi, compute_comm, req(2), ierr)
+    call MPI_Isend(s_lo, n, MPI_DOUBLE_PRECISION, dest_lo, tag_lo, compute_comm, req(3), ierr)
+    call MPI_Isend(s_hi, n, MPI_DOUBLE_PRECISION, dest_hi, tag_hi, compute_comm, req(4), ierr)
+#else
+    req = 0
+    if (nbr_lo >= 0 .or. nbr_hi >= 0) error stop 'comm_post_dev: MPI neighbor without USE_MPI'
+#endif
+  end subroutine comm_post_dev
+
+  subroutine comm_wait_dev(req)
+    integer, intent(inout) :: req(4)
+#ifdef USE_MPI
+    integer :: ierr, stats(MPI_STATUS_SIZE, 4)
+    call MPI_Waitall(4, req, stats, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_wait_dev: waitall'
+#endif
+  end subroutine comm_wait_dev
 
   subroutine comm_exchange2(nbr_lo, nbr_hi, send_lo, send_hi, recv_lo, recv_hi)
     integer(ip), intent(in) :: nbr_lo, nbr_hi

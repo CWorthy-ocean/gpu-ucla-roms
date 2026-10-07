@@ -19,7 +19,7 @@ module passive_mod
   use formulas
   use time_state
   use passive_column_mod, only: passive_column_run, passive_horiz_run, passive_t3dmix_run
-  use halo_mod, only: halo_fill_3d_tp
+  use halo_mod, only: halo_fill_3d_tp, halo_tp_start, halo_tp_mid, halo_tp_finish, tp_overlap_on
   implicit none
   private
 
@@ -37,6 +37,7 @@ module passive_mod
   real(rp), WORK_ATTR public, allocatable :: tb_south(:,:,:), tb_north(:,:,:)  ! (is:ie, nz, ntp)
 
   public :: read_passive_namelist
+  public :: passive_exchange_mid, passive_exchange_finish
   public :: alloc_passive
   public :: init_passive
   public :: passive_predictor
@@ -165,10 +166,12 @@ contains
     real(rp), intent(in) :: dtau, cf_stp, cf_bak
     integer(ip), intent(in) :: n_stp, n_new, indx
     if (ntp <= 0) return
-    ! Slot nrhs (= nstp) is the previous step's nnew, exchanged after its
-    ! t3dmix (or at load); nothing writes tp in between, so no exchange
-    ! here. Slot n_new is exchanged by pre_step3d after passive_t3dbc, and
-    ! nothing reads its halo before that (t3dbc reads slot nstp).
+    ! Slot nrhs (= nstp) is the previous step's nnew: its exchange was
+    ! started after that step's t3dmix (or done at load) and is completed
+    ! here, just before the first stencil that reads it. Slot n_new is
+    ! exchanged by pre_step3d after passive_t3dbc, and nothing reads its
+    ! halo before that (t3dbc reads slot nstp).
+    call halo_tp_finish(tp, ntp)
     call passive_horiz_run(tp, ntp, 1_ip, nrhs, n_stp, n_new, indx, cf_stp, cf_bak, dtau)
     call passive_column_run(tp, ntp, nrhs, n_new, dtau, 1_ip, .true., passive_mirror)
   end subroutine passive_predictor
@@ -180,7 +183,9 @@ contains
     ! solve, open boundaries.
     real(rp), intent(in) :: dt_in
     if (ntp <= 0) return
-    ! slot nrhs was exchanged after the predictor's boundary update
+    ! slot nrhs (= 3): exchange started by pre_step3d after the predictor's
+    ! boundary update, completed here
+    call halo_tp_finish(tp, ntp)
     call passive_horiz_run(tp, ntp, 2_ip, nrhs, nnew, nnew, nnew, 0.0_rp, 0.0_rp, dt_in)
     call passive_column_run(tp, ntp, nrhs, nnew, dt_in, 0_ip, .false., passive_mirror)
     call passive_t3dbc()
@@ -194,8 +199,27 @@ contains
     ! (t3dmix for tp; one thread per tracer and cell).
     if (ntp <= 0) return
     call passive_t3dmix_run(tp, ntp, nrhs, nnew, dt)
-    call halo_fill_3d_tp(tp, ntp, nnew)
+    ! nnew is the next step's nstp: post the exchange now, the next step
+    ! advances it (passive_exchange_mid) and the predictor completes it.
+    if (tp_overlap_on(2)) then
+      call halo_tp_start(tp, ntp, nnew)
+    else
+      call halo_fill_3d_tp(tp, ntp, nnew)
+    endif
   end subroutine passive_t3dmix
+
+  subroutine passive_exchange_mid()
+    ! Advance a pending all-tracer exchange (east-west done, north-south
+    ! posted); placed where unrelated kernels hide the transfer.
+    if (ntp <= 0) return
+    call halo_tp_mid(tp, ntp)
+  end subroutine passive_exchange_mid
+
+  subroutine passive_exchange_finish()
+    ! Complete a pending all-tracer exchange (end of run, before finalize).
+    if (ntp <= 0) return
+    call halo_tp_finish(tp, ntp)
+  end subroutine passive_exchange_finish
 
   ! ------------------------------------------------------ open boundaries
   subroutine passive_t3dbc()

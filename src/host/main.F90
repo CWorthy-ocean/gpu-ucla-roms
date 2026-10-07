@@ -9,6 +9,7 @@ program roms_gpu
   use arch_mod, only: init_arch, arch_name, select_device
   use comm_mod, only: init_comm, finalize_comm, comm_rank, comm_size, is_io_rank
   use io_server, only: io_server_run, io_finalize
+  use passive_mod, only: passive_exchange_finish
   implicit none
 
   integer(ip) :: gnx, gny, nz, halo, npx, npy, rank
@@ -95,6 +96,7 @@ program roms_gpu
   endif
   endif
 
+  call passive_exchange_finish()
   call io_finalize()
   call free_state()
   call finalize_comm()

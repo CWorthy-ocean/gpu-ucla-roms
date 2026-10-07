@@ -124,7 +124,8 @@ contains
       call implicit_tracer_columns(nx, ny, nz, n_new, itrc, iAkt, dt_loc, .false.)
       if (itrc == itemp) call dump_cor_col('cor impl', 5)
       call t3dbc(itrc)
-      call halo_fill_3d_t(t, STAGGER_RHO, nnew, itrc)
+      ! no exchange here: MARBL and t3dmix read t(nnew) at the point only
+      ! (t3dmix's stencil is slot nrhs) and rho_eos(nnew) exchanges it
     enddo
     if (ntp > 0) call passive_corrector(dt_loc)
   end subroutine step3d_t

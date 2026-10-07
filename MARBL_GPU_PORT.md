@@ -682,6 +682,71 @@ Pac 8 GPUs 4-step restart vs pac8; Pac 3-day history vs pac3d8w4m):
 Net 4.5% per step on Pac, 4.6% on MiniPac; the walltime difference between
 the first two rows is init/queue noise (init 86 vs 83-93 s).
 
+## Exchange overlap (2026-10-07): non-blocking tracer exchange, fewer exchanges, and what the step is really bound by
+
+- The two remaining all-tracer exchanges per step are non-blocking in three
+  pieces (`halo_tp_start` packs and posts the east-west round on device
+  buffers through GPU-direct MPI with its own tags 321-324; `halo_tp_mid`
+  waits, unpacks, packs and posts the north-south round; `halo_tp_finish`
+  waits and unpacks). The slot-3 exchange is posted at the end of
+  pre_step3d, advanced after visc3d and finished in passive_corrector; the
+  end-of-step exchange is posted after passive_t3dmix, advanced after the
+  next step's lmd_vmix and finished in passive_predictor
+  (`passive_exchange_finish` before finalize). Between post and finish the
+  slot's interior is unchanged and its halo unread (see the hygiene
+  section for the slot-rotation argument). Without GPU-direct MPI the
+  start does the blocking exchange. Debug knobs: `ROMS_GPU_TP_OVERLAP`
+  (bitmask, 1 = slot-3 window, 2 = end-of-step window, default 3),
+  `ROMS_GPU_TP_CHECK=1` (redo each overlapped exchange blockingly and
+  count differing halo values), `ROMS_GPU_TP_DEVSYNC=1`.
+- Eleven redundant single-field 3-D exchanges per step removed by the same
+  argument: u and v (nrhs) and temp (nrhs) at the step start (exchanged by
+  step3d_uv2's and rho_eos(nnew)'s groups after the last writes), the
+  per-tracer exchanges after the T/S predictor (the group after t3dbc
+  follows) and after the corrector (MARBL and t3dmix read nnew at the
+  point; rho_eos(nnew) exchanges it), and t3dmix's exchanges of nrhs
+  before and nnew after (slot 3 unchanged since the groups; nnew exchanged
+  by rho_eos).
+- Results, all bit-identical (MiniPac 4-step and 3-day vs 4r/3dv3, Pac
+  4-step restart vs pac8, Pac 3-day history+restart vs pac3d8w4m):
+  MiniPac non-output step 0.1168 -> 0.1168 (overlap) -> 0.1128 s (fewer
+  exchanges); Pac 3-day p50 0.488 -> 0.494 (overlap) -> 0.478 s (fewer exchanges; per-rank stepping 136.7 -> 132.8 s).
+  On rank 0 of the Pac profile the overlap removed the 62 ms of idle at the
+  tracer exchanges, but the 3-day step did not move: an all-rank profile
+  (`tools/nsys_rank_balance.py`, `nsys_allranks.sh`) shows GPU busy per
+  step from 0.198 s (rank 7, 28k wet of 232k cells) to 0.340 s (rank 2,
+  all wet); mean 0.29 s. The step is paced by the wettest tile, and the
+  other ranks' exchange "waits" were waiting for it. The busy times fit
+  cost = wet + 0.47 x land per cell, but the memory cap
+  (`tile_max_cells_ratio` 1.2, ~0.12 GB per 1000 cells, 3 FP64 slots of 32
+  tracers) forced the balancer to land weight 0.844, i.e. near-equal
+  areas. So at 8 GPUs the remaining lever is balance, not latency: either
+  memory per cell must drop (wet-column storage of the passive tracers,
+  which would let the cap be set on wet cells) or the run needs 16 GPUs,
+  where the cap is loose enough for the 0.47 weight. Consequence for the
+  wet-column dycore item: it makes land cheaper still, which at the 1.2
+  cap mostly speeds up tiles that already wait.
+- Rebalancing alone does not help: a 3-day run with the fitted land weight
+  (0.47) and the cap at 1.3 (largest tile 282k cells, model max/mean cost
+  1.07, 30 GB on the sampled node) gave p50 0.487 s vs 0.478 s, still
+  bit-identical. Reason: the ~30 exchanges per step synchronize neighbours
+  phase by phase, so the step is the sum over phases of the slowest rank
+  in each phase. The passive phases are paced by the wettest tile and the
+  dycore phases (full-tile kernels) by the largest tile; a cost-balanced
+  cut moves work between the two without shortening the sum. Phase times
+  with stamps on (4-step Pac, median over ranks): pre_step3d 0.113 s,
+  step3d_t 0.122 s (the passive kernels), step2d fast loop 0.039 s,
+  corrector forces 0.028, step3d_uv1+visc 0.024, lmd_vmix 0.020, prsgrd
+  0.013, the rest under 0.01; sum 0.39 s. So the fast loop (wider-halo
+  item) is 8-10% of the step, and making every phase scale with wet cells
+  (wet-column dycore + wet-column storage of the passive tracers so the
+  memory cap can be set on wet cells) is what would let a wet-balanced cut
+  balance all phases at once (busy 0.34 -> ~0.29 s on the pacing rank).
+- A false alarm cost half a day: two runs diverged mid-run at last-digit
+  level. The known-good blocking binary diverged at the same step on the
+  same node (deg0072); 20+ runs on other nodes were bit-identical. Check
+  `exec_host` before chasing a race.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

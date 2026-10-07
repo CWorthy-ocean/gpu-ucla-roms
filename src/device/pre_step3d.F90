@@ -137,7 +137,8 @@ contains
       iAkt = min(itrc, 2)
       call implicit_tracer_columns(nx, ny, nz, n_new, itrc, iAkt, dtau, .true.)
       if (itrc == itemp) call dump_pre_col('pre impl', 4, indx)
-      call halo_fill_3d_t(t, STAGGER_RHO, nnew, itrc)
+      ! no exchange here: the group after t3dbc below exchanges t(nnew) and
+      ! nothing reads its halo before that (t3dbc reads slot nstp)
     enddo
     if (ntp > 0) call passive_predictor(dtau, cf_stp, cf_bak, n_stp, n_new, indx)
 
@@ -291,7 +292,15 @@ contains
     call hg_add(F_T, nnew, itemp)
     call hg_add(F_T, nnew, isalt)
     call hg_end()
-    if (ntp > 0) call halo_fill_3d_tp(tp, ntp, nnew)
+    ! slot 3 of the passives: post the exchange; advanced after visc3d and
+    ! completed by passive_corrector (nothing touches the slot in between)
+    if (ntp > 0) then
+      if (tp_overlap_on(1)) then
+        call halo_tp_start(tp, ntp, nnew)
+      else
+        call halo_fill_3d_tp(tp, ntp, nnew)
+      endif
+    endif
     call dump_pre_step_t()
   end subroutine pre_step3d
 

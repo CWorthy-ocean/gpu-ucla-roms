@@ -24,7 +24,9 @@ contains
     dt_loc = dt
 
     do itrc = 1, nt
-      call halo_fill_3d_t(t, STAGGER_RHO, nrhs, itrc)
+      ! slot nrhs (= 3) halos: exchanged by pre_step3d's group after t3dbc and
+      ! again by the corrector's rho_eos; unchanged since. Slot nnew is
+      ! written at the point only and exchanged by rho_eos(nnew) afterwards.
       ! The four faces of each cell are evaluated inline (the former wrk3a /
       ! wrk3b expressions) and summed in the same order: bit-identical to the
       ! three-kernel version without the two flux temporaries.
@@ -51,7 +53,6 @@ contains
           enddo
         enddo
       enddo
-      call halo_fill_3d_t(t, STAGGER_RHO, nnew, itrc)
     enddo
   end subroutine t3dmix
 

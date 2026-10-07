@@ -19,7 +19,7 @@ module step_driver
   use visc3d_mod, only: visc3d
   use step3d_t_mod, only: step3d_t
   use t3dmix_mod, only: t3dmix
-  use passive_mod, only: ntp, passive_t3dmix
+  use passive_mod, only: ntp, passive_t3dmix, passive_exchange_mid
   use lmd_mod, only: lmd_vmix
   use frc_io, only: set_forces
   use bry_io, only: set_bry_all, dump_bry_north
@@ -84,13 +84,10 @@ contains
     call step_mark('set_tides')
     call halo_fill_2d_s(zeta, STAGGER_RHO, knew)
     call step_mark('halo zeta')
-    call halo_fill_3d_s(u, STAGGER_U, nrhs)
-    call step_mark('halo u')
-    call halo_fill_3d_s(v, STAGGER_V, nrhs)
-    call step_mark('halo v')
+    ! u, v and t in slot nrhs (= nstp) are the previous step's nnew, whose
+    ! halos step3d_uv2's group and rho_eos(nnew)'s group exchanged after
+    ! the last writes; nothing touches them in between, so no exchange here.
     call dump_vic('after halo v')
-    call halo_fill_3d_t(t, STAGGER_RHO, nrhs, 1_ip)
-    call step_mark('halo t')
     call set_depth()
     call step_mark('set_depth')
     call dump_pgf_col('after set_depth')
@@ -108,6 +105,7 @@ contains
     call step_mark('omega')
     call lmd_vmix(nstp)
     call step_mark('lmd_vmix')
+    if (ntp > 0) call passive_exchange_mid()   ! previous step's nnew: east-west done, post north-south
     call prsgrd()
     call step_mark('prsgrd')
     call dump_col_probe('start', nrhs)
@@ -149,6 +147,7 @@ contains
     call step3d_uv1()
     call visc3d()
     call step_mark('step3d_uv1+visc')
+    if (ntp > 0) call passive_exchange_mid()   ! slot 3 of the passives: east-west done, post north-south
     call dump_uvt('after step3d_uv1', nnew)
     call dump_bt2d_probe('after step3d_uv1+visc')
     call dump_rvS('after step3d_uv1+visc')
