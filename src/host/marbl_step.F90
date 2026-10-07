@@ -56,6 +56,7 @@ module marbl_gpu
   public :: marbl_gpu_stage_his
   public :: marbl_gpu_define_rst
   public :: marbl_gpu_write_rst
+  public :: marbl_gpu_stage_rst8
 
 contains
 
@@ -113,28 +114,22 @@ contains
   ! Saved state from the initial/restart file (CPU names). Missing
   ! variables leave the pH at 0 = "no previous solution".
   subroutine marbl_gpu_load_state(ncid, rec, i0, j0, nxi, neta, fi0, fj0)
+    use par_read, only: pr_store_2d, pr_store_3d, pr_taking
     integer, intent(in) :: ncid, rec, i0, j0, nxi, neta, fi0, fj0
-    real(rp), allocatable :: t2(:,:), t3(:,:,:)
     if (.not. marbl_on) return
-    allocate(t2(nxi, neta), t3(nxi, neta, decomp%nz))
     if (nc_has_var(ncid, 'MARBL_PH_SURF')) then
-      call nc_read_2d(ncid, 'MARBL_PH_SURF', t2, nxi, neta, rec, i0f=fi0, j0f=fj0)
-      sf_ph(i0:i0+nxi-1, j0:j0+neta-1) = t2
+      call pr_store_2d(ncid, 'MARBL_PH_SURF', sf_ph(decomp%is, decomp%js), i0, j0, nxi, neta, rec, fi0, fj0)
     endif
     if (nc_has_var(ncid, 'MARBL_PH_SURF_ALT_CO2')) then
-      call nc_read_2d(ncid, 'MARBL_PH_SURF_ALT_CO2', t2, nxi, neta, rec, i0f=fi0, j0f=fj0)
-      sf_ph_alt(i0:i0+nxi-1, j0:j0+neta-1) = t2
+      call pr_store_2d(ncid, 'MARBL_PH_SURF_ALT_CO2', sf_ph_alt(decomp%is, decomp%js), i0, j0, nxi, neta, rec, fi0, fj0)
     endif
     if (nc_has_var(ncid, 'MARBL_PH_3D')) then
-      call nc_read_3d(ncid, 'MARBL_PH_3D', t3, nxi, neta, decomp%nz, rec, i0f=fi0, j0f=fj0)
-      it_ph(i0:i0+nxi-1, j0:j0+neta-1, :) = t3
+      call pr_store_3d(ncid, 'MARBL_PH_3D', it_ph(decomp%is, decomp%js, 1), i0, j0, nxi, neta, decomp%nz, rec, fi0, fj0)
     endif
     if (nc_has_var(ncid, 'MARBL_PH_3D_ALT_CO2')) then
-      call nc_read_3d(ncid, 'MARBL_PH_3D_ALT_CO2', t3, nxi, neta, decomp%nz, rec, i0f=fi0, j0f=fj0)
-      it_pha(i0:i0+nxi-1, j0:j0+neta-1, :) = t3
+      call pr_store_3d(ncid, 'MARBL_PH_3D_ALT_CO2', it_pha(decomp%is, decomp%js, 1), i0, j0, nxi, neta, decomp%nz, rec, fi0, fj0)
     endif
-    deallocate(t2, t3)
-    write(*,'(a)') 'MARBL saved state (surface and 3-D pH) loaded where present'
+    if (pr_taking()) write(*,'(a)') 'MARBL saved state (surface and 3-D pH) loaded where present'
   end subroutine marbl_gpu_load_state
 
   ! One MARBL call: at the end of the tracer step (after the passive
@@ -248,6 +243,19 @@ contains
     id = nc_def_var(ncid, 'MARBL_PH_3D', (/d_xi, d_eta, d_s, d_t/))
     id = nc_def_var(ncid, 'MARBL_PH_3D_ALT_CO2', (/d_xi, d_eta, d_s, d_t/))
   end subroutine marbl_gpu_define_rst
+
+  subroutine marbl_gpu_stage_rst8(i0, i1, j0, j1, di, dj)
+    ! The saved pH state into a double-precision staged (server) record.
+    use io_server, only: io_stage8_2d, io_stage8_3d
+    integer, intent(in) :: i0, i1, j0, j1, di, dj
+    integer :: nz
+    if (.not. marbl_on) return
+    nz = int(decomp%nz)
+    call io_stage8_2d('MARBL_PH_SURF', sf_ph(decomp%is, decomp%js), i0, i1, j0, j1, di, dj)
+    call io_stage8_2d('MARBL_PH_SURF_ALT_CO2', sf_ph_alt(decomp%is, decomp%js), i0, i1, j0, j1, di, dj)
+    call io_stage8_3d('MARBL_PH_3D', it_ph(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1, di, dj)
+    call io_stage8_3d('MARBL_PH_3D_ALT_CO2', it_pha(decomp%is, decomp%js, 1), 1, nz, i0, i1, j0, j1, di, dj)
+  end subroutine marbl_gpu_stage_rst8
 
   subroutine marbl_gpu_write_rst(ncid, rec, i0, i1, j0, j1, fi0, fj0)
     ! fi0, fj0: 1-based global file offsets of this tile's first interior point

@@ -304,6 +304,233 @@ Case files (cases/GPU): `namelist_roms_gpu_marbl4q.nml` /
 `…4q1` (history every step), `…3dq` (3 days, 6-hourly history, 50 min
 walltime with the old exchange); 1x1 counterparts `4r`, `4r1`, `3dv3`.
 
+## Multi-GPU round 2: balance, exchange count, output path (2026-10-06)
+
+Measured with the corrected per-step metric (the `cumul` of a
+`step: baroclinic step` line is that step's wall time; the earlier "0.144 s"
+figure in this file's first multi-GPU section was the largest single step
+divided by 288 and is wrong). Non-output steps of the 3-day MiniPac case:
+
+| configuration | non-output step | output steps / 3 d | 3-day walltime |
+|---|---|---|---|
+| 1 GPU | 0.424 s | 11 s | 3:59 |
+| 2x2, commit 57690cc | 0.209 s | 190 s | 10:28 |
+| 2x2 + mask-balanced cuts (lever 1) | 0.212 s | 183 s | 10:28 |
+| 2x2 + server assembles records | 0.215 s | 6 s | 3:39 |
+| 2x2 + fused fast-loop tail, non-blocking exchange | 0.192 s | 6 s | 3:35 |
+
+- Lever 1, `src/shared/tile_balance.F90` + `&tile_settings`: tensor-product
+  cuts from the land mask (cost = wet columns + land_weight x land cells,
+  2-D prefix sums, quantile seeds, alternating exact min-max partition with
+  the 2*halo+2 width floor; `uniform` and `explicit` modes; cuts and
+  per-tile costs logged as `tiles:` lines). On MiniPac the cost ratio goes
+  1.144 -> 1.091 but the step does not move: the tiled step is bound by the
+  ~1400 exchanges per step (GPU busy 0.22 s of a 0.80 s MARBL step), not by
+  the slowest tile's work. Keep it; it costs nothing and helps land-heavy
+  domains once the exchange overhead is down.
+- Output path: the server received one tile's record, wrote it (a partial-
+  chunk rewrite), then received the next tile's, so the other tiles waited
+  behind every write (10-25 s per history step). `write_assembled` now
+  collects all tiles' parts of a record and writes each variable once at
+  full extent: history steps 183 s -> 6 s per 3 days. The restart is still
+  written tile by tile (24 s for 4 tiles); routing it through the server
+  in double precision is the next output item.
+- Lever 2 so far: one 3-D exchange for the smoothed Richardson number
+  (lmd), two redundant passive fills dropped, the fast-loop tail doing one
+  fused ubar/vbar exchange with zeta exchanged only on the last fast step
+  (`step2d_tail`; the driver uses `step2d_with_halo`, not `step2d_fused`),
+  and non-blocking exchanges (both directions in flight, one wait) in
+  `comm_sendrecv_raw/dev`. 0.215 -> 0.192 s. The remaining idle time is the
+  per-exchange latency; the next step is batching several fields per
+  exchange at the heavy call sites (rho_eos, prsgrd, lmd, pre_step3d).
+- Mask-aware tiling beyond this (the CPU MPI_MASKING idea: more subdomains
+  than ranks, drop land-only subdomains; and wet-column compaction of the
+  column kernels) is discussed in the resume notes.
+
+## Multi-GPU round 3: exchange batching, wet columns, restart, init, two nodes (2026-10-06)
+
+Every run below is bit-identical to the single-GPU reference over 4 steps
+and over 3 days (history and restart). Non-output step = mean of the
+`step: baroclinic step` cumul values over the 3-day run.
+
+| configuration | non-output step | init | restart write | 3-day walltime |
+|---|---|---|---|---|
+| 1 GPU (reference) | 0.424 s | 97 s | 24 s | 3:59 |
+| 2x2, round 2 | 0.192 s | 93 s | 24 s (rank-ordered) | 3:35 |
+| 2x2 + A: group exchanges | 0.169 s | | | 3:40 |
+| 2x2 + B: wet-column kernels | 0.155 s | | | 3:37 |
+| 2x2 + C: restart via server | 0.169 s (run-to-run noise 0.155-0.169) | | 10.5 s on the server, overlapped | 3:30 |
+| 4x2 on two nodes (D) | 0.126 s | 76 s | | 3:06 |
+| final main binary (round 3), 1 GPU | 0.424 s | 67 s | 10 s on the server | |
+| final, 2x2 | 0.171 s | 35 s | 10 s on the server | 2:27 |
+| final, 4x2 on two nodes | 0.124 s | 22 s | 10 s on the server | 2:11 |
+
+Pac CPU reference (`cases/CPU_Pac`, 512 ranks on 4 CPU nodes, daily
+history + MARBL diagnostics): 3.55 s per step over the last 280 steps,
+init 226 s, walltime 25:55, 365 GB of output (rst 118 GB).
+
+- A, `halo_mod` group exchanges (`hg_begin / hg_add(id, slot, itr) / hg_end`):
+  the consecutive fills at each call site (rho_eos, prsgrd, geom, lmd,
+  pre_step3d, step3d_t/uv, visc3d, step2d, advect, the driver) become one
+  EW and one NS round over packed multi-field buffers (ids F_HZ..F_ZETA
+  resolved by a dispatcher; wrk3a/wrk3b keep their nz-from-level-0 quirk).
+- B, wet columns: `build_wet_list()` (gpu_state) after `setup_metrics`
+  gives `nwet, wet_i, wet_j`; the MARBL carb/interior/sflux kernels and the
+  passive horiz/t3dmix/column kernels run over wet columns only (1-D grids,
+  block 128). KPP is untouched because hbls carries nonzero land values.
+  Land values of tracers/zeta/temp are exact zeros in the restart, so the
+  skipped stores change nothing.
+- C, restart through the I/O server in double precision: `io_stage8_*`
+  stage real(8) windows through pinned/device buffers, the record header
+  carries a precision flag (hdr(7)), the server receives MPI_REAL8 into
+  real(8) tile buffers and `write_assembled` writes each variable once with
+  the explicit-shape double putters `nc_put_2d/3d_rec_d`. Compute ranks no
+  longer wait (24 s -> 0). Bug found on the way: the server's variable
+  names were 16 characters (`NAMELEN`), truncating
+  `MARBL_PH_SURF_ALT_CO2`; now 32 with a length check in `add_var`.
+- D, two nodes: PBS `select=1:ncpus=64:mpiprocs=4:ngpus=4+1:ncpus=64:mpiprocs=5:ngpus=4`
+  and `mpiexec -n 9` (no -ppn) place ranks 0-3 on node 1 and 4-8 on node 2,
+  so the server (last rank) shares node 2 and every compute rank has its own
+  GPU (`select_device` = rank mod device count). 0.169 -> 0.126 s per step
+  (1.34x for 2x the GPUs: still exchange-latency bound). The history output
+  steps stall ~4 s each: one server rank writes a 3.8 GB record in 6.5 s
+  while the eight tiles compute the next 24 steps in 3 s, so the run is now
+  bound by the single writer (13 records + restart = 95 s of writing per 3
+  days on both 2x2 and 4x2). Several writer ranks or parallel NetCDF is the
+  next output item.
+- Initialization (97 -> 36 s on 2x2, bit-identical on 1x1, 2x2 and 4x2):
+  - forcing file handles cached for the whole init (`frc_file_ncid`,
+    `close_frc_cache`): the series binders opened every file three times
+    per variable (174 series x 22 files) - 42 + 23 s -> 20 + 2 s;
+  - time axes prefetched once in parallel (`prefetch_time_axes`: files
+    assigned to ranks by size, all local reads first, then broadcasts;
+    `cached_times` in the binders): a classic-format record axis costs one
+    seek per record, 4348 records for `uwnd` - 20 s -> 5-9 s. A first
+    version interleaved read and broadcast per file and serialized the
+    reads (no gain): keep reads and broadcasts in separate loops;
+  - `src/host/par_read.F90`: collective reader for the grid and the initial
+    records. Phase 1 queues every window (`pr_store_2d/3d/3d_pt` with the
+    same sequence on all ranks), `pr_flush` reads whole variables
+    contiguously (one per rank per batch, windows allgathered) and
+    redistributes the windows over MPI, phase 2 stores them on the device
+    through a staging buffer and small kernels (`stage_to_device`). The
+    tile-window reads straight from the contiguous file were the cost
+    (0.29 s per tracer per tile on MiniPac, 1.5 s on Pac; 0.01 GB/s for an
+    8x8 Pac tile): 25 s -> 19 s on MiniPac (bound by the 4-stripe file,
+    reads 7-11 s per rank at ~0.43 GB/s) and the host-side stores into
+    managed memory 8 s -> 1 s. Pac's restart has 24 stripes.
+- SFLX_CORR (sea-surface salinity restoring, `roms_bugfix bulk_frc.F90`)
+  ported for the Pac case: `&surf_frc_settings sflx_corr = .true.` and
+  `&sss_correction dsssdt` (cm/day, stored as m/s), series `sss`/`sss_time`
+  through the usual bulk interpolation, kernel at the end of
+  `calc_bulk_coare`: `stflx(isalt) = -dSSSdt (S(nz, nrhs) - sss) rmask`
+  (bulk forcing only, as the CPU). Default off keeps MiniPac bit-identical.
+  Smoke test (4 steps, 2x2): mean surface salt change 2.7e-4 PSU, hbls
+  responds everywhere, isolated KPP-depth outliers up to 0.08 PSU.
+  Validation against the CPU comes with the Pac reference.
+- Pac CPU reference: `cases/CPU_Pac` (repo sources at HEAD, CPU_marbl's
+  cppdefs plus SFLX_CORR, CDR off, 32x16 tiles on 4 nodes, exact restart
+  2010-02-08, daily history and MARBL diagnostics, restart at day 3). The
+  CPU_marbl local source overrides (KPP, probe headers) must not be copied:
+  they need a removed probe module, and they equal the repo files when
+  LMD_KPP and LMD_BKPP are both defined.
+
+## Pac on the GPU (2026-10-06): first run and CPU comparison
+
+Case: `cases/GPU/namelist_roms_gpu_pac3d8.nml` + `submit_roms_gpu_pac3d8.sh`
+(1856x960x100, 32 MARBL tracers, hourly MARBL, SFLX_CORR on, exact restart
+2010-02-08, 4x2 wet-balanced tiles on 2 nodes = 8 GPUs + server rank);
+`namelist_roms_gpu_pac8.nml` is the 4-step test. CPU reference:
+`cases/CPU_Pac` (512 ranks on 4 CPU nodes).
+
+| | GPU, 8 GPUs on 2 nodes | CPU, 512 cores on 4 nodes |
+|---|---|---|
+| mean step (3 days, with output) | 1.15 s | 3.55 s |
+| initialization | 103 s (restart read 60 s) | 226 s |
+| 3-day walltime | 9:54 - 11:03 | 25:55 |
+| GPU memory per tile | 30 GB of 40 | |
+| tile cost imbalance | 1.11 | |
+
+- Correctness: `tools/gpu_cpu_day_cmp.py` (RMS of gpu-cpu over wet points
+  per field, ratio to the CPU field's RMS). Day-3 ratios on Pac vs the
+  MiniPac GPU/CPU pair: temp 1.3e-4 vs 1.1e-4, salt 3.2e-5 vs 2.4e-5, zeta
+  4.7e-5 vs 2.2e-5, DIC 1.6e-5 vs 2.2e-5, PH 3.5e-6 vs 3.6e-6, O2 1.7e-4 vs
+  1.6e-4, phytoplankton carbon 1.0-1.3e-2 vs 3-6e-3: the Pac run sits at the
+  same noise-floor level as MiniPac.
+- The first Pac run had temp RMS 0.17 C at day 3 (ratio 1.3e-2, 100x
+  MiniPac), confined to sea-surface temperatures at -1.8 C: the CPU code
+  always applies `SEA_ICE_NOFLUX` (set_global_definitions.h): where
+  SST <= -1.8 C it zeroes stflx(itemp) and srflx. Ported into the bulk kernel
+  (`calc_bulk_coare`); MiniPac stays bit-identical (never that cold). The
+  CDR_LITE k_gas and DAILYPAR variants of the rule are not in the GPU model
+  (those options are off).
+- Step time is bimodal on Pac (p10 0.45 s, p50 0.90 s, p90 2.3 s, max 8.7 s):
+  step3d_t (0.43 s mean, p10 0.14 / p90 1.22) and pre_step3d (0.30 mean,
+  p50 0.15 / p80 0.67) vary 5-10x from step to step, which they do not on
+  MiniPac tiles (flat 0.042 / 0.034 s). The pure dycore steps (p10) are 2.9x a
+  MiniPac 2x2 step for 3.7x the cells, as expected; the rest looks like
+  managed-memory migration (30 GB resident of 40, the MARBL surface host
+  loop touching tp pages, 2 x 11.5 GB of tracers per tile). Profile a few Pac
+  steps with nsys (UM traffic vs kernel time) before anything else.
+- Output: the server writes a 30 GB history record in 50-64 s and the 55 GB
+  restart in 90 s; three daily records plus the restart are ~4 minutes of a
+  10-minute run, so the single writer is now the second item after the
+  step-time variability.
+
+## Pac optimization round (2026-10-06 night)
+
+- The bimodal 8-GPU step was memory pressure, not kernels: the wet-balanced
+  cuts gave rank 4 a 310k-cell tile at 39.4 of 39.5 GB (`gpumem:` report
+  printed by `wall_stamp` at 'init done' / 'restart staged'; ~0.12 GB per
+  1000 tile cells including halos), unified memory paged in a 16-step
+  cycle and every rank waited at the exchanges. On 16 GPUs (18 GB tiles)
+  the step was flat at 0.46 s. Fix: `&tile_settings tile_max_cells_ratio`
+  (default 1.2): the land weight is raised in x1.5 steps until the largest
+  tile area is within that ratio of the mean (Pac: 0.844, max tile 238k
+  cells, 31.7 GB, cost imbalance 1.016).
+
+| Pac 3 days | 8 GPUs before | 8 GPUs, cap (final) | 16 GPUs, cap (final) | CPU, 512 cores |
+|---|---|---|---|---|
+| step p10 / p50 / p90 | 0.45 / 0.90 / 2.3 s | 0.42 / 0.53 / 0.62 s | 0.25 / 0.31 / 0.38 s | 3.55 s mean |
+| stepping per rank | 330 s | 166-172 s | 119 s | 1020 s |
+| walltime | 9:54 | 7:14 - 8:42 | 6:36 | 25:55 |
+
+Final-binary verification (edge-row exchange + cap): MiniPac 4r/4ref,
+4q/4r, 8q/4r, 3dq/3dv3, 3d8q/3dv3 bit-identical; Pac 8-tile and 16-tile
+3-day histories bit-identical to each other; Pac 8-tile vs the CPU
+reference at day 3: zeta 1.7e-5 (was 4.7e-5 before the seam fix), temp
+1.3e-4, salt 3.8e-5, DIC 1.7e-5, PH 3.8e-6, O2 1.8e-4, diatC 1.1e-2 - the
+MiniPac noise-floor levels.
+
+- nsys on rank 0 (12 steps, `tools/nsys_timeline.py` on the sqlite export):
+  steady fast steps are kernel-bound (0.47 s of kernels per step); passive
+  tracer kernels (horiz 62 ms, column 48, pre-advection 26, t3dmix 18 ms
+  per step) are a third and run near memory bandwidth with 32 FP64
+  tracers; MARBL interior 74 ms per hour; exchange pack/unpack 42 ms over
+  ~350 launches; per-step memsets 17 ms (step3d_uv2); UM traffic during
+  steady steps ~170 MB/step. The output path dominates the fixed cost:
+  one server rank writes a 30 GB history record in 50-64 s and the 55 GB
+  restart in 90 s (4 of the 7 minutes of the 3-day run); compute ranks
+  stall ~20 s at a history step when both staging slots are busy.
+- Seam bug 6, visible only on Pac: `interior_bounds` exchanged rows 1..ny,
+  so the physical boundary rows (j = 0 south, ny+1 north) were never
+  exchanged east-west while the boundary routines (u2dbc, v2dbc, u3dbc,
+  v3dbc, t3dbc radiation) use tangential neighbours on them. 8- and
+  16-tile Pac runs diverged from step 1 at the south edge, exactly at the
+  cuts (per-step history pair `pac8s`/`pac16s`, offsets from the cuts).
+  MiniPac never showed it: its seams meet masked edge points. Fix: j1 = 0
+  on a south edge, j2 = ny+1 on a north edge (the north-south round already
+  packs columns i1-h..i2+h). MiniPac 2x2 stays bit-identical; the Pac
+  8- and 16-tile per-step runs agree on every completed record.
+- I/O server slots: with output faster than the writer (per-step 30 GB
+  records on Pac) the server evicted slot 1 rather than the oldest record
+  and dropped tiles still assembling at quit (records 2 and 4 of 5 had
+  holes). Now `NSLOT = 4`, the oldest record is evicted with a WARNING,
+  and incomplete records are flushed at quit: all five per-step records
+  complete, MiniPac 2x2 bit-identical. A writer slower than the output
+  cadence still costs partial-chunk writes; several writer ranks or
+  parallel NetCDF remain the real fix.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

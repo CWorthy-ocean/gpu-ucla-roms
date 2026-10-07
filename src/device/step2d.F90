@@ -182,11 +182,9 @@ contains
     call halo_ensure()
     call step2d_pre()
     call host_zeta_obc()
-    call halo_fill_2d_n(zeta, STAGGER_RHO)   ! halo rows next to a physical edge see the OBC values
-    call step2d_mid()
+    call step2d_mid()                        ! exchanges zeta(knew) before its halo PGF terms
     call host_uv_obc()
-    call halo_fill_2d_n(ubar, STAGGER_U)     ! every fast step, as the CPU step2d exchange
-    call halo_fill_2d_n(vbar, STAGGER_V)
+    call halo_fill_uv_n(ubar, vbar)          ! every fast step, as the CPU step2d exchange
     if (fast_is_last_h) then
       call step2d_last_zeta()
       call halo_fill_2d_n(zeta, STAGGER_RHO)
@@ -433,8 +431,10 @@ contains
       call dump_rvS('after subtract')
       call dump_rufrc_build('after subtract rubar')
     endif
-    call halo_fill_2d(rufrc, STAGGER_U)
-    call halo_fill_2d(rvfrc, STAGGER_V)
+    call hg_begin()
+    call hg_add(F_RUFRC)
+    call hg_add(F_RVFRC)
+    call hg_end()
     if (first) then
       call fill_pgf_state(.true.)
       call apply_pgf(.true.)
@@ -545,10 +545,14 @@ contains
   end subroutine step2d_last_zeta
 
   subroutine step2d_tail()
-    if (fast_is_last_h) call step2d_last_zeta()
-    call halo_fill_2d_n(zeta, STAGGER_RHO)
-    call halo_fill_2d_n(ubar, STAGGER_U)
-    call halo_fill_2d_n(vbar, STAGGER_V)
+    ! zeta(knew) was exchanged inside step2d_mid before its halo PGF terms;
+    ! only the last fast step rewrites it (zt_avg1). ubar and vbar go in one
+    ! exchange per direction.
+    if (fast_is_last_h) then
+      call step2d_last_zeta()
+      call halo_fill_2d_n(zeta, STAGGER_RHO)
+    endif
+    call halo_fill_uv_n(ubar, vbar)
   end subroutine step2d_tail
 
   subroutine fill_pgf_state(fb_correct)

@@ -51,13 +51,15 @@ contains
     call dump_pre_col('pre in', 1, indx)
     if (nz > COL_KMAX) error stop 'pre_step3d: nz exceeds COL_KMAX'
 
-    call halo_fill_3d(Hz, STAGGER_RHO)
-    call halo_fill_3d_s(u, STAGGER_U, nrhs)
-    call halo_fill_3d_s(v, STAGGER_V, nrhs)
-    call halo_fill_3d(FlxU, STAGGER_U)
-    call halo_fill_3d(FlxV, STAGGER_V)
-    call halo_fill_3d_w(We, STAGGER_RHO)
-    call halo_fill_3d_w(Wi, STAGGER_RHO)
+    call hg_begin()
+    call hg_add(F_HZ)
+    call hg_add(F_U, nrhs)
+    call hg_add(F_V, nrhs)
+    call hg_add(F_FLXU)
+    call hg_add(F_FLXV)
+    call hg_add(F_WE)
+    call hg_add(F_WI)
+    call hg_end()
     call set_bottom_drag()
 
 #ifdef USE_CUDA
@@ -283,10 +285,12 @@ contains
     call t3dbc(itemp)
     call t3dbc(isalt)
     if (ntp > 0) call passive_t3dbc()
-    call halo_fill_3d_s(u, STAGGER_U, nnew)
-    call halo_fill_3d_s(v, STAGGER_V, nnew)
-    call halo_fill_3d_t(t, STAGGER_RHO, nnew, itemp)
-    call halo_fill_3d_t(t, STAGGER_RHO, nnew, isalt)
+    call hg_begin()
+    call hg_add(F_U, nnew)
+    call hg_add(F_V, nnew)
+    call hg_add(F_T, nnew, itemp)
+    call hg_add(F_T, nnew, isalt)
+    call hg_end()
     if (ntp > 0) call halo_fill_3d_tp(tp, ntp, nnew)
     call dump_pre_step_t()
   end subroutine pre_step3d
@@ -305,8 +309,10 @@ contains
     zob_loc = zob
     rdrg_loc = rdrg
     dt_loc = dt
-    call halo_fill_3d_s(u, STAGGER_U, nstp)
-    call halo_fill_3d_s(v, STAGGER_V, nstp)
+    call hg_begin()
+    call hg_add(F_U, nstp)
+    call hg_add(F_V, nstp)
+    call hg_end()
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>

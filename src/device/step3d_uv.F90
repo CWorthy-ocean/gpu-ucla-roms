@@ -48,13 +48,15 @@ contains
     i_u1 = nx
     j_v0 = 1
     if (decomp%edge_s) j_v0 = 2
-    call halo_fill_3d_s(u, STAGGER_U, nrhs)
-    call halo_fill_3d_s(v, STAGGER_V, nrhs)
-    call halo_fill_3d_s(u, STAGGER_U, nnew)
-    call halo_fill_3d_s(v, STAGGER_V, nnew)
-    call halo_fill_3d(Hz, STAGGER_RHO)
-    call halo_fill_3d_w(Wi, STAGGER_RHO)
-    call halo_fill_3d_w(We, STAGGER_RHO)
+    call hg_begin()
+    call hg_add(F_U, nrhs)
+    call hg_add(F_V, nrhs)
+    call hg_add(F_U, nnew)
+    call hg_add(F_V, nnew)
+    call hg_add(F_HZ)
+    call hg_add(F_WI)
+    call hg_add(F_WE)
+    call hg_end()
 
     call dump_ru_probe('after prsgrd', .false.)
     call dump_rv3d('after prsgrd', 0.0_rp)
@@ -186,10 +188,12 @@ contains
     call dump_vn3('after corr impl')
     call dump_uv1_b('after impl')
 
-    call halo_fill_3d_s(u, STAGGER_U, nnew)
-    call halo_fill_3d_s(v, STAGGER_V, nnew)
-    call halo_fill_2d(rufrc, STAGGER_U)
-    call halo_fill_2d(rvfrc, STAGGER_V)
+    call hg_begin()
+    call hg_add(F_U, nnew)
+    call hg_add(F_V, nnew)
+    call hg_add(F_RUFRC)
+    call hg_add(F_RVFRC)
+    call hg_end()
     call dump_uv2_b('after uv1')
   end subroutine step3d_uv1
 
@@ -721,12 +725,14 @@ contains
     endif
 
     call dump_uv2_b('after couple2')
-    call halo_fill_3d_s(u, STAGGER_U, nnew)
-    call halo_fill_3d_s(v, STAGGER_V, nnew)
-    call halo_fill_3d(FlxU, STAGGER_U)
-    call halo_fill_3d(FlxV, STAGGER_V)
-    call halo_fill_2d_s(ubar, STAGGER_U, knew)
-    call halo_fill_2d_s(vbar, STAGGER_V, knew)
+    call hg_begin()
+    call hg_add(F_U, nnew)
+    call hg_add(F_V, nnew)
+    call hg_add(F_FLXU)
+    call hg_add(F_FLXV)
+    call hg_add(F_UBAR, knew)
+    call hg_add(F_VBAR, knew)
+    call hg_end()
   end subroutine step3d_uv2
 
 end module step3d_uv_mod

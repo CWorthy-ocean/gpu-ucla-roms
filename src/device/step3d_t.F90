@@ -30,8 +30,10 @@ contains
     n_new = nnew
     dt_loc = dt
     if (nz > COL_KMAX) error stop 'step3d_t: nz exceeds COL_KMAX'
-    call halo_fill_3d(Hz, STAGGER_RHO)
-    call halo_fill_3d_w(Wi, STAGGER_RHO)
+    call hg_begin()
+    call hg_add(F_HZ)
+    call hg_add(F_WI)
+    call hg_end()
 
     ! Advection of all tracers in one launch when it is safe (see
     ! fuse_tracers); forcing, the implicit solve and the OBC stay per tracer.

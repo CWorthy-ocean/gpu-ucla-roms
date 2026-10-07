@@ -39,9 +39,11 @@ contains
 
   subroutine set_depth()
     call set_depth_interior()
-    call halo_fill_3d_w(z_w, STAGGER_RHO)
-    call halo_fill_3d(z_r, STAGGER_RHO)
-    call halo_fill_3d(Hz, STAGGER_RHO)
+    call hg_begin()
+    call hg_add(F_ZW)
+    call hg_add(F_ZR)
+    call hg_add(F_HZ)
+    call hg_end()
   end subroutine set_depth
 
   subroutine set_depth_interior()
@@ -118,8 +120,10 @@ contains
         enddo
       enddo
     enddo
-    call halo_fill_3d(FlxU, STAGGER_U)
-    call halo_fill_3d(FlxV, STAGGER_V)
+    call hg_begin()
+    call hg_add(F_FLXU)
+    call hg_add(F_FLXV)
+    call hg_end()
   end subroutine set_HUV
 
   subroutine set_HUV1()
@@ -196,10 +200,12 @@ contains
       enddo
     enddo
 
-    call halo_fill_3d(FlxU, STAGGER_U)
-    call halo_fill_3d(FlxV, STAGGER_V)
-    call halo_fill_3d_s(u, STAGGER_U, nnew)
-    call halo_fill_3d_s(v, STAGGER_V, nnew)
+    call hg_begin()
+    call hg_add(F_FLXU)
+    call hg_add(F_FLXV)
+    call hg_add(F_U, nnew)
+    call hg_add(F_V, nnew)
+    call hg_end()
   end subroutine set_HUV1
 
   subroutine omega()
@@ -281,8 +287,10 @@ contains
 
     call apply_volume_sources()
     call fill_omega_edge_ghosts()
-    call halo_fill_3d_w(We, STAGGER_RHO)
-    call halo_fill_3d_w(Wi, STAGGER_RHO)
+    call hg_begin()
+    call hg_add(F_WE)
+    call hg_add(F_WI)
+    call hg_end()
   end subroutine omega
 
   subroutine fill_omega_edge_ghosts()

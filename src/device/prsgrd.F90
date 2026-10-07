@@ -53,11 +53,13 @@ contains
     edge_s = decomp%edge_s
     edge_n = decomp%edge_n
 
-    call halo_fill_3d(z_r, STAGGER_RHO)
-    call halo_fill_3d_w(z_w, STAGGER_RHO)
-    call halo_fill_3d(Hz, STAGGER_RHO)
-    call halo_fill_3d(rho1, STAGGER_RHO)
-    call halo_fill_3d(qp1, STAGGER_RHO)
+    call hg_begin()
+    call hg_add(F_ZR)
+    call hg_add(F_ZW)
+    call hg_add(F_HZ)
+    call hg_add(F_RHO1)
+    call hg_add(F_QP1)
+    call hg_end()
     call ensure_scratch()
 
     ! Zero ru, rv on the device (not a host memset of managed memory).
@@ -329,8 +331,10 @@ contains
       enddo
     endif
 
-    call halo_fill_3d(ru, STAGGER_U)
-    call halo_fill_3d(rv, STAGGER_V)
+    call hg_begin()
+    call hg_add(F_RU)
+    call hg_add(F_RV)
+    call hg_end()
   end subroutine prsgrd
 
   subroutine dump_pgf_col(tag)

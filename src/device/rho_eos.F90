@@ -41,11 +41,13 @@ contains
     if (edge_s) j0 = 0
     if (edge_n) j1 = ny + 1
 
-    call halo_fill_3d_t(t, STAGGER_RHO, tid, itemp)
-    if (has_salt) call halo_fill_3d_t(t, STAGGER_RHO, tid, isalt)
-    call halo_fill_3d(Hz, STAGGER_RHO)
-    call halo_fill_3d(z_r, STAGGER_RHO)
-    call halo_fill_3d_w(z_w, STAGGER_RHO)
+    call hg_begin()
+    call hg_add(F_T, tid, itemp)
+    if (has_salt) call hg_add(F_T, tid, isalt)
+    call hg_add(F_HZ)
+    call hg_add(F_ZR)
+    call hg_add(F_ZW)
+    call hg_end()
     write(*,'(a)') 'step: rho_eos prehalo'
     flush(6)
     call sync_arch()
@@ -121,12 +123,14 @@ contains
 
     call dump_eos(tid)
 
-    call halo_fill_3d(rho1, STAGGER_RHO)
-    call halo_fill_3d(qp1, STAGGER_RHO)
-    call halo_fill_3d(rho, STAGGER_RHO)
-    call halo_fill_3d_w(bvf, STAGGER_RHO)
-    call halo_fill_2d(rhoA, STAGGER_RHO)
-    call halo_fill_2d(rhoS, STAGGER_RHO)
+    call hg_begin()
+    call hg_add(F_RHO1)
+    call hg_add(F_QP1)
+    call hg_add(F_RHO)
+    call hg_add(F_BVF)
+    call hg_add(F_RHOA)
+    call hg_add(F_RHOS)
+    call hg_end()
   end subroutine rho_eos
 
   subroutine dump_eos(tind)

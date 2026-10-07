@@ -8,6 +8,9 @@ module halo_mod
   use decomp_mod, only: decomp
   use time_state, only: fast, nt
   use comm_mod, only: comm_exchange2, comm_exchange3, comm_sendrecv_raw, comm_sendrecv_dev, comm_gpu_direct
+  use gpu_state, only: Hz, z_r, z_w, FlxU, FlxV, We, Wi, u, v, t, rho1, qp1, rho, bvf, rhoA, rhoS, ru, rv, &
+                       umask, vmask, rmask, sustr, svstr, stflx, srflx, f, hbls, hbbl, Akv, Akt, ghat, &
+                       rufrc, rvfrc, wrk3a, wrk3b, ubar, vbar, zeta
 #ifdef USE_CUDA
   use cudafor
 #endif
@@ -36,6 +39,18 @@ module halo_mod
   real(rp), WORK_ATTR allocatable :: work2d(:,:)
   real(rp), WORK_ATTR allocatable :: work3d(:,:,:)
   real(rp), WORK_ATTR allocatable :: work3dw(:,:,:)
+  ! Group exchange state and buffers (device; grown on demand).
+  integer, parameter :: HG_MAX = 40
+  integer :: hg_n = 0, hg_nlev_tot = 0
+  integer :: hg_id(HG_MAX), hg_slot(HG_MAX), hg_itr(HG_MAX), hg_lev0(HG_MAX), hg_nlev(HG_MAX)
+#ifdef USE_CUDA
+  real(rp), device, allocatable :: gew_slo(:,:,:), gew_shi(:,:,:), gew_rlo(:,:,:), gew_rhi(:,:,:)
+  real(rp), device, allocatable :: gns_slo(:,:,:), gns_shi(:,:,:), gns_rlo(:,:,:), gns_rhi(:,:,:)
+#else
+  real(rp), allocatable :: gew_slo(:,:,:), gew_shi(:,:,:), gew_rlo(:,:,:), gew_rhi(:,:,:)
+  real(rp), allocatable :: gns_slo(:,:,:), gns_shi(:,:,:), gns_rlo(:,:,:), gns_rhi(:,:,:)
+#endif
+  integer :: hg_cap = 0
 #ifdef USE_CUDA
   ! Pinned host staging for the MPI path: packed device buffers are copied
   ! here asynchronously on work_stream, exchanged, and copied back. No
@@ -54,6 +69,16 @@ module halo_mod
 
   public :: halo_fill_2d
   public :: halo_fill_2d_n
+  public :: halo_fill_uv_n
+  public :: hg_begin, hg_add, hg_end
+  ! Field ids for the group exchange (hg_*): several fields in one
+  ! east-west and one north-south round. All fields use the rho-cell
+  ! exchange bounds (see interior_bounds), so staggers may be mixed.
+  integer, parameter, public :: F_HZ = 1, F_ZR = 2, F_ZW = 3, F_FLXU = 4, F_FLXV = 5, F_WE = 6, F_WI = 7, &
+       F_U = 8, F_V = 9, F_T = 10, F_RHO1 = 11, F_QP1 = 12, F_RHO = 13, F_BVF = 14, F_RHOA = 15, F_RHOS = 16, &
+       F_RU = 17, F_RV = 18, F_UMASK = 19, F_VMASK = 20, F_RMASK = 21, F_SUSTR = 22, F_SVSTR = 23, &
+       F_STFLX = 24, F_SRFLX = 25, F_F = 26, F_HBLS = 27, F_HBBL = 28, F_AKV = 29, F_AKT = 30, F_GHAT = 31, &
+       F_RUFRC = 32, F_RVFRC = 33, F_WRK3A = 34, F_WRK3B = 35, F_UBAR = 36, F_VBAR = 37, F_ZETA = 38
   public :: halo_fill_2d_s
   public :: halo_fill_2d_st
   public :: halo_fill_2d_sw
@@ -130,6 +155,292 @@ contains
     call exchange_ew_2d_n(a, i1, i2, j1, j2)
     call exchange_ns_2d_n(a, i1, i2, j1, j2)
   end subroutine halo_fill_2d_n
+
+  subroutine halo_fill_uv_n(u2, v2)
+    ! ubar and vbar at slot fast%knew in ONE exchange per direction: both are
+    ! packed as levels 0 and 1 of the 3-D buffers (the rho-cell exchange
+    ! bounds are the same for every stagger). Pure copies.
+    real(rp), WORK_ATTR intent(inout) :: u2(decomp%is:decomp%ie, decomp%js:decomp%je, 4)
+    real(rp), WORK_ATTR intent(inout) :: v2(decomp%is:decomp%ie, decomp%js:decomp%je, 4)
+    integer(ip) :: i1, i2, j1, j2, h, i, j, m, n, ilo, ihi
+    if (no_neighbors()) return
+    call ensure_bufs()
+    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+    h = decomp%halo
+    if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
+      CUF_DO2
+      do j = j1, j2
+        do m = 1, h
+          n = fast%knew
+          ew_slo(m, j, 0) = u2(i1 + m - 1, j, n)
+          ew_shi(m, j, 0) = u2(i2 - h + m, j, n)
+          ew_slo(m, j, 1) = v2(i1 + m - 1, j, n)
+          ew_shi(m, j, 1) = v2(i2 - h + m, j, n)
+        enddo
+      enddo
+      call deliver3(decomp%nbr_w, decomp%nbr_e, ew_slo(:, :, 0:1), ew_shi(:, :, 0:1), &
+                    ew_rlo(:, :, 0:1), ew_rhi(:, :, 0:1))
+      if (decomp%nbr_w /= NBR_NONE) then
+        CUF_DO2
+        do j = j1, j2
+          do m = 1, h
+            n = fast%knew
+            u2(i1 - h + m - 1, j, n) = ew_rlo(m, j, 0)
+            v2(i1 - h + m - 1, j, n) = ew_rlo(m, j, 1)
+          enddo
+        enddo
+      endif
+      if (decomp%nbr_e /= NBR_NONE) then
+        CUF_DO2
+        do j = j1, j2
+          do m = 1, h
+            n = fast%knew
+            u2(i2 + m, j, n) = ew_rhi(m, j, 0)
+            v2(i2 + m, j, n) = ew_rhi(m, j, 1)
+          enddo
+        enddo
+      endif
+    endif
+    if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
+      ilo = i1 - h; ihi = i2 + h
+      CUF_DO2
+      do m = 1, h
+        do i = ilo, ihi
+          n = fast%knew
+          ns_slo(i, m, 0) = u2(i, j1 + m - 1, n)
+          ns_shi(i, m, 0) = u2(i, j2 - h + m, n)
+          ns_slo(i, m, 1) = v2(i, j1 + m - 1, n)
+          ns_shi(i, m, 1) = v2(i, j2 - h + m, n)
+        enddo
+      enddo
+      call deliver3(decomp%nbr_s, decomp%nbr_n, ns_slo(:, :, 0:1), ns_shi(:, :, 0:1), &
+                    ns_rlo(:, :, 0:1), ns_rhi(:, :, 0:1))
+      if (decomp%nbr_s /= NBR_NONE) then
+        CUF_DO2
+        do m = 1, h
+          do i = ilo, ihi
+            n = fast%knew
+            u2(i, j1 - h + m - 1, n) = ns_rlo(i, m, 0)
+            v2(i, j1 - h + m - 1, n) = ns_rlo(i, m, 1)
+          enddo
+        enddo
+      endif
+      if (decomp%nbr_n /= NBR_NONE) then
+        CUF_DO2
+        do m = 1, h
+          do i = ilo, ihi
+            n = fast%knew
+            u2(i, j2 + m, n) = ns_rhi(i, m, 0)
+            v2(i, j2 + m, n) = ns_rhi(i, m, 1)
+          enddo
+        enddo
+      endif
+    endif
+  end subroutine halo_fill_uv_n
+
+  ! ------------------------------------------------------------ group exchange
+  subroutine hg_begin()
+    hg_n = 0; hg_nlev_tot = 0
+  end subroutine hg_begin
+
+  subroutine hg_add(id, slot, itr)
+    ! Register a field (optionally a time slot and a tracer/level index).
+    integer, intent(in) :: id
+    integer(ip), intent(in), optional :: slot, itr
+    integer :: nl
+    if (no_neighbors()) return
+    hg_n = hg_n + 1
+    if (hg_n > HG_MAX) error stop 'hg_add: too many fields in one group'
+    hg_id(hg_n) = id
+    hg_slot(hg_n) = 1; hg_itr(hg_n) = 1
+    if (present(slot)) hg_slot(hg_n) = int(slot)
+    if (present(itr)) hg_itr(hg_n) = int(itr)
+    select case (id)
+    case (F_ZW, F_WE, F_WI, F_BVF, F_AKV, F_AKT, F_GHAT)
+      nl = int(decomp%nz) + 1
+    case (F_HZ, F_ZR, F_FLXU, F_FLXV, F_U, F_V, F_T, F_RHO1, F_QP1, F_RHO, F_RU, F_RV, F_WRK3A, F_WRK3B)
+      nl = int(decomp%nz)
+    case default
+      nl = 1
+    end select
+    hg_lev0(hg_n) = hg_nlev_tot
+    hg_nlev(hg_n) = nl
+    hg_nlev_tot = hg_nlev_tot + nl
+  end subroutine hg_add
+
+  subroutine hg_end()
+    ! One east-west round for every registered field, then one north-south
+    ! round (including the east-west halo columns), as the single fills do.
+    integer(ip) :: i1, i2, j1, j2, h, is, ie, js, je, k
+    integer :: L
+    if (no_neighbors() .or. hg_n == 0) then
+      hg_n = 0; hg_nlev_tot = 0
+      return
+    endif
+    call ensure_bufs()
+    h = decomp%halo; is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+    L = hg_nlev_tot
+    if (hg_cap < L) then
+      if (allocated(gew_slo)) deallocate(gew_slo, gew_shi, gew_rlo, gew_rhi, gns_slo, gns_shi, gns_rlo, gns_rhi)
+      allocate(gew_slo(h, js:je, L), gew_shi(h, js:je, L), gew_rlo(h, js:je, L), gew_rhi(h, js:je, L))
+      allocate(gns_slo(is:ie, h, L), gns_shi(is:ie, h, L), gns_rlo(is:ie, h, L), gns_rhi(is:ie, h, L))
+      gew_slo = 0.0_rp; gew_shi = 0.0_rp; gew_rlo = 0.0_rp; gew_rhi = 0.0_rp
+      gns_slo = 0.0_rp; gns_shi = 0.0_rp; gns_rlo = 0.0_rp; gns_rhi = 0.0_rp
+      hg_cap = L
+    endif
+    if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
+      do k = 1, hg_n
+        call hg_dispatch(k, 1, i1, i2, j1, j2)
+      enddo
+      call deliver3(decomp%nbr_w, decomp%nbr_e, gew_slo(:, :, 1:L), gew_shi(:, :, 1:L), &
+                    gew_rlo(:, :, 1:L), gew_rhi(:, :, 1:L))
+      do k = 1, hg_n
+        call hg_dispatch(k, 2, i1, i2, j1, j2)
+      enddo
+    endif
+    if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
+      do k = 1, hg_n
+        call hg_dispatch(k, 3, i1, i2, j1, j2)
+      enddo
+      call deliver3(decomp%nbr_s, decomp%nbr_n, gns_slo(:, :, 1:L), gns_shi(:, :, 1:L), &
+                    gns_rlo(:, :, 1:L), gns_rhi(:, :, 1:L))
+      do k = 1, hg_n
+        call hg_dispatch(k, 4, i1, i2, j1, j2)
+      enddo
+    endif
+    hg_n = 0; hg_nlev_tot = 0
+  end subroutine hg_end
+
+  subroutine hg_dispatch(k, phase, i1, i2, j1, j2)
+    ! Resolve the field id to its slab (first element + level range) and run
+    ! phase 1: pack EW, 2: unpack EW, 3: pack NS, 4: unpack NS.
+    integer, intent(in) :: k, phase
+    integer(ip), intent(in) :: i1, i2, j1, j2
+    integer(ip) :: is, js, nz, sl, it
+    is = decomp%is; js = decomp%js; nz = decomp%nz
+    sl = hg_slot(k); it = hg_itr(k)
+    select case (hg_id(k))
+    case (F_HZ);    call hg_slab(Hz(is, js, 1), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_ZR);    call hg_slab(z_r(is, js, 1), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_ZW);    call hg_slab(z_w(is, js, 0), 0_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_FLXU);  call hg_slab(FlxU(is, js, 1), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_FLXV);  call hg_slab(FlxV(is, js, 1), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_WE);    call hg_slab(We(is, js, 0), 0_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_WI);    call hg_slab(Wi(is, js, 0), 0_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_U);     call hg_slab(u(is, js, 1, sl), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_V);     call hg_slab(v(is, js, 1, sl), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_T);     call hg_slab(t(is, js, 1, sl, it), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_RHO1);  call hg_slab(rho1(is, js, 1), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_QP1);   call hg_slab(qp1(is, js, 1), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_RHO);   call hg_slab(rho(is, js, 1), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_BVF);   call hg_slab(bvf(is, js, 0), 0_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_RHOA);  call hg_slab(rhoA(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_RHOS);  call hg_slab(rhoS(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_RU);    call hg_slab(ru(is, js, 1), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_RV);    call hg_slab(rv(is, js, 1), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_UMASK); call hg_slab(umask(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_VMASK); call hg_slab(vmask(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_RMASK); call hg_slab(rmask(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_SUSTR); call hg_slab(sustr(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_SVSTR); call hg_slab(svstr(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_STFLX); call hg_slab(stflx(is, js, it), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_SRFLX); call hg_slab(srflx(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_F);     call hg_slab(f(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_HBLS);  call hg_slab(hbls(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_HBBL);  call hg_slab(hbbl(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_AKV);   call hg_slab(Akv(is, js, 0), 0_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_AKT);   call hg_slab(Akt(is, js, 0, it), 0_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_GHAT);  call hg_slab(ghat(is, js, 0), 0_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_RUFRC); call hg_slab(rufrc(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_RVFRC); call hg_slab(rvfrc(is, js), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    ! wrk3a/wrk3b are (0:nz) arrays that the single fill exchanged as nz
+    ! levels from level 0 (sequence association); keep exactly that slab.
+    case (F_WRK3A); call hg_slab(wrk3a(is, js, 0), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_WRK3B); call hg_slab(wrk3b(is, js, 0), 1_ip, nz, k, phase, i1, i2, j1, j2)
+    case (F_UBAR);  call hg_slab(ubar(is, js, sl), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_VBAR);  call hg_slab(vbar(is, js, sl), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case (F_ZETA);  call hg_slab(zeta(is, js, sl), 1_ip, 1_ip, k, phase, i1, i2, j1, j2)
+    case default
+      error stop 'hg_dispatch: unknown field id'
+    end select
+  end subroutine hg_dispatch
+
+  subroutine hg_slab(a, kb, ke, k, phase, i1, i2, j1, j2)
+    ! Pack / unpack one slab a(is:ie, js:je, kb:ke) at group level offset
+    ! hg_lev0(k) (pure copies).
+    integer(ip), intent(in) :: kb, ke, i1, i2, j1, j2
+    integer, intent(in) :: k, phase
+    real(rp), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, kb:ke)
+    integer(ip) :: i, j, m, kk, h, l0, ilo, ihi
+    h = decomp%halo
+    l0 = hg_lev0(k)
+    ilo = i1 - h; ihi = i2 + h
+    select case (phase)
+    case (1)
+      CUF_DO3
+      do kk = kb, ke
+        do j = j1, j2
+          do m = 1, h
+            gew_slo(m, j, l0 + kk - kb + 1) = a(i1 + m - 1, j, kk)
+            gew_shi(m, j, l0 + kk - kb + 1) = a(i2 - h + m, j, kk)
+          enddo
+        enddo
+      enddo
+    case (2)
+      if (decomp%nbr_w /= NBR_NONE) then
+        CUF_DO3
+        do kk = kb, ke
+          do j = j1, j2
+            do m = 1, h
+              a(i1 - h + m - 1, j, kk) = gew_rlo(m, j, l0 + kk - kb + 1)
+            enddo
+          enddo
+        enddo
+      endif
+      if (decomp%nbr_e /= NBR_NONE) then
+        CUF_DO3
+        do kk = kb, ke
+          do j = j1, j2
+            do m = 1, h
+              a(i2 + m, j, kk) = gew_rhi(m, j, l0 + kk - kb + 1)
+            enddo
+          enddo
+        enddo
+      endif
+    case (3)
+      CUF_DO3
+      do kk = kb, ke
+        do m = 1, h
+          do i = ilo, ihi
+            gns_slo(i, m, l0 + kk - kb + 1) = a(i, j1 + m - 1, kk)
+            gns_shi(i, m, l0 + kk - kb + 1) = a(i, j2 - h + m, kk)
+          enddo
+        enddo
+      enddo
+    case (4)
+      if (decomp%nbr_s /= NBR_NONE) then
+        CUF_DO3
+        do kk = kb, ke
+          do m = 1, h
+            do i = ilo, ihi
+              a(i, j1 - h + m - 1, kk) = gns_rlo(i, m, l0 + kk - kb + 1)
+            enddo
+          enddo
+        enddo
+      endif
+      if (decomp%nbr_n /= NBR_NONE) then
+        CUF_DO3
+        do kk = kb, ke
+          do m = 1, h
+            do i = ilo, ihi
+              a(i, j2 + m, kk) = gns_rhi(i, m, l0 + kk - kb + 1)
+            enddo
+          enddo
+        enddo
+      endif
+    end select
+  end subroutine hg_slab
 
   subroutine halo_fill_3d(a, stagger)
     real(rp), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, 1:decomp%nz)
@@ -348,7 +659,6 @@ contains
           enddo
         enddo
       endif
-      call sync_arch()
     endif
     ! ---- north-south, including the east-west halo columns
     if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
@@ -389,7 +699,6 @@ contains
           enddo
         enddo
       endif
-      call sync_arch()
     endif
   end subroutine halo_fill_3d_tp
 
@@ -437,10 +746,17 @@ contains
     ! on the east/north side (uv_rhs stops at nx toward a neighbor), so the
     ! exchange carries it, with one more point beyond, to the west/south
     ! tile as its halo a(nx+1), a(nx+2). Periodic wrap gives a(nx+1) = a(1).
+    ! The physical boundary rows (j = 0 at a south edge, ny+1 at a north
+    ! edge) are computed by the boundary routines with tangential neighbours
+    ! (u2dbc/v2dbc/u3dbc/v3dbc/t3dbc radiation), so an east-west seam on an
+    ! open edge needs them exchanged too. The north-south round already
+    ! covers the columns 0 and nx+1 (it packs i1-h .. i2+h).
     i1 = 1
     j1 = 1
     i2 = decomp%nx
     j2 = decomp%ny
+    if (decomp%edge_s) j1 = 0
+    if (decomp%edge_n) j2 = decomp%ny + 1
   end subroutine interior_bounds
 
   subroutine exchange_ew_2d(a, i1, i2, j1, j2)
@@ -473,7 +789,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ew_2d
 
   subroutine exchange_ns_2d(a, i1, i2, j1, j2)
@@ -508,7 +823,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ns_2d
 
   subroutine exchange_ew_2d_n(a, i1, i2, j1, j2)
@@ -544,7 +858,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ew_2d_n
 
   subroutine exchange_ns_2d_n(a, i1, i2, j1, j2)
@@ -582,7 +895,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ns_2d_n
 
   subroutine exchange_ew_3d(a, i1, i2, j1, j2, k0, k1)
@@ -621,7 +933,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ew_3d
 
   subroutine exchange_ns_3d(a, i1, i2, j1, j2, k0, k1)
@@ -662,7 +973,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ns_3d
 
   subroutine exchange_ew_3dw(a, i1, i2, j1, j2, k0, k1)
@@ -701,7 +1011,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ew_3dw
 
   subroutine exchange_ns_3dw(a, i1, i2, j1, j2, k0, k1)
@@ -742,7 +1051,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ns_3dw
 
   subroutine exchange_ew_2d_s(a, i1, i2, j1, j2, slot)
@@ -776,7 +1084,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ew_2d_s
 
   subroutine exchange_ns_2d_s(a, i1, i2, j1, j2, slot)
@@ -812,7 +1119,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ns_2d_s
 
   subroutine exchange_ew_3d_s(a, i1, i2, j1, j2, k0, k1, slot)
@@ -852,7 +1158,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ew_3d_s
 
   subroutine exchange_ns_3d_s(a, i1, i2, j1, j2, k0, k1, slot)
@@ -894,7 +1199,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ns_3d_s
 
   subroutine exchange_ew_3d_t(a, i1, i2, j1, j2, k0, k1, slot, itrc)
@@ -935,7 +1239,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ew_3d_t
 
   subroutine exchange_ns_3d_t(a, i1, i2, j1, j2, k0, k1, slot, itrc)
@@ -978,7 +1281,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ns_3d_t
 
   subroutine exchange_ew_3dw_s(a, i1, i2, j1, j2, k0, k1, slot)
@@ -1018,7 +1320,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ew_3dw_s
 
   subroutine exchange_ns_3dw_s(a, i1, i2, j1, j2, k0, k1, slot)
@@ -1060,7 +1361,6 @@ contains
         enddo
       enddo
     endif
-    call sync_arch()
   end subroutine exchange_ns_3dw_s
 
   ! Host-side sections of a managed array are legal. A CUF kernel on a

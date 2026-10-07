@@ -26,6 +26,7 @@ program roms_gpu
     call finalize_comm()
     stop
   endif
+  call wall_stamp('start')
   call select_device(comm_rank())
   call init_arch()
 
@@ -41,6 +42,7 @@ program roms_gpu
     nml_path = 'namelist.nml'
     if (command_argument_count() >= 2) call get_command_argument(2, nml_path)
     call load_case(nml_path)
+    call wall_stamp('init done')
     write(*,'(a,a)') 'roms_gpu  architecture = ', trim(arch_name())
     write(*,'(a,2i6)') '  MPI rank, size = ', comm_rank(), comm_size()
     write(*,'(a)') 'roms_gpu  (loaded case)'
@@ -97,3 +99,36 @@ program roms_gpu
   call free_state()
   call finalize_comm()
 end program roms_gpu
+
+subroutine wall_stamp(tag)
+  ! Wall clock since the first stamp, printed by every compute rank.
+  use comm_mod, only: comm_rank, is_io_rank
+  implicit none
+  character(len=*), intent(in) :: tag
+  integer(8), save :: t0 = -1, rate = 1
+  integer(8) :: now
+  if (is_io_rank()) return
+  call system_clock(now, rate)
+  if (t0 < 0) t0 = now
+  write(*,'(a,i0,a,a,a,f10.2,a)') 'wall: rank ', comm_rank(), '  ', tag, '  t = ', &
+       real(now - t0, 8) / real(rate, 8), ' s'
+  if (tag == 'init done' .or. tag == 'restart staged') call gpu_mem_report(tag)
+  flush(6)
+end subroutine wall_stamp
+
+subroutine gpu_mem_report(tag)
+  ! Device memory in use on this rank's GPU (resident managed pages included).
+  use comm_mod, only: comm_rank
+#ifdef USE_CUDA
+  use cudafor
+#endif
+  implicit none
+  character(len=*), intent(in) :: tag
+#ifdef USE_CUDA
+  integer(kind=cuda_count_kind) :: freeb, totalb
+  integer :: ierr
+  ierr = cudaMemGetInfo(freeb, totalb)
+  if (ierr == 0) write(*,'(a,i0,a,a,a,f7.2,a,f7.2,a)') 'gpumem: rank ', comm_rank(), '  ', tag, &
+       '  used ', real(totalb - freeb, 8) / 2.0d0**30, ' GB of ', real(totalb, 8) / 2.0d0**30, ' GB'
+#endif
+end subroutine gpu_mem_report

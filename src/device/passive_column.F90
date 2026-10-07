@@ -13,6 +13,7 @@ module passive_column_mod
   use kinds
   use decomp_mod, only: decomp
   use gpu_state
+  use gpu_state, only: nwet, wet_i, wet_j
   use formulas
 #ifdef USE_CUDA
   use cudafor
@@ -401,9 +402,12 @@ contains
   end subroutine column_point
 
 #ifdef USE_CUDA
-  attributes(global) subroutine horiz_kernel(nel, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, nz, is, ie, js, je, nslot, &
+  attributes(global) subroutine horiz_kernel(nel, nwet, wet_i, wet_j, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, nz, is, ie, js, je, nslot, &
                                              west, east, south, north, tp_, Hz_, Hzb_, pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_)
     integer(ip), value :: nel, mode, ts, ns, nn, nb, ntr, nx, ny, nz, is, ie, js, je, nslot, west, east, south, north
+    integer(ip), value :: nwet
+    integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
+    integer(ip) :: cc
     real(rp), value :: cs, cb, dtp
     real(pp), device, intent(inout) :: tp_(ntr, is:ie, js:je, nz, nslot)
     real(rp), device, intent(in) :: Hz_(is:ie, js:je, nz), Hzb_(is:ie, js:je, nz), FlxU_(is:ie, js:je, nz), FlxV_(is:ie, js:je, nz)
@@ -412,15 +416,18 @@ contains
     tid = (blockIdx%x - 1) * blockDim%x + threadIdx%x
     if (tid > nel) return
     itr = mod(tid - 1, ntr) + 1; c = (tid - 1) / ntr
-    i = mod(c, nx) + 1; c = c / nx
-    j = mod(c, ny) + 1; k = c / ny + 1
+    cc = mod(c, nwet) + 1; k = c / nwet + 1
+    i = wet_i(cc); j = wet_j(cc)
     call horiz_point(itr, i, j, k, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, is, ie, js, je, nz, nslot, &
                      west, east, south, north, tp_, Hz_, Hzb_, pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_)
   end subroutine horiz_kernel
 
-  attributes(global) subroutine t3dmix_kernel(nel, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, nslot, nd, &
+  attributes(global) subroutine t3dmix_kernel(nel, nwet, wet_i, wet_j, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, nslot, nd, &
                                               tp_, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
     integer(ip), value :: nel, nr, nn, isl, ntr, nx, ny, nz, is, ie, js, je, nslot, nd
+    integer(ip), value :: nwet
+    integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
+    integer(ip) :: cc
     real(rp), value :: dtl
     real(pp), device, intent(inout) :: tp_(ntr, is:ie, js:je, nz, nslot)
     real(rp), device, intent(in) :: Hz_(is:ie, js:je, nz), pm_(is:ie, js:je), pn_(is:ie, js:je)
@@ -430,15 +437,18 @@ contains
     tid = (blockIdx%x - 1) * blockDim%x + threadIdx%x
     if (tid > nel) return
     itr = mod(tid - 1, ntr) + 1; c = (tid - 1) / ntr
-    i = mod(c, nx) + 1; c = c / nx
-    j = mod(c, ny) + 1; k = c / ny + 1
+    cc = mod(c, nwet) + 1; k = c / nwet + 1
+    i = wet_i(cc); j = wet_j(cc)
     call t3dmix_point(itr, i, j, k, nr, nn, dtl, isl, ntr, is, ie, js, je, nz, nslot, nd, &
                       tp_, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
   end subroutine t3dmix_kernel
 
-  attributes(global) subroutine column_kernel(nel, ts, nn, ctr, dtp, ntr, nx, ny, nz, is, ie, js, je, nslot, nts, isl, mir, &
+  attributes(global) subroutine column_kernel(nel, nwet, wet_i, wet_j, ts, nn, ctr, dtp, ntr, nx, ny, nz, is, ie, js, je, nslot, nts, isl, mir, &
                                               tp_, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
     integer(ip), value :: nel, ts, nn, ctr, ntr, nx, ny, nz, is, ie, js, je, nslot, nts, isl, mir
+    integer(ip), value :: nwet
+    integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
+    integer(ip) :: cc
     real(rp), value :: dtp
     real(pp), device, intent(inout) :: tp_(ntr, is:ie, js:je, nz, nslot)
     real(rp), device, intent(in) :: Hz_(is:ie, js:je, nz), We_(is:ie, js:je, 0:nz)
@@ -449,7 +459,7 @@ contains
     tid = (blockIdx%x - 1) * blockDim%x + threadIdx%x
     if (tid > nel) return
     itr = mod(tid - 1, ntr) + 1; c = (tid - 1) / ntr
-    i = mod(c, nx) + 1; j = c / nx + 1
+    i = wet_i(c + 1); j = wet_j(c + 1)
     call column_point(itr, i, j, ts, nn, ctr, dtp, ntr, is, ie, js, je, nz, nslot, nts, isl, mir, &
                       tp_, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
   end subroutine column_kernel
@@ -470,9 +480,9 @@ contains
     east  = merge(1_ip, 0_ip, decomp%edge_e)
     south = merge(1_ip, 0_ip, decomp%edge_s)
     north = merge(1_ip, 0_ip, decomp%edge_n)
-    nel = ntr * nx * ny * nz
+    nel = ntr * nwet * nz
 #ifdef USE_CUDA
-    call horiz_kernel<<<(nel + 127) / 128, 128>>>(nel, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, nz, is, ie, js, je, 3_ip, &
+    call horiz_kernel<<<(nel + 127) / 128, 128>>>(nel, nwet, wet_i, wet_j, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, nz, is, ie, js, je, 3_ip, &
          west, east, south, north, tp, Hz, Hz_bak, pm, pn, FlxU, FlxV, umask, vmask, rmask)
 #else
     do k = 1, nz; do j = 1, ny; do i = 1, nx; do itr = 1, ntr
@@ -493,9 +503,9 @@ contains
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     nd = int(size(diff2, 3), ip); isl = min(2_ip, nd)
-    nel = ntr * nx * ny * nz
+    nel = ntr * nwet * nz
 #ifdef USE_CUDA
-    call t3dmix_kernel<<<(nel + 127) / 128, 128>>>(nel, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, 3_ip, nd, &
+    call t3dmix_kernel<<<(nel + 127) / 128, 128>>>(nel, nwet, wet_i, wet_j, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, 3_ip, nd, &
          tp, Hz, pm, pn, pmon_u, pnom_v, umask, vmask, diff2)
 #else
     do k = 1, nz; do j = 1, ny; do i = 1, nx; do itr = 1, ntr
@@ -519,10 +529,10 @@ contains
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     nts = int(size(stflx, 3), ip); isl = int(isalt, ip)
     mir = merge(1_ip, 0_ip, mirror)
-    nel = ntr * nx * ny
+    nel = ntr * nwet
     call passive_factor(dtp, use_fwd)
 #ifdef USE_CUDA
-    call column_kernel<<<(nel + 127) / 128, 128>>>(nel, ts, nn, ctr, dtp, ntr, nx, ny, nz, is, ie, js, je, 3_ip, nts, isl, mir, &
+    call column_kernel<<<(nel + 127) / 128, 128>>>(nel, nwet, wet_i, wet_j, ts, nn, ctr, dtp, ntr, nx, ny, nz, is, ie, js, je, 3_ip, nts, isl, mir, &
          tp, Hz, We, pm, pn, rmask, stflx, ghat, col_fc, col_cf, col_wc)
 #else
     do j = 1, ny; do i = 1, nx; do itr = 1, ntr

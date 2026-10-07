@@ -124,7 +124,45 @@ module gpu_state
   public :: free_state
   public :: init_ideal_box
 
+  ! Wet columns of this tile's interior (1:nx, 1:ny), j-major order: the
+  ! column kernels run over these only. Land columns keep their (zero)
+  ! values, which is what the full-tile kernels leave there too.
+  integer(ip), public :: nwet = 0
+#ifdef USE_CUDA
+  integer(ip), device, allocatable, public :: wet_i(:), wet_j(:)
+#else
+  integer(ip), allocatable, public :: wet_i(:), wet_j(:)
+#endif
+  public :: build_wet_list
+
+
 contains
+
+  subroutine build_wet_list()
+    ! Called once the mask is final (after fill_static_halos / setup_metrics).
+    integer(ip) :: i, j, n
+    integer(ip), allocatable :: hi(:), hj(:)
+    n = 0
+    do j = 1, decomp%ny
+      do i = 1, decomp%nx
+        if (rmask(i, j) > 0.5_rp) n = n + 1
+      enddo
+    enddo
+    allocate(hi(max(n, 1)), hj(max(n, 1)))
+    n = 0
+    do j = 1, decomp%ny
+      do i = 1, decomp%nx
+        if (rmask(i, j) > 0.5_rp) then
+          n = n + 1; hi(n) = i; hj(n) = j
+        endif
+      enddo
+    enddo
+    nwet = n
+    if (allocated(wet_i)) deallocate(wet_i, wet_j)
+    allocate(wet_i(max(n, 1)), wet_j(max(n, 1)))
+    wet_i = hi; wet_j = hj
+    deallocate(hi, hj)
+  end subroutine build_wet_list
 
   subroutine alloc_state(nt)
     integer(ip), intent(in) :: nt

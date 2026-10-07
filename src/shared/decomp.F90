@@ -31,20 +31,40 @@ module decomp_mod
 contains
 
   subroutine init_decomp(gnx, gny, nz, halo, npx, npy, rank, &
-                         periodic_x, periodic_y)
+                         periodic_x, periodic_y, xcut, ycut)
+    ! xcut(0:npx), ycut(0:npy): global interior indices of the tile cuts
+    ! (tile k covers xcut(k-1)+1 : xcut(k)); absent = equal widths (the
+    ! remainder spread over the first tiles).
     integer(ip), intent(in) :: gnx, gny, nz, halo, npx, npy, rank
     logical,     intent(in) :: periodic_x, periodic_y
-    integer(ip) :: inode, jnode, nx, ny
+    integer(ip), intent(in), optional :: xcut(0:npx), ycut(0:npy)
+    integer(ip) :: inode, jnode, nx, ny, i0, j0, k
 
-    if (mod(gnx, npx) /= 0 .or. mod(gny, npy) /= 0) then
-      error stop 'init_decomp: gnx/npx and gny/npy must divide evenly'
-    endif
     if (halo < 2) error stop 'init_decomp: halo must be >= 2 (U3/UP3)'
 
     inode = mod(rank, npx)
     jnode = rank / npx
-    nx = gnx / npx
-    ny = gny / npy
+    if (present(xcut)) then
+      nx = xcut(inode + 1) - xcut(inode)
+      i0 = xcut(inode) + 1
+    else
+      nx = gnx / npx + merge(1_ip, 0_ip, inode + 1 <= mod(gnx, npx))
+      i0 = 1
+      do k = 0, inode - 1
+        i0 = i0 + gnx / npx + merge(1_ip, 0_ip, k + 1 <= mod(gnx, npx))
+      enddo
+    endif
+    if (present(ycut)) then
+      ny = ycut(jnode + 1) - ycut(jnode)
+      j0 = ycut(jnode) + 1
+    else
+      ny = gny / npy + merge(1_ip, 0_ip, jnode + 1 <= mod(gny, npy))
+      j0 = 1
+      do k = 0, jnode - 1
+        j0 = j0 + gny / npy + merge(1_ip, 0_ip, k + 1 <= mod(gny, npy))
+      enddo
+    endif
+    if (nx < 2 * halo + 2 .or. ny < 2 * halo + 2) error stop 'init_decomp: tile too small for the halo'
 
     decomp%nx = nx
     decomp%ny = ny
@@ -57,8 +77,8 @@ contains
     decomp%je = ny + 1 + halo
     decomp%gnx = gnx
     decomp%gny = gny
-    decomp%i0 = inode * nx + 1
-    decomp%j0 = jnode * ny + 1
+    decomp%i0 = i0
+    decomp%j0 = j0
     decomp%inode = inode
     decomp%jnode = jnode
     decomp%npx = npx

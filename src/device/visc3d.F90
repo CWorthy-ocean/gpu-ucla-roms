@@ -33,9 +33,11 @@ contains
     i_u1 = nx
     j_v0 = 1
     if (decomp%edge_s) j_v0 = 2
-    call halo_fill_3d_s(u, STAGGER_U, nstp)
-    call halo_fill_3d_s(v, STAGGER_V, nstp)
-    call halo_fill_3d(Hz, STAGGER_RHO)
+    call hg_begin()
+    call hg_add(F_U, nstp)
+    call hg_add(F_V, nstp)
+    call hg_add(F_HZ)
+    call hg_end()
     ! P1 rvfrc probe: host reads only when probes are on.
     rvfrc_p1_0 = 0.0_rp
     i = iprb_pt(1)
@@ -184,8 +186,10 @@ contains
     endif
     call dump_rv3d('after visc3d', cff)
 
-    call halo_fill_3d_s(u, STAGGER_U, nnew)
-    call halo_fill_3d_s(v, STAGGER_V, nnew)
+    call hg_begin()
+    call hg_add(F_U, nnew)
+    call hg_add(F_V, nnew)
+    call hg_end()
   end subroutine visc3d
 
   subroutine dump_visc(k)

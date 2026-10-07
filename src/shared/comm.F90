@@ -42,6 +42,7 @@ module comm_mod
   public :: comm_world_rank
   public :: comm_world_size
   public :: compute_barrier
+  public :: comm_compute
 
 contains
 
@@ -101,6 +102,11 @@ contains
   integer function comm_world_size()
     comm_world_size = world_size
   end function comm_world_size
+
+  integer function comm_compute()
+    ! The communicator of the compute ranks (world when there is no server).
+    comm_compute = compute_comm
+  end function comm_compute
 
   subroutine compute_barrier()
     ! Barrier over the compute ranks (no-op on one rank).
@@ -162,18 +168,17 @@ contains
     real(rp),    intent(in)    :: s_lo(*), s_hi(*)
     real(rp),    intent(inout) :: r_lo(*), r_hi(*)
 #ifdef USE_MPI
-    integer :: dest_lo, dest_hi, ierr, stat(MPI_STATUS_SIZE)
+    integer :: dest_lo, dest_hi, ierr, req(4), stats(MPI_STATUS_SIZE, 4)
     if (.not. ready) call init_comm()
     dest_lo = mpi_dest(nbr_lo)
     dest_hi = mpi_dest(nbr_hi)
-    call MPI_Sendrecv(s_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 301, &
-                      r_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 301, &
-                      compute_comm, stat, ierr)
-    if (ierr /= MPI_SUCCESS) error stop 'comm_sendrecv_raw: lo'
-    call MPI_Sendrecv(s_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 302, &
-                      r_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 302, &
-                      compute_comm, stat, ierr)
-    if (ierr /= MPI_SUCCESS) error stop 'comm_sendrecv_raw: hi'
+    ! Both directions in flight at once: receives first, then sends, one wait.
+    call MPI_Irecv(r_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 301,     compute_comm, req(1), ierr)
+    call MPI_Irecv(r_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 302, compute_comm, req(2), ierr)
+    call MPI_Isend(s_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 301,     compute_comm, req(3), ierr)
+    call MPI_Isend(s_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 302, compute_comm, req(4), ierr)
+    call MPI_Waitall(4, req, stats, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_sendrecv_raw: waitall'
 #else
     if (nbr_lo >= 0 .or. nbr_hi >= 0) error stop 'comm_sendrecv_raw: MPI neighbor without USE_MPI'
 #endif
@@ -192,18 +197,17 @@ contains
     real(rp), intent(inout) :: r_lo(*), r_hi(*)
 #endif
 #ifdef USE_MPI
-    integer :: dest_lo, dest_hi, ierr, stat(MPI_STATUS_SIZE)
+    integer :: dest_lo, dest_hi, ierr, req(4), stats(MPI_STATUS_SIZE, 4)
     if (.not. ready) call init_comm()
     dest_lo = mpi_dest(nbr_lo)
     dest_hi = mpi_dest(nbr_hi)
-    call MPI_Sendrecv(s_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 311, &
-                      r_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 311, &
-                      compute_comm, stat, ierr)
-    if (ierr /= MPI_SUCCESS) error stop 'comm_sendrecv_dev: lo'
-    call MPI_Sendrecv(s_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 312, &
-                      r_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 312, &
-                      compute_comm, stat, ierr)
-    if (ierr /= MPI_SUCCESS) error stop 'comm_sendrecv_dev: hi'
+    ! Both directions in flight at once: receives first, then sends, one wait.
+    call MPI_Irecv(r_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 311,     compute_comm, req(1), ierr)
+    call MPI_Irecv(r_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 312, compute_comm, req(2), ierr)
+    call MPI_Isend(s_lo, n, MPI_DOUBLE_PRECISION, dest_lo, 311,     compute_comm, req(3), ierr)
+    call MPI_Isend(s_hi, n, MPI_DOUBLE_PRECISION, dest_hi, 312, compute_comm, req(4), ierr)
+    call MPI_Waitall(4, req, stats, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'comm_sendrecv_dev: waitall'
 #else
     if (nbr_lo >= 0 .or. nbr_hi >= 0) error stop 'comm_sendrecv_dev: MPI neighbor without USE_MPI'
 #endif

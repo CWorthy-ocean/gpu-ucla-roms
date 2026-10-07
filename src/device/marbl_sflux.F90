@@ -12,6 +12,7 @@ module marbl_sflux_mod
   ! and return everything by value (CUF-kernel convention of this code base):
   ! multi-valued results come back in small derived types.
   use kinds
+  use gpu_state, only: nwet, wet_i, wet_j
   use decomp_mod, only: decomp
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
@@ -528,13 +529,16 @@ contains
   !---------------------------------------------------------------------------
 #ifdef USE_CUDA
   attributes(global) &
-  subroutine sflux_kernel(ntr, nz, kk, slot, nts, is, ie, js, je, nx, ny, &
+  subroutine sflux_kernel(ntr, nz, kk, slot, nts, is, ie, js, je, nx, ny, nwet, wet_i, wet_j, &
        ipo4, ino3, isio3, inh4, ife, io2, idic, idica, ialk, ialka, lo2, lco2, lnhx, &
        xkw_coeff, mass_to_vol, dust_po4_fac, dust_sio3_fac, len2m, cm2len, m2len, &
        del_ph, phlo_init, phhi_init, ifrac, atm_pres, tr, ts, mask)
     ! Parameters come in as scalars: nvfortran 25.9 rejects a by-value
     ! derived type as a global-kernel argument ("unexpected load datatype").
     integer(ip), value :: ntr, nz, kk, slot, nts, is, ie, js, je, nx, ny
+    integer(ip), value :: nwet
+    integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
+    integer(ip) :: c
     integer(ip), value :: ipo4, ino3, isio3, inh4, ife, io2, idic, idica, ialk, ialka, lo2, lco2, lnhx
     real(rp), value :: xkw_coeff, mass_to_vol, dust_po4_fac, dust_sio3_fac, len2m, cm2len, m2len
     real(rp), value :: del_ph, phlo_init, phhi_init, ifrac, atm_pres
@@ -554,9 +558,9 @@ contains
     integer(ip) :: c_ierr
     real(rp), parameter :: c0 = 0.0_rp, c1 = 1.0_rp
 
-    i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
-    j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
-    if (i > nx .or. j > ny) return
+    c = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    if (c > nwet) return
+    i = wet_i(c); j = wet_j(c)
     do m = 1, ntr
       sf_flux(i, j, m) = c0
     enddo
@@ -696,10 +700,10 @@ contains
     real(rp), WORK_ATTR intent(in) :: mask(decomp%is:decomp%ie, decomp%js:decomp%je)
 #ifdef USE_CUDA
     type(dim3) :: grid, block
-    block = dim3(32, 4, 1)
-    grid = dim3((decomp%nx + 31) / 32, (decomp%ny + 3) / 4, 1)
+    block = dim3(128, 1, 1)
+    grid = dim3((nwet + 127) / 128, 1, 1)
     call sflux_kernel<<<grid, block, 0, work_stream>>>(ntr, nz, kk, slot, nts, &
-         decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, &
+         decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, nwet, wet_i, wet_j, &
          p%po4, p%no3, p%sio3, p%nh4, p%fe, p%o2, p%dic, p%dic_alt, p%alk, p%alk_alt, &
          p%flux_o2, p%flux_co2, p%nhx_emis, &
          p%xkw_coeff, p%mass_to_vol, p%dust_po4_fac, p%dust_sio3_fac, p%len2m, p%cm2len, p%m2len, &

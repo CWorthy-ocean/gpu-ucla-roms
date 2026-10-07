@@ -13,7 +13,7 @@ module tide_io
   use decomp_mod
   use gpu_state
   use time_state
-  use frc_io, only: case_frcfiles, case_nfrc
+  use frc_io, only: case_frcfiles, case_nfrc, frc_file_ncid
   use nc_io
   use arch_mod, only: sync_arch
 #ifdef USE_CUDA
@@ -280,13 +280,11 @@ contains
     integer :: i, ncid
     path = ''
     do i = 1, case_nfrc
-      call nc_open_read(case_frcfiles(i), ncid)
+      ncid = frc_file_ncid(i)   ! cached handle, closed by close_frc_cache
       if (nc_has_var(ncid, 'omega')) then
         path = case_frcfiles(i)
-        call nc_close(ncid)
         return
       endif
-      call nc_close(ncid)
     enddo
   end function find_tide_file
 

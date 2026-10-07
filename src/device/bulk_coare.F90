@@ -1,7 +1,8 @@
 #include "mem_attr.inc"
 module bulk_coare
   ! COARE 3.0 bulk fluxes (Fairall et al. 2003), ported from
-  ! roms_bugfix/src/bulk_frc.F90. No QCORR / SFLX_CORR / TAU_CORR / ice.
+  ! roms_bugfix/src/bulk_frc.F90, with SFLX_CORR (namelist) and the
+  ! SEA_ICE_NOFLUX cap. No QCORR / TAU_CORR.
   ! All loops are device kernels (pointwise; the COARE iteration stays
   ! serial per point). Inputs must be managed/device arrays.
   use kinds
@@ -35,13 +36,16 @@ module bulk_coare
 
 contains
 
-  subroutine calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad)
+  subroutine calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad, do_sss, dsss, sss)
     real(rp), WORK_ATTR intent(in) :: uwnd(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: vwnd(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: tair(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: qair(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: prate(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(in) :: lwrad(decomp%is:decomp%ie, decomp%js:decomp%je)
+    logical,  intent(in) :: do_sss                 ! SFLX_CORR salinity restoring
+    real(rp), intent(in) :: dsss                   ! piston velocity, m/s
+    real(rp), WORK_ATTR intent(in) :: sss(decomp%is:decomp%ie, decomp%js:decomp%je)
     integer(ip) :: i, j, iter, itermax, nx, ny, nz, is, ie, js, je, n_rhs, i_fb, j_fb
     real(rp) :: rho0i, cpi, TseaC, TseaK, TairC, TairK, Qsea, rhoAir
     real(rp) :: VisAir, Hlv, delW, delT, delQ, u10, Zo10, Cd10, Ch10, Ct10, Cd
@@ -172,6 +176,13 @@ contains
         stflx(i, j, itemp) = apply_mask(srflx(i, j) + hflw + hflat + hfsen, rmask(i, j))
         evap = -Cp * hflat / Hlv
         swflx(i, j) = apply_mask(prate(i, j) * cmday2ms - evap, rmask(i, j))
+        ! roms_bugfix SEA_ICE_NOFLUX (set_global_definitions.h, always on): no
+        ! surface heat flux and no shortwave where the sea surface is at or
+        ! below -1.8 C ("poor man's sea ice").
+        if (TseaC <= -1.8_rp) then
+          stflx(i, j, itemp) = 0.0_rp
+          srflx(i, j) = 0.0_rp
+        endif
         aer = rhoAir * wspd0 * rho0i
         cer = Cd
         sustr_r(i, j) = apply_mask(aer * cer * uwnd(i, j), rmask(i, j))
@@ -231,14 +242,27 @@ contains
         svstr(i, j) = apply_mask(0.5_rp * (svstr_r(i, j - 1) + svstr_r(i, j)), vmask(i, j))
       enddo
     enddo
+    if (do_sss) then
+      ! roms_bugfix bulk_frc.F90 SFLX_CORR: stflx(isalt) = -dSSSdt (S(nz,nrhs) - sss) rmask
+      cff = dsss
 #ifdef USE_CUDA
-    !$cuf kernel do(2) <<<*,*>>>
+      !$cuf kernel do(2) <<<*,*>>>
 #endif
-    do j = js, je
-      do i = is, ie
-        stflx(i, j, isalt) = 0.0_rp
+      do j = js, je
+        do i = is, ie
+          stflx(i, j, isalt) = apply_mask(-cff * (t(i, j, nz, n_rhs, isalt) - sss(i, j)), rmask(i, j))
+        enddo
       enddo
-    enddo
+    else
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = js, je
+        do i = is, ie
+          stflx(i, j, isalt) = 0.0_rp
+        enddo
+      enddo
+    endif
   end subroutine calc_bulk_coare
 
 #ifdef USE_CUDA

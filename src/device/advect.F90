@@ -56,12 +56,14 @@ contains
     south = merge(1_ip, 0_ip, decomp%edge_s)
     north = merge(1_ip, 0_ip, decomp%edge_n)
 
-    call halo_fill_2d(umask, STAGGER_U)
-    call halo_fill_2d(vmask, STAGGER_V)
-    call halo_fill_2d(rmask, STAGGER_RHO)
-    call halo_fill_3d_t(t, STAGGER_RHO, t_slot, itr)
-    call halo_fill_3d(FlxU, STAGGER_U)
-    call halo_fill_3d(FlxV, STAGGER_V)
+    call hg_begin()
+    call hg_add(F_UMASK)
+    call hg_add(F_VMASK)
+    call hg_add(F_RMASK)
+    call hg_add(F_T, t_slot, itr)
+    call hg_add(F_FLXU)
+    call hg_add(F_FLXV)
+    call hg_end()
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
@@ -139,8 +141,10 @@ contains
       enddo
     enddo
 
-    call halo_fill_3d(wrk3a, STAGGER_U)
-    call halo_fill_3d(wrk3b, STAGGER_V)
+    call hg_begin()
+    call hg_add(F_WRK3A)
+    call hg_add(F_WRK3B)
+    call hg_end()
   end subroutine horiz_up3_fluxes
 
   subroutine horiz_c4_fluxes(tidx, itrc)
@@ -163,11 +167,13 @@ contains
     south = merge(1_ip, 0_ip, decomp%edge_s)
     north = merge(1_ip, 0_ip, decomp%edge_n)
 
-    call halo_fill_2d(umask, STAGGER_U)
-    call halo_fill_2d(vmask, STAGGER_V)
-    call halo_fill_3d_t(t, STAGGER_RHO, t_slot, itr)
-    call halo_fill_3d(FlxU, STAGGER_U)
-    call halo_fill_3d(FlxV, STAGGER_V)
+    call hg_begin()
+    call hg_add(F_UMASK)
+    call hg_add(F_VMASK)
+    call hg_add(F_T, t_slot, itr)
+    call hg_add(F_FLXU)
+    call hg_add(F_FLXV)
+    call hg_end()
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
@@ -219,8 +225,10 @@ contains
       enddo
     enddo
 
-    call halo_fill_3d(wrk3a, STAGGER_U)
-    call halo_fill_3d(wrk3b, STAGGER_V)
+    call hg_begin()
+    call hg_add(F_WRK3A)
+    call hg_add(F_WRK3B)
+    call hg_end()
   end subroutine horiz_c4_fluxes
 
   subroutine dump_horiz_flux_probe(tag, dtau_in)
@@ -316,10 +324,12 @@ contains
 
     nz = decomp%nz
     call ensure_wrk3()
-    call halo_fill_2d(rmask, STAGGER_RHO)
-    call halo_fill_3d_t(t, STAGGER_RHO, tidx, itrc)
-    call halo_fill_3d(Hz, STAGGER_RHO)
-    call halo_fill_3d_w(We, STAGGER_RHO)
+    call hg_begin()
+    call hg_add(F_RMASK)
+    call hg_add(F_T, tidx, itrc)
+    call hg_add(F_HZ)
+    call hg_add(F_WE)
+    call hg_end()
     ! Zero col_wc on the device (k = 0 and nz stay zero; a host assignment
     ! would migrate the whole array to the CPU every call).
 #ifdef USE_CUDA
@@ -554,15 +564,19 @@ contains
     logical, intent(in) :: horiz, vert
     integer(ip) :: itrc
     if (horiz) then
-      call halo_fill_2d(umask, STAGGER_U)
-      call halo_fill_2d(vmask, STAGGER_V)
-      call halo_fill_3d(FlxU, STAGGER_U)
-      call halo_fill_3d(FlxV, STAGGER_V)
+      call hg_begin()
+      call hg_add(F_UMASK)
+      call hg_add(F_VMASK)
+      call hg_add(F_FLXU)
+      call hg_add(F_FLXV)
+      call hg_end()
     endif
     call halo_fill_2d(rmask, STAGGER_RHO)
     if (vert) then
-      call halo_fill_3d(Hz, STAGGER_RHO)
-      call halo_fill_3d_w(We, STAGGER_RHO)
+      call hg_begin()
+      call hg_add(F_HZ)
+      call hg_add(F_WE)
+      call hg_end()
     endif
     do itrc = 1, nt
       call halo_fill_3d_t(t, STAGGER_RHO, tidx, itrc)

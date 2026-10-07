@@ -13,7 +13,7 @@ module bry_io
   use decomp_mod
   use gpu_state
   use time_state
-  use frc_io, only: case_frcfiles, case_nfrc, cyc_bracket
+  use frc_io, only: case_frcfiles, case_nfrc, cyc_bracket, frc_file_ncid, cached_times
   use passive_mod, only: ntp, passive_marbl, passive_name, tb_west, tb_east, tb_south, tb_north
   use nc_io
   use arch_mod, only: sync_arch
@@ -226,7 +226,7 @@ contains
         ntot = 0
       endif
       do i = 1, case_nfrc
-        call nc_open_read(case_frcfiles(i), ncid)
+        ncid = frc_file_ncid(i)   ! cached handle, closed by close_frc_cache
         if (nc_has_var(ncid, vname)) then
           call nc_var_shape(ncid, vname, a1, a2, a3, nrec)
           if (nc_has_var(ncid, tname)) nrec = nc_var_nrecs(ncid, tname)
@@ -243,7 +243,9 @@ contains
           else
             allocate(tloc(nrec))
             tloc = 0.0_rp
-            if (nc_has_var(ncid, tname)) call nc_get_1d(ncid, tname, tloc)
+            if (nc_has_var(ncid, tname)) then
+              if (.not. cached_times(i, tname, tloc)) call nc_get_1d(ncid, tname, tloc)
+            endif
             do k = 1, nrec
               ntot = ntot + 1
               times(ntot) = tloc(k)
@@ -253,7 +255,6 @@ contains
             deallocate(tloc)
           endif
         endif
-        call nc_close(ncid)
       enddo
     enddo
 

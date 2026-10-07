@@ -11,6 +11,7 @@ module nc_io
   public :: nc_sync
   public :: nc_def_var_f
   public :: nc_put_2d_rec_f
+  public :: nc_put_2d_rec_d, nc_put_3d_rec_d
   public :: nc_put_3d_rec_f
   public :: nc_close
   public :: nc_dim_len
@@ -221,6 +222,35 @@ contains
     integer, intent(in) :: ncid
     call nc_check(nf90_sync(ncid), 'sync')
   end subroutine nc_sync
+
+  subroutine nc_put_2d_rec_d(ncid, name, arr, n1, n2, rec, i0f, j0f)
+    ! As nc_put_2d_rec_f for a contiguous (n1, n2) double block.
+    integer,          intent(in) :: ncid, n1, n2, rec
+    character(len=*), intent(in) :: name
+    real(8),          intent(in) :: arr(n1, n2)
+    integer,          intent(in), optional :: i0f, j0f
+    integer :: varid, i0, j0
+    i0 = 1; j0 = 1
+    if (present(i0f)) i0 = i0f
+    if (present(j0f)) j0 = j0f
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, rec/), &
+                  count=(/n1, n2, 1/)), 'putrec '//trim(name))
+  end subroutine nc_put_2d_rec_d
+
+  subroutine nc_put_3d_rec_d(ncid, name, arr, n1, n2, n3, rec, i0f, j0f)
+    integer,          intent(in) :: ncid, n1, n2, n3, rec
+    character(len=*), intent(in) :: name
+    real(8),          intent(in) :: arr(n1, n2, n3)
+    integer,          intent(in), optional :: i0f, j0f
+    integer :: varid, i0, j0
+    i0 = 1; j0 = 1
+    if (present(i0f)) i0 = i0f
+    if (present(j0f)) j0 = j0f
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, arr, start=(/i0, j0, 1, rec/), &
+                  count=(/n1, n2, n3, 1/)), 'putrec '//trim(name))
+  end subroutine nc_put_3d_rec_d
 
   subroutine nc_put_2d_rec_f(ncid, name, arr, n1, n2, rec, i0f, j0f)
     ! arr is the first element of a contiguous (n1, n2) float32 block,

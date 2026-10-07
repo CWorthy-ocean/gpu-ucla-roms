@@ -35,7 +35,7 @@ override FFLAGS_HOST += $(FFLAGS_MPI) $(NETCDF_FFLAGS)
 override FFLAGS_GPU  += $(FFLAGS_MPI) $(NETCDF_FFLAGS)
 LIBS        ?= $(NETCDF_FLIBS)
 
-SRC_SHARED = src/shared/kinds.F90 src/shared/decomp.F90 src/shared/arch.F90 \
+SRC_SHARED = src/shared/kinds.F90 src/shared/decomp.F90 src/shared/tile_balance.F90 src/shared/arch.F90 \
              src/shared/comm.F90 src/shared/formulas.F90 src/shared/time_state.F90
 SRC_DEV    = src/device/gpu_state.F90 src/device/column_solve.F90 src/device/halo.F90 src/device/geom.F90 \
              src/device/obc.F90 src/device/step2d.F90 src/device/prsgrd.F90 \
@@ -45,7 +45,7 @@ SRC_DEV    = src/device/gpu_state.F90 src/device/column_solve.F90 src/device/hal
              src/device/step3d_t.F90 src/device/t3dmix.F90 src/device/lmd.F90 \
              src/device/bulk_coare.F90
 SRC_HOST   = src/host/step_driver.F90
-SRC_IO     = src/host/nc_io.F90 src/host/host_buf.F90 src/host/frc_io.F90 \
+SRC_IO     = src/host/nc_io.F90 src/host/host_buf.F90 src/host/par_read.F90 src/host/frc_io.F90 \
              src/host/bry_io.F90 src/host/tide_io.F90 src/host/io_server.F90 src/host/marbl_step.F90 src/host/his_io.F90 \
              src/host/case_io.F90
 MODDIR     = build

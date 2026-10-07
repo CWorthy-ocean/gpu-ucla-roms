@@ -18,6 +18,7 @@ module marbl_interior_mod
   ! Lig_cnt = 1, one PAR subcolumn, no restoring, no scale-factor forcings,
   ! ciso/abio off.
   use kinds
+  use gpu_state, only: nwet, wet_i, wet_j
   use decomp_mod, only: decomp
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
@@ -1083,8 +1084,11 @@ contains
   !===========================================================================
 #ifdef USE_CUDA
   attributes(global) &
-  subroutine carb_kernel(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, tr, ts, z_r, mask)
+  subroutine carb_kernel(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, nwet, wet_i, wet_j, tr, ts, z_r, mask)
     integer(ip), value :: ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny
+    integer(ip), value :: nwet
+    integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
+    integer(ip) :: c
     real(pp), device, intent(in) :: tr(ntr, is:ie, js:je, nz, nslot)
     real(rp), device, intent(in) :: ts(is:ie, js:je, nz, nslot, nts)
     real(rp), device, intent(in) :: z_r(is:ie, js:je, nz)
@@ -1095,10 +1099,10 @@ contains
     real(rp) :: t_dic, t_alk, t_po4, t_sio3, t_dica, t_alka
     integer(ip), parameter :: lpress = 1
 
-    i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
-    j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+    c = (blockIdx%x - 1) * blockDim%x + threadIdx%x
     kk = blockIdx%z
-    if (i > nx .or. j > ny .or. kk > nz) return
+    if (c > nwet .or. kk > nz) return
+    i = wet_i(c); j = wet_j(c)
     if (mask(i, j) == c0) return
     potemp = ts(i, j, kk, slot, itemp)
     salt = ts(i, j, kk, slot, isalt)
@@ -1153,9 +1157,12 @@ contains
   ! K2: interior ecosystem, one thread per column, surface to bottom
   !===========================================================================
   attributes(global) &
-  subroutine interior_kernel(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, dtm, ldg, &
+  subroutine interior_kernel(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, nwet, wet_i, wet_j, dtm, ldg, &
                              tr, ts, z_r, z_w, Hz, mask, dust)
     integer(ip), value :: ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, ldg
+    integer(ip), value :: nwet
+    integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
+    integer(ip) :: c
     real(rp), value :: dtm
     real(pp), device, intent(inout) :: tr(ntr, is:ie, js:je, nz, nslot)
     real(rp), device, intent(in) :: ts(is:ie, js:je, nz, nslot, nts)
@@ -1166,9 +1173,9 @@ contains
     real(rp) :: trk(NTRMAX), tend(NTRMAX), dg(ND_IT)
     type(sink_t) :: st
 
-    i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
-    j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
-    if (i > nx .or. j > ny) return
+    c = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    if (c > nwet) return
+    i = wet_i(c); j = wet_j(c)
     if (mask(i, j) == c0) return
     dust_flux = dust(i, j)
     ! set_surface_particulate_terms + PAR at the surface
@@ -1293,10 +1300,10 @@ contains
     ! No explicit cudaLimitStackSize: the runtime sizes the per-thread
     ! stack from the kernels' static requirement, and a large explicit
     ! limit reserves stack x resident threads (64 kB cost 14 GB here).
-    block = dim3(32, 4, 1)
-    grid = dim3((decomp%nx + 31) / 32, (decomp%ny + 3) / 4, nz)
+    block = dim3(128, 1, 1)
+    grid = dim3((nwet + 127) / 128, 1, nz)
     call carb_kernel<<<grid, block, 0, work_stream>>>(ntr, nz, slot, nslot, nts, &
-         decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, tr, ts, z_r, mask)
+         decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, nwet, wet_i, wet_j, tr, ts, z_r, mask)
 #else
     error stop 'marbl_carbonate_compute: CUDA build required'
 #endif
@@ -1318,10 +1325,10 @@ contains
     integer(ip) :: ldg
     ldg = 0
     if (keep .and. allocated(it_tend)) ldg = 1
-    block = dim3(32, 4, 1)
-    grid = dim3((decomp%nx + 31) / 32, (decomp%ny + 3) / 4, 1)
+    block = dim3(128, 1, 1)
+    grid = dim3((nwet + 127) / 128, 1, 1)
     call interior_kernel<<<grid, block, 0, work_stream>>>(ntr, nz, slot, nslot, nts, &
-         decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, dtm, ldg, &
+         decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, nwet, wet_i, wet_j, dtm, ldg, &
          tr, ts, z_r, z_w, Hz, mask, dust)
 #else
     error stop 'marbl_interior_compute: CUDA build required'

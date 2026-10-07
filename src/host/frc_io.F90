@@ -11,15 +11,36 @@ module frc_io
   use nc_io
   use bulk_coare, only: calc_bulk_coare
   use arch_mod, only: sync_arch
+  use comm_mod, only: comm_rank, comm_size, comm_compute
+  use netcdf, only: nf90_inquire, nf90_inquire_variable, nf90_inquire_dimension, nf90_get_var, &
+                    nf90_double, nf90_float, nf90_max_var_dims
 #ifdef USE_CUDA
   use cudafor
 #endif
   implicit none
+#ifdef USE_MPI
+  include 'mpif.h'
+#endif
   private
 
   integer, parameter :: max_frc = 64
   character(len=512), public :: case_frcfiles(max_frc)
   integer,            public :: case_nfrc = 0
+  integer, private :: frc_cache(max_frc) = -1   ! read handles kept open during initialization
+  public :: frc_file_ncid, close_frc_cache
+  public :: prefetch_time_axes, cached_times
+  ! Time axes of the forcing files, read once in parallel (file i by rank
+  ! mod(i-1, nranks)) and broadcast: every record of a classic-format file
+  ! costs one seek, so a month of hourly times is thousands of reads.
+  integer, parameter :: MAXTC = 1024
+  type :: tc_t
+    integer :: ifile = 0, n = 0
+    character(len=64) :: name = ''
+    real(rp), allocatable :: t(:)
+  end type tc_t
+  type(tc_t), save :: tcache(MAXTC)
+  integer :: ntc = 0
+  logical :: first_bind = .true.
   logical,            public :: interp_flux_frc = .false.
 
   real(rp), parameter :: Cp = 3985.0_rp
@@ -43,10 +64,17 @@ module frc_io
 
   type(series2d) :: s_sustr, s_svstr, s_shflx, s_swflx, s_swrad
   type(series2d) :: s_uwnd, s_vwnd, s_tair, s_qair, s_prate, s_lwrad, s_bswrad
+  type(series2d) :: s_sss                      ! SFLX_CORR: sea-surface salinity restoring data
   ! MARBL surface forcing (dust/iron/nox/nhy climatologies, atmospheric xCO2)
   type(series2d) :: s_dust, s_iron, s_nox, s_nhy, s_xco2, s_xco2a
   logical, public :: bgc_frc_on = .false.
   real(rp), WORK_ATTR allocatable :: uwnd(:,:), vwnd(:,:), qair(:,:), prate(:,:), lwrad_in(:,:)
+  real(rp), WORK_ATTR allocatable :: sss(:,:)
+  ! SFLX_CORR (roms_bugfix bulk_frc.F90): stflx(isalt) = -dSSSdt (S_surface - sss),
+  ! bulk forcing only. &surf_frc_settings sflx_corr; &sss_correction dsssdt [cm/day].
+  logical,  public :: sflx_corr = .false.
+  real(rp), public :: dsssdt = 7.777_rp
+  real(rp)         :: dsssdt_ms = 0.0_rp       ! piston velocity, m/s
 
   public :: read_forcing_namelist
   public :: init_forcing
@@ -67,7 +95,8 @@ contains
     character(len=512) :: frcfiles(max_frc), frcfile(max_frc)
     logical :: interp_bulk_frc, check_bulk_frc_units
     namelist /forcing_files/ frcfiles, frcfile
-    namelist /surf_frc_settings/ interp_flux_frc, interp_bulk_frc, check_bulk_frc_units
+    namelist /surf_frc_settings/ interp_flux_frc, interp_bulk_frc, check_bulk_frc_units, sflx_corr
+    namelist /sss_correction/ dsssdt
     namelist /flux_frc_settings/ interp_flux_frc
     namelist /bulk_frc_settings/ interp_bulk_frc, check_bulk_frc_units
 
@@ -82,6 +111,9 @@ contains
     read(unit, nml=flux_frc_settings, iostat=ios)
     rewind(unit)
     read(unit, nml=bulk_frc_settings, iostat=ios)
+    rewind(unit)
+    read(unit, nml=sss_correction, iostat=ios)
+    dsssdt_ms = dsssdt / (100.0_rp * 86400.0_rp)
 
     case_nfrc = 0
     do i = 1, max_frc
@@ -100,6 +132,7 @@ contains
     have_flux = .false.
     have_bulk = .false.
     if (case_nfrc < 1) return
+    call prefetch_time_axes()
     call bind_series(s_uwnd, 'uwnd', 'time', 'r')
     call bind_series(s_vwnd, 'vwnd', 'time', 'r')
     call bind_series(s_tair, 'Tair', 'time', 'r')
@@ -120,8 +153,17 @@ contains
       qair = 0.0_rp; prate = 0.0_rp; lwrad_in = 0.0_rp
       write(*,'(a,i0,a,2es14.6)') 'bulk/COARE forcing, Tair records = ', s_tair%ntot, &
            '  days ', s_tair%times(1), s_tair%times(s_tair%ntot)
+      ! SFLX_CORR: sea-surface salinity restoring data (bulk forcing only)
+      if (.not. allocated(sss)) allocate(sss(decomp%is:decomp%ie, decomp%js:decomp%je))
+      sss = 0.0_rp
+      if (sflx_corr) then
+        call bind_series(s_sss, 'sss', 'sss_time', 'r')
+        if (.not. s_sss%ready) error stop 'sflx_corr: sss / sss_time not found in the forcing files'
+        write(*,'(a,f8.3,a,es12.4,a)') 'SSS restoring on: dSSSdt =', dsssdt, ' cm/day (', dsssdt_ms, ' m/s)'
+      endif
       return
     endif
+    if (sflx_corr) error stop 'sflx_corr needs bulk forcing (as roms_bugfix SFLX_CORR with BULK_FRC)'
     nmiss = 0
     if (s_uwnd%ready .or. s_vwnd%ready .or. s_tair%ready .or. s_qair%ready) then
       if (.not. s_uwnd%ready) nmiss = nmiss + 1
@@ -168,7 +210,8 @@ contains
              minval(tair), maxval(tair), '  uwnd range=', minval(uwnd), maxval(uwnd)
         logged_bulk = .true.
       endif
-      call calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad_in)
+      if (sflx_corr) call fill_r(s_sss, tneed, sss)
+      call calc_bulk_coare(uwnd, vwnd, tair, qair, prate, lwrad_in, sflx_corr, dsssdt_ms, sss)
       return
     endif
     if (.not. have_flux) return
@@ -194,6 +237,120 @@ contains
     endif
   end subroutine set_forces
 
+  subroutine prefetch_time_axes()
+    ! Collective over the compute ranks. Every 1-D real variable of every
+    ! forcing file lands in tcache on every rank.
+    integer :: i, nc, me, owner, ncid, nv, v, ndims, xtype, dimids(nf90_max_var_dims), n, k, cnt, k0
+    integer :: nfirst(max_frc), nlast(max_frc), owner_of(max_frc)
+    integer(8) :: fsize(max_frc)
+    integer(8), allocatable :: load(:)
+    logical :: done(max_frc)
+    integer(8) :: c0, c1, c2, crate
+    character(len=64) :: vname
+    integer :: ierr
+    nc = comm_size(); me = comm_rank()
+    allocate(load(0:nc - 1))
+    call system_clock(c0, crate)
+    ! Owners by file size (largest first to the least-loaded rank): the
+    ! read cost scales with the record count, i.e. with the file size.
+    do i = 1, case_nfrc
+      inquire(file=trim(case_frcfiles(i)), size=fsize(i))
+      if (fsize(i) < 0) fsize(i) = 0
+    enddo
+    load = 0
+    done = .false.
+    do k = 1, case_nfrc
+      i = maxloc(fsize(1:case_nfrc), 1, mask=.not. done(1:case_nfrc))
+      done(i) = .true.
+      owner_of(i) = minloc(load(0:nc - 1), 1) - 1
+      load(owner_of(i)) = load(owner_of(i)) + fsize(i) + 1
+    enddo
+    ! local reads first (all files of this rank), then the broadcasts
+    do i = 1, case_nfrc
+      owner = owner_of(i)
+      if (me == owner) then
+        nfirst(i) = ntc + 1
+        ncid = frc_file_ncid(i)
+        call nc_check(nf90_inquire(ncid, nvariables=nv), 'inquire forcing file')
+        do v = 1, nv
+          call nc_check(nf90_inquire_variable(ncid, v, name=vname, xtype=xtype, ndims=ndims, dimids=dimids), 'inquire var')
+          if (ndims /= 1) cycle
+          if (xtype /= nf90_double .and. xtype /= nf90_float) cycle
+          call nc_check(nf90_inquire_dimension(ncid, dimids(1), len=n), 'dim len')
+          if (n < 1) cycle
+          if (ntc >= MAXTC) error stop 'prefetch_time_axes: raise MAXTC'
+          ntc = ntc + 1
+          tcache(ntc)%ifile = i; tcache(ntc)%name = vname; tcache(ntc)%n = n
+          allocate(tcache(ntc)%t(n))
+          call nc_check(nf90_get_var(ncid, v, tcache(ntc)%t), 'get '//trim(vname))
+        enddo
+        nlast(i) = ntc
+      endif
+    enddo
+    call system_clock(c1, crate)
+#ifdef USE_MPI
+    do i = 1, case_nfrc
+      owner = owner_of(i)
+      if (me == owner) then
+        cnt = nlast(i) - nfirst(i) + 1
+        k0 = nfirst(i) - 1
+      else
+        cnt = 0
+        k0 = ntc
+      endif
+      call MPI_Bcast(cnt, 1, MPI_INTEGER, owner, comm_compute(), ierr)
+      do k = 1, cnt
+        if (me /= owner) then
+          if (ntc >= MAXTC) error stop 'prefetch_time_axes: raise MAXTC'
+          ntc = ntc + 1
+          tcache(ntc)%ifile = i
+        endif
+        call MPI_Bcast(tcache(k0 + k)%name, 64, MPI_CHARACTER, owner, comm_compute(), ierr)
+        call MPI_Bcast(tcache(k0 + k)%n, 1, MPI_INTEGER, owner, comm_compute(), ierr)
+        if (me /= owner) allocate(tcache(k0 + k)%t(tcache(k0 + k)%n))
+        call MPI_Bcast(tcache(k0 + k)%t, tcache(k0 + k)%n, MPI_REAL8, owner, comm_compute(), ierr)
+      enddo
+    enddo
+#endif
+    call system_clock(c2, crate)
+    write(*,'(a,i0,a,i0,a,i0,a,f7.2,a,f7.2,a)') 'forcing: rank ', me, ' prefetched ', ntc, ' time axes from ', case_nfrc, &
+         ' files: reads ', real(c1 - c0) / real(crate), ' s  broadcasts ', real(c2 - c1) / real(crate), ' s'
+  end subroutine prefetch_time_axes
+
+  logical function cached_times(i, tname, tloc) result(found)
+    ! The prefetched axis tname of file i into tloc (sizes must agree).
+    integer, intent(in) :: i
+    character(len=*), intent(in) :: tname
+    real(rp), intent(out) :: tloc(:)
+    integer :: k
+    found = .false.
+    do k = 1, ntc
+      if (tcache(k)%ifile == i .and. trim(tcache(k)%name) == trim(tname)) then
+        if (tcache(k)%n /= size(tloc)) return
+        tloc = tcache(k)%t
+        found = .true.
+        return
+      endif
+    enddo
+  end function cached_times
+
+  function frc_file_ncid(i) result(ncid)
+    ! Read-only handle for forcing file i, opened once and kept until
+    ! close_frc_cache: the series binders scan every file per variable.
+    integer, intent(in) :: i
+    integer :: ncid
+    if (frc_cache(i) < 0) call nc_open_read(case_frcfiles(i), frc_cache(i))
+    ncid = frc_cache(i)
+  end function frc_file_ncid
+
+  subroutine close_frc_cache()
+    integer :: i
+    do i = 1, case_nfrc
+      if (frc_cache(i) >= 0) call nc_close(frc_cache(i))
+      frc_cache(i) = -1
+    enddo
+  end subroutine close_frc_cache
+
   subroutine bind_series(s, vname, tname, gtype)
     type(series2d),   intent(inout) :: s
     character(len=*), intent(in)    :: vname, tname, gtype
@@ -208,7 +365,7 @@ contains
     s%ntot = 0
     ntot = 0
     do i = 1, case_nfrc
-      call nc_open_read(case_frcfiles(i), ncid)
+      ncid = frc_file_ncid(i)   ! cached handle, closed by close_frc_cache
       if (nc_has_var(ncid, vname)) then
         call nc_forcing_layout(ncid, vname, tname, nxi, neta, nrec, tax)
         ntot = ntot + max(nrec, 1)
@@ -225,19 +382,19 @@ contains
           endif
         endif
       endif
-      call nc_close(ncid)
     enddo
+    if (first_bind) call wall_stamp('bind pass1 '//trim(vname))
     if (ntot < 1) return
     allocate(s%times(ntot), s%ifile(ntot), s%irec(ntot), s%paths(ntot))
     s%ntot = 0
     do i = 1, case_nfrc
-      call nc_open_read(case_frcfiles(i), ncid)
+      ncid = frc_file_ncid(i)   ! cached handle, closed by close_frc_cache
       if (nc_has_var(ncid, vname)) then
         call nc_forcing_layout(ncid, vname, tname, nxi, neta, nrec, tax)
         nrec = max(nrec, 1)
         allocate(tloc(nrec))
         if (nc_has_var(ncid, tname)) then
-          call nc_get_1d(ncid, tname, tloc)
+          if (.not. cached_times(i, tname, tloc)) call nc_get_1d(ncid, tname, tloc)
         else
           tloc = 0.0_rp
         endif
@@ -250,23 +407,22 @@ contains
         enddo
         deallocate(tloc)
       endif
-      call nc_close(ncid)
     enddo
+    if (first_bind) call wall_stamp('bind pass2 '//trim(vname))
     if (s%ntot < 1) return
     call sort_catalog(s)
     ! climatology? cycle_length on the time axis of the first file with the variable
     s%cycle = -1.0_rp
     do i = 1, case_nfrc
-      call nc_open_read(case_frcfiles(i), ncid)
+      ncid = frc_file_ncid(i)   ! cached handle, closed by close_frc_cache
       if (nc_has_var(ncid, vname) .and. nc_has_var(ncid, tname)) then
         call nc_get_att_real(ncid, tname, 'cycle_length', cyc, lcyc)
         if (lcyc .and. cyc > 0.0_rp) s%cycle = cyc
-        call nc_close(ncid)
         exit
       endif
-      call nc_close(ncid)
     enddo
     if (s%cycle > 0.0_rp) write(*,'(3a,f10.3)') 'forcing ', trim(vname), ' is cyclic, cycle_length =', s%cycle
+    if (first_bind) call wall_stamp('bind pass3 '//trim(vname))
     s%ready = .true.
     allocate(s%buf(s%n1, s%n2, 2))
     s%buf = 0.0_rp
@@ -274,6 +430,8 @@ contains
     s%it2 = min(2, s%ntot)
     call read_catalog_rec(s, s%it1, 1)
     call read_catalog_rec(s, s%it2, 2)
+    if (first_bind) call wall_stamp('bound '//trim(vname))
+    first_bind = .false.
   end subroutine bind_series
 
   subroutine sort_catalog(s)
@@ -714,23 +872,20 @@ contains
     path = ''
     fallback = ''
     do i = 1, case_nfrc
-      call nc_open_read(case_frcfiles(i), ncid)
+      ncid = frc_file_ncid(i)   ! cached handle, closed by close_frc_cache
       if (nc_has_var(ncid, vname)) then
         if (present(tname)) then
           if (nc_has_var(ncid, tname)) then
             path = case_frcfiles(i)
-            call nc_close(ncid)
             return
           elseif (len_trim(fallback) == 0) then
             fallback = case_frcfiles(i)
           endif
         else
           path = case_frcfiles(i)
-          call nc_close(ncid)
           return
         endif
       endif
-      call nc_close(ncid)
     enddo
     if (len_trim(path) == 0) path = fallback
   end function find_var_file

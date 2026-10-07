@@ -216,9 +216,11 @@ contains
     iic = 1
     knew = 1
     kstp = 1
-    call halo_fill_2d_s(zeta, STAGGER_RHO, 1_ip)
-    call halo_fill_2d_s(ubar, STAGGER_U, 1_ip)
-    call halo_fill_2d_s(vbar, STAGGER_V, 1_ip)
+    call hg_begin()
+    call hg_add(F_ZETA, 1_ip)
+    call hg_add(F_UBAR, 1_ip)
+    call hg_add(F_VBAR, 1_ip)
+    call hg_end()
     call set_depth()
 
     vol0 = sum((h(1:decomp%nx, 1:decomp%ny) + zeta(1:decomp%nx, 1:decomp%ny, 1)) / &

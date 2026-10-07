@@ -8,10 +8,12 @@ module his_io
   use time_state
   use nc_io
   use io_server
+  use io_server, only: io_init8, io_stage8_begin, io_stage8_2d, io_stage8_3d, io_stage8_3d_pt, io_stage8_end
+  use comm_mod, only: have_io_server
   use comm_mod, only: comm_rank, comm_size, compute_barrier
   use passive_mod, only: ntp, tp, wrt_passive, passive_name
   use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
-                       marbl_gpu_define_rst, marbl_gpu_write_rst
+                       marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
   implicit none
   private
 
@@ -236,8 +238,10 @@ contains
   end subroutine wrt_his
 
   subroutine wrt_rst()
-    integer :: ncid, n2, n3, itp, ir
+    integer :: ncid, n2, n3, itp, ir, nz, is, js
     real(rp) :: twrite
+    character(len=512) :: open_rst
+    open_rst = ''
     if (.not. wrt_file_rst) return
     if (.not. output_ready) call init_output()
     twrite = start_time + dt * real(max(iic - ntstart + 1, 0), rp)
@@ -252,8 +256,42 @@ contains
       call make_fname(output_root, 'rst', nfile_rst, fname_rst)
       if (comm_rank() == 0) call create_rst_file(fname_rst)
       call compute_barrier()
+      open_rst = fname_rst
     endif
     rec_rst = rec_rst + 1
+    call wall_stamp('restart write begin')
+    if (have_io_server()) then
+      ! staged double-precision record: the server assembles the tiles and
+      ! writes each variable once; the compute ranks continue.
+      nz = decomp%nz; is = decomp%is; js = decomp%js
+      call io_stage8_begin(IO_KIND_RST, rec_rst, nfile_rst, twrite, open_rst)
+      call io_stage8_2d('zeta', zeta(is, js, n2), ir0, ir1, jr0, jr1, ir0, jr0)
+      call io_stage8_2d('ubar', ubar(is, js, n2), iu0, iu1, jr0, jr1, 0, jr0)
+      call io_stage8_2d('vbar', vbar(is, js, n2), ir0, ir1, jv0, jv1, ir0, 0)
+      call io_stage8_3d('u', u(is, js, 1, n3), 1, nz, iu0, iu1, jr0, jr1, 0, jr0)
+      call io_stage8_3d('v', v(is, js, 1, n3), 1, nz, ir0, ir1, jv0, jv1, ir0, 0)
+      call io_stage8_3d('temp', t(is, js, 1, n3, itemp), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+      call io_stage8_3d('salt', t(is, js, 1, n3, isalt), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+      do itp = 1, ntp
+        call io_stage8_3d_pt(trim(passive_name(itp)), tp(1, is, js, 1, n3), ntp, itp, 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+      enddo
+      call io_stage8_2d('hbls', hbls(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
+      call io_stage8_2d('hbbl', hbbl(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
+      if (marbl_on) call marbl_gpu_stage_rst8(ir0, ir1, jr0, jr1, ir0, jr0)
+      call io_stage8_2d('DU_avg1', DU_avg1(is, js), iu0, iu1, jr0, jr1, 0, jr0)
+      call io_stage8_2d('DV_avg1', DV_avg1(is, js), ir0, ir1, jv0, jv1, ir0, 0)
+      call io_stage8_2d('DU_avg2', DU_avg2(is, js), iu0, iu1, jr0, jr1, 0, jr0)
+      call io_stage8_2d('DV_avg2', DV_avg2(is, js), ir0, ir1, jv0, jv1, ir0, 0)
+      call io_stage8_2d('DU_avg_bak', DU_avg_bak(is, js), iu0, iu1, jr0, jr1, 0, jr0)
+      call io_stage8_2d('DV_avg_bak', DV_avg_bak(is, js), ir0, ir1, jv0, jv1, ir0, 0)
+      call io_stage8_2d('rufrc', rufrc_bak(is, js, max(nstp, 1)), iu0, iu1, jr0, jr1, 0, jr0)
+      call io_stage8_2d('rvfrc', rvfrc_bak(is, js, max(nstp, 1)), ir0, ir1, jv0, jv1, ir0, 0)
+      call io_stage8_end()
+      call wall_stamp('restart staged')
+      if (comm_rank() == 0) write(*,'(a,es14.6,a,i0,a,i0)') 'staged restart t = ', twrite, &
+           '  rec = ', rec_rst, '  file ', nfile_rst
+      return
+    endif
     ! one tile at a time (a single NetCDF writer), each slab at its global offsets
     do ir = 0, int(comm_size()) - 1
     if (ir == comm_rank()) then
@@ -284,6 +322,7 @@ contains
     endif
     call compute_barrier()
     enddo
+    call wall_stamp('restart write end')
     if (comm_rank() == 0) write(*,'(a,es14.6,a,i0,a,i0)') 'wrote restart t = ', twrite, &
          '  rec = ', rec_rst, '  file ', nfile_rst
   end subroutine wrt_rst
@@ -386,7 +425,9 @@ contains
     n3w = count((/wrt_O, wrt_Akv, wrt_Akt, wrt_Aks/))
     cap_rec = n2d * nxy + n3d * nxy * nh + n3w * nxy * nhw
     cap_field = nxy * nhw
-    if (wrt_file_his) call io_init(cap_rec, cap_field)
+    if (wrt_file_his .or. wrt_file_rst) call io_init(cap_rec, cap_field)
+    ! double-precision capacity for one restart record of this tile
+    if (wrt_file_rst) call io_init8((15 + 2) * nxy + (4 + ntp + 2) * nxy * nh, nxy * nh)
   end subroutine init_staging
 
   subroutine set_write_bounds()
