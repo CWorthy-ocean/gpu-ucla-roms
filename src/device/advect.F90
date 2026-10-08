@@ -606,7 +606,7 @@ contains
     call tracer_halos(tidx, .true., .false.)
     lim = dry_lim(G_TRC)
 #ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
+    !$cuf kernel do(3) <<<*,(32,16,1)>>>
 #endif
     do k = 1, nz
       do j = 1, ny
@@ -644,12 +644,18 @@ contains
     ! value (v_face's arithmetic exactly) is computed once and reused as
     ! the lower face of the next level. ctr = 1: centered (predictor);
     ! 0: upstream-biased (corrector).
+    ! thickness_tplus/tminus are expanded inline (as calls from this kernel
+    ! they were not inlined): their slopes dlt(k-1) = dlt_m(k) and
+    ! dlt(k+1) = dlt_p(k) are the same expressions on the same operands, so
+    ! each is computed once (as dlt_p) and carried up the column in
+    ! registers, with the bottom (dlt_m = 0, hkm = Hz_k) and surface
+    ! (dlt_p = 0, hkp2 = Hz_kp1) cases as in the functions.
     integer(ip), intent(in) :: tidx, n_new, ctr
     real(rp), intent(in) :: dtp
     integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, nn, ctr_l, lim
     real(rp) :: dtpp, fz_lo, fz_k, tplus, tminus, rm, w
-    real(rp) :: t_km1, t_k, t_kp1, t_kp2, Hz_km1, Hz_k, Hz_kp1, Hz_kp2
-    logical :: at_bottom, at_surface
+    real(rp) :: t_k, t_kp1, t_kp2, Hz_k, Hz_kp1, Hz_kp2
+    real(rp) :: dlt_m, dlt_c, dlt_p, hkm, hkp2, tlin
 
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = nt
     ts = tidx; nn = n_new; ctr_l = ctr
@@ -668,21 +674,25 @@ contains
           t_kp1 = t(i, j, 2, ts, itr)
           Hz_k = Hz(i, j, 1)
           Hz_kp1 = Hz(i, j, 2)
-          t_km1 = t_k
-          Hz_km1 = Hz_k
+          ! k = 1 (bottom): dlt_m = 0, hkm = Hz_k
+          dlt_c = (t_kp1 - t_k) / max(Hz_k + Hz_kp1, 1.0e-30_rp)
+          dlt_m = 0.0_rp
+          hkm = Hz_k
           do k = 1, nz - 1
-            at_bottom = (k == 1)
-            at_surface = (k == nz - 1)
-            if (at_surface) then
+            if (k == nz - 1) then
               t_kp2 = t_kp1
               Hz_kp2 = Hz_kp1
+              hkp2 = Hz_kp1
+              dlt_p = 0.0_rp
             else
               t_kp2 = t(i, j, k + 2, ts, itr)
               Hz_kp2 = Hz(i, j, k + 2)
+              hkp2 = Hz_kp2
+              dlt_p = (t_kp2 - t_kp1) / max(Hz_kp1 + Hz_kp2, 1.0e-30_rp)
             endif
-            tplus = thickness_tplus(t_km1, t_k, t_kp1, Hz_km1, Hz_k, Hz_kp1, at_bottom)
-            tminus = thickness_tminus(t_km1, t_k, t_kp1, t_kp2, Hz_km1, Hz_k, Hz_kp1, Hz_kp2, &
-                                      at_bottom, at_surface)
+            tlin = (Hz_kp1 * t_k + Hz_k * t_kp1) / max(Hz_k + Hz_kp1, 1.0e-30_rp)
+            tplus = tlin - Hz_k * Hz_kp1 * (dlt_c - dlt_m) / max(hkm + Hz_k + Hz_kp1, 1.0e-30_rp)
+            tminus = tlin - Hz_k * Hz_kp1 * (dlt_p - dlt_c) / max(Hz_k + Hz_kp1 + hkp2, 1.0e-30_rp)
             w = We(i, j, k)
             if (ctr_l == 1) then
               fz_k = 0.5_rp * (tplus + tminus) * w
@@ -692,8 +702,9 @@ contains
             fz_k = apply_mask(fz_k, rm)
             t(i, j, k, nn, itr) = t(i, j, k, nn, itr) - dtpp * (fz_k - fz_lo)
             fz_lo = fz_k
-            t_km1 = t_k; t_k = t_kp1; t_kp1 = t_kp2
-            Hz_km1 = Hz_k; Hz_k = Hz_kp1; Hz_kp1 = Hz_kp2
+            dlt_m = dlt_c; dlt_c = dlt_p; hkm = Hz_k
+            t_k = t_kp1; t_kp1 = t_kp2
+            Hz_k = Hz_kp1; Hz_kp1 = Hz_kp2
           enddo
           ! Top level: the surface face is zero.
           t(i, j, nz, nn, itr) = t(i, j, nz, nn, itr) - dtpp * (0.0_rp - fz_lo)
@@ -708,9 +719,10 @@ contains
     ! for all tracers.
     integer(ip), intent(in) :: tidx, n_new
     real(rp), intent(in) :: dt_in
-    integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, nn, lim
+    integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, nn, lim, jpr, njp
     integer(ip) :: west, east, south, north
-    real(rp) :: dtl, dtpp
+    real(rp) :: dtl, dtpp, dtpp1, fe_lo, fe_mid
+    logical :: two, act0, act1
 
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = nt
     ts = tidx; nn = n_new; dtl = dt_in
@@ -720,20 +732,42 @@ contains
     north = merge(1_ip, 0_ip, decomp%edge_n)
     call tracer_halos(tidx, .true., .true.)
     lim = dry_lim(G_TRC)
+    njp = (ny + 1) / 2
+    ! Each thread the points j and j+1 (shared y-face up3_fe(i, j+1) once).
 #ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
+    !$cuf kernel do(3) <<<*,(32,16,1)>>>
 #endif
     do k = 1, nz
-      do j = 1, ny
+      do jpr = 0, njp - 1
         do i = 1, nx
-          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
+          j = 1 + 2 * jpr
+          two = (j + 1 <= ny)
+          act0 = .true.
+          act1 = two
+          if (lim > 0) then
+            act0 = (colact(i, j) /= 0)
+            if (two) act1 = (colact(i, j + 1) /= 0)
+          endif
+          if (.not. (act0 .or. act1)) cycle
           dtpp = dtl * pm(i, j) * pn(i, j)
+          if (act1) dtpp1 = dtl * pm(i, j + 1) * pn(i, j + 1)
           do itr = 1, ntr
-            t(i, j, k, nn, itr) = t(i, j, k, nn, itr) - dtpp * &
-                 (up3_fx(i + 1, j, k, ts, itr, west, east, nx) - &
-                  up3_fx(i, j, k, ts, itr, west, east, nx) + &
-                  up3_fe(i, j + 1, k, ts, itr, south, north, ny) - &
-                  up3_fe(i, j, k, ts, itr, south, north, ny))
+            fe_lo = up3_fe(i, j, k, ts, itr, south, north, ny)
+            fe_mid = up3_fe(i, j + 1, k, ts, itr, south, north, ny)
+            if (act0) then
+              t(i, j, k, nn, itr) = t(i, j, k, nn, itr) - dtpp * &
+                   (up3_fx(i + 1, j, k, ts, itr, west, east, nx) - &
+                    up3_fx(i, j, k, ts, itr, west, east, nx) + &
+                    fe_mid - &
+                    fe_lo)
+            endif
+            if (act1) then
+              t(i, j + 1, k, nn, itr) = t(i, j + 1, k, nn, itr) - dtpp1 * &
+                   (up3_fx(i + 1, j + 1, k, ts, itr, west, east, nx) - &
+                    up3_fx(i, j + 1, k, ts, itr, west, east, nx) + &
+                    up3_fe(i, j + 2, k, ts, itr, south, north, ny) - &
+                    fe_mid)
+            endif
           enddo
         enddo
       enddo

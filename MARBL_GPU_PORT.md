@@ -965,6 +965,115 @@ Bit-identical for every build:
 What is left of a Pac hour beyond the clean steps: the MARBL call (~105 ms,
 of which ~85 ms MARBL kernels) and ~35 ms around the forcing step.
 
+## Kernel round after the full-code review (2026-10-08)
+
+A read-only review ranked the remaining bit-identical work by measured
+kernel time. Four agents then each worked in their own copy of the tree on
+disjoint files, under a common brief (`scratchpad/AGENT_BRIEF.md`), while I
+did the exchange and fast-loop items. A change was kept only if it passed
+four tests: MiniPac 1x1 and 2x2 4-step, Pac 4x2 4-step, and MiniPac 2x2
+3-day. The merged build was then retested on the full set.
+
+**Passive tracers** (`passive_column.F90`, `halo.F90`):
+- The all-tracer halo pack/unpack had the 2-wide halo index innermost: 97%
+  of lanes were idle and 8 B were used per 32 B sector. Buffers are now
+  tracer-innermost, `(h*ntr, j, nz)` and `(h*ntr, i, nz)`, and the W/E and
+  S/N unpacks run in one launch each. 10.2 ms -> 0.5 ms per step.
+- `horiz_kernel` became `c4_kernel` (predictor) and `up3_kernel`
+  (corrector):
+  - a 2-D grid replaces the runtime div/mod;
+  - each thread does 20 levels, with the per-column stencil and mask work
+    hoisted out of the level loop;
+  - time slots are passed as separate arrays by sequence association, so
+    loads take the read-only path;
+  - every kernel in the module carries `launch_bounds`. With nvfortran
+    25.9 one bound in a module changes the register limit of the module's
+    unbounded kernels.
+  - 56.5 -> 26.3 ms.
+- `column_col` uses a sliding window (dlt_m(k) = dlt(k-1), dlt_p(k) =
+  dlt(k+1): same operands and order), 4 divides per level instead of 6,
+  and a peeled interior. 41.5 -> 33.9 ms.
+
+**KPP** (`lmd.F90`):
+- One column kernel computes the 3x3-smoothed Rig inline, runs the interior
+  mixing recurrence, and stores Akv/Akt/ghat once. It replaces the 5
+  smoothing kernels, lmd_interior and the per-level KPP kernel.
+- The Vtsq and Rig work is folded into the KPP column sweep. lmd_wm/ws
+  are called only when ssgm < 1, and their last result is reused when the
+  inputs repeat. Dead stores and zero_mix_coefs are gone (proof in the
+  comment of `lmd_zero_deep_frame`).
+- lmd_swr_frac runs once per step: Hz is unchanged between the two
+  lmd_vmix calls, and every reader is interior.
+- Probe steps keep the old path. 30.2 -> 10.2 ms.
+
+**Dycore** (uv_rhs, prsgrd, advect, geom/omega, step3d_t, pre_step3d,
+step3d_uv, column_solve):
+- `fomn` is a static 2-D array.
+- The horizontal momentum kernels are split into upstream and centered
+  versions with point pairs and `(32,16,1)` blocks: 13.4 -> 5.7 ms.
+- prsgrd: a single-sweep column kernel, a frame-only zero kernel and point
+  pairs: 12.2 -> 6.6 ms.
+- Vertical advection carries the thickness slopes up the column (4
+  divides per level instead of 9): 8.5 -> 4.0 ms.
+- add_vert_uv_rhs keeps its recurrences in registers.
+- The omega zero kernel zeroes only Wi(0) and the halo frame.
+- The step3d_t forcing is fused into a new `implicit_tracer_columns_frc`,
+  and the AM3 work is moved into the pre_step3d Thomas sweeps.
+- 26.6 ms per step in total.
+
+**MARBL** (`marbl_interior.F90`, `marbl_sflux.F90`, `marbl_step.F90`,
+new `marbl_carb_helpers.inc`):
+- The PFT counts are compile-time parameters (NAUTO=3, NZOO=1, NPREY=3;
+  set_marbl_par stops if the instance differs). The per-PFT loops are
+  fused and unrolled, tracers are read in place, and tendencies are
+  applied by `emit_tend` with the same expression. The kernel stack went
+  from 2528 B to 280 B, still at 255 registers.
+- `prd` lives in constant memory.
+- The temperature function is computed once per level and shared by PFTs
+  with the same parameters.
+- The carbonate helpers are included into the module, so they inline.
+- zsat is computed only once history staging starts.
+- The solver-failure report is a device reduction.
+- interior 71.5 -> 29.8 ms and carb 11.0 -> 6.3 ms per hourly call.
+
+**Fast loop** (`obc.F90`, `step2d.F90`, `halo.F90`):
+- u2dbc and v2dbc run as one launch (`uv2dbc`). They write different
+  arrays and read each other only at kstp.
+- The zeta/ubar/vbar exchange waits on an event recorded after its pack
+  instead of on the whole stream.
+- accumulate_boundary_avg1 is queued behind the pack, so it runs during
+  the MPI transfer. It reads only physical-edge cells, which no exchange
+  writes.
+- The W/E unpacks run in one launch.
+- Fast-loop phase 22.7 -> 17.4 ms per step.
+
+Pac 8x1 strips, 3-day run:
+
+| | mean step | median | p10 | 4-step cycle (s) |
+|---|---|---|---|---|
+| before (098e783 + forcing work) | 0.308 s | 0.275 s | 0.271 s | 0.291 0.273 0.378 0.290 |
+| after | 0.201 s | 0.178 s | 0.172 s | 0.186 0.196 0.221 0.202 |
+
+- GPU busy on a clean step: 257.5 -> 163.3 ms. On the MARBL step: 342.8 ->
+  200.0 ms.
+- Stepping is 91 -> 64 s, but the walltime stays ~4:30. Init (~97 s) and
+  the end-of-run writer backlog (~107 s after the last step) are now 75% of
+  a 3-day run.
+- `ninfo = 24` instead of 1 saves ~1 ms per step. It is now set in
+  `cases/pac/gpu/namelist_roms_gpu_pac3dS10.nml`.
+
+Notes:
+- **Pre-existing race, not fixed.** u2dbc's closed-edge Neumann copy
+  `ubar(m, 0, kn) = ubar(m, 1, kn)` at m = nx+1 reads a cell that thread 1
+  writes in the same launch. Only closed-wall configurations are affected;
+  both test cases have all four edges open.
+- **Latent, non-default case.** With a non-default `ROMS_GPU_SKIP_DRY`
+  that skips G_MOM but not G_LMD, visc3d reads stale scratch at deep
+  columns. Those values now differ from the old code's.
+- **Builds share TMPDIR.** Concurrent builds in the shared TMPDIR (set by
+  ncarenv) collide with "IILM file version error". Give each build its
+  own TMPDIR.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

@@ -25,6 +25,7 @@ module obc
   public :: zetabc
   public :: u2dbc
   public :: v2dbc
+  public :: uv2dbc
   public :: uv2dbc_corners
   public :: u3dbc
   public :: v3dbc
@@ -301,6 +302,208 @@ contains
       endif
     enddo
   end subroutine v2dbc
+
+  subroutine uv2dbc()
+    ! u2dbc and v2dbc in one launch: thread m runs the ubar body, then the
+    ! vbar body. They write different arrays (ubar / vbar at knew) and each
+    ! reads the other only at kstp, so the results are those of the two
+    ! separate launches.
+    integer(ip) :: m, nx, ny, i0, j0, ks, kn, mmax
+    real(rp) :: cff, hx, cx, zx, cy, cext, dtf
+    real(rp) :: g0m, g0c, g1m, g1c
+    logical :: ew, ee, es, en, ow, oe, os, on
+    nx = decomp%nx; ny = decomp%ny
+    ks = kstp; kn = knew; dtf = dtfast
+    ew = decomp%edge_w; ee = decomp%edge_e; es = decomp%edge_s; en = decomp%edge_n
+    ow = obc_west; oe = obc_east; os = obc_south; on = obc_north
+    if (.not. (ew .or. ee .or. es .or. en)) return
+    i0 = 1
+    if (ew) i0 = 2
+    j0 = 1
+    if (es) j0 = 2
+    mmax = max(nx, ny) + 1
+    CUF_DO1
+    do m = 0, mmax
+      if (m >= 1 .and. m <= ny) then
+        if (ew) then
+          if (ow) then
+            cff = 0.5_rp * (h(0, m) + h(1, m))
+            hx = sqrt(g / max(cff, 1.0_rp))
+            cx = dtf * cff * hx * 0.5_rp * (pm(0, m) + pm(1, m))
+            zx = (0.5_rp + cx) * zeta(1, m, ks) + (0.5_rp - cx) * zeta(0, m, ks)
+            if (cx > cx_lim) then
+              zx = zx + (zeta(1, m, kn) + cx * zeta(0, m, ks) - (1.0_rp + cx) * zeta(1, m, ks)) * &
+                   (1.0_rp - cx_lim / cx)**2
+            endif
+            ubar(1, m, kn) = 0.5_rp * ((1.0_rp - cx) * ubar(1, m, ks) + cx * ubar(2, m, ks) + &
+                 ubar_west(m) - hx * (zx - zeta_west(m)))
+            ubar(1, m, kn) = apply_mask(ubar(1, m, kn), umask(1, m))
+          else
+            ubar(1, m, kn) = 0.0_rp
+          endif
+        endif
+        if (ee) then
+          if (oe) then
+            cff = 0.5_rp * (h(nx, m) + h(nx + 1, m))
+            hx = sqrt(g / max(cff, 1.0_rp))
+            cx = dtf * cff * hx * 0.5_rp * (pm(nx, m) + pm(nx + 1, m))
+            zx = (0.5_rp + cx) * zeta(nx, m, ks) + (0.5_rp - cx) * zeta(nx + 1, m, ks)
+            if (cx > cx_lim) then
+              zx = zx + (zeta(nx, m, kn) + cx * zeta(nx + 1, m, ks) - (1.0_rp + cx) * zeta(nx, m, ks)) * &
+                   (1.0_rp - cx_lim / cx)**2
+            endif
+            ubar(nx + 1, m, kn) = 0.5_rp * ((1.0_rp - cx) * ubar(nx + 1, m, ks) + cx * ubar(nx, m, ks) + &
+                 ubar_east(m) + hx * (zx - zeta_east(m)))
+            ubar(nx + 1, m, kn) = apply_mask(ubar(nx + 1, m, kn), umask(nx + 1, m))
+          else
+            ubar(nx + 1, m, kn) = 0.0_rp
+          endif
+        endif
+      endif
+      ! Tangent (CPU u2dbc_tile): upstream radiation, inflow nudged to
+      ! ubar_south/ubar_north; closed edges fall back to Neumann.
+      ! g0(i) = ubar(i+1,edge) - ubar(i,edge), g1 likewise one row inside.
+      if (es) then
+        if (os) then
+          if (m >= i0 .and. m <= nx) then
+            g0m = ubar(m, 0, ks) - ubar(m - 1, 0, ks)
+            g0c = ubar(m + 1, 0, ks) - ubar(m, 0, ks)
+            g1m = ubar(m, 1, ks) - ubar(m - 1, 1, ks)
+            g1c = ubar(m + 1, 1, ks) - ubar(m, 1, ks)
+            cx = -0.125_rp * dtf * (vbar(m, 1, ks) + vbar(m - 1, 1, ks)) * &
+                 (pn(m, 0) + pn(m - 1, 0) + pn(m, 1) + pn(m - 1, 1))
+            cy = 0.125_rp * dtf * (ubar(m, 0, ks) + ubar(m, 1, ks)) * &
+                 (pm(m, 0) + pm(m - 1, 0) + pm(m, 1) + pm(m - 1, 1))
+            if (cx > 0.0_rp) then
+              cext = 0.0_rp
+            else
+              cext = -cx; cx = 0.0_rp
+            endif
+            ubar(m, 0, kn) = (1.0_rp - cx) * (ubar(m, 0, ks) &
+                 - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c) &
+                 + cx * (ubar(m, 1, ks) - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c)
+            ubar(m, 0, kn) = ((1.0_rp - cext) * ubar(m, 0, kn) + cext * ubar_south(m)) * umask(m, 0)
+          endif
+        elseif (m >= 1 .and. m <= nx + 1) then
+          ubar(m, 0, kn) = ubar(m, 1, kn)
+        endif
+      endif
+      if (en) then
+        if (on) then
+          if (m >= i0 .and. m <= nx) then
+            g0m = ubar(m, ny, ks) - ubar(m - 1, ny, ks)
+            g0c = ubar(m + 1, ny, ks) - ubar(m, ny, ks)
+            g1m = ubar(m, ny + 1, ks) - ubar(m - 1, ny + 1, ks)
+            g1c = ubar(m + 1, ny + 1, ks) - ubar(m, ny + 1, ks)
+            cx = 0.125_rp * dtf * (vbar(m, ny + 1, ks) + vbar(m - 1, ny + 1, ks)) * &
+                 (pn(m, ny) + pn(m - 1, ny) + pn(m, ny + 1) + pn(m - 1, ny + 1))
+            cy = 0.125_rp * dtf * (ubar(m, ny, ks) + ubar(m, ny + 1, ks)) * &
+                 (pm(m, ny) + pm(m - 1, ny) + pm(m, ny + 1) + pm(m - 1, ny + 1))
+            if (cx > 0.0_rp) then
+              cext = 0.0_rp
+            else
+              cext = -cx; cx = 0.0_rp
+            endif
+            ubar(m, ny + 1, kn) = (1.0_rp - cx) * (ubar(m, ny + 1, ks) &
+                 - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c) &
+                 + cx * (ubar(m, ny, ks) - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c)
+            ubar(m, ny + 1, kn) = ((1.0_rp - cext) * ubar(m, ny + 1, kn) + &
+                 cext * ubar_north(m)) * umask(m, ny + 1)
+          endif
+        elseif (m >= 1 .and. m <= nx + 1) then
+          ubar(m, ny + 1, kn) = ubar(m, ny, kn)
+        endif
+      endif
+      if (m >= 1 .and. m <= nx) then
+        if (es) then
+          if (os) then
+            cff = 0.5_rp * (h(m, 0) + h(m, 1))
+            hx = sqrt(g / max(cff, 1.0_rp))
+            cx = dtf * cff * hx * 0.5_rp * (pn(m, 0) + pn(m, 1))
+            zx = (0.5_rp + cx) * zeta(m, 1, ks) + (0.5_rp - cx) * zeta(m, 0, ks)
+            if (cx > cx_lim) then
+              zx = zx + (zeta(m, 1, kn) + cx * zeta(m, 0, ks) - (1.0_rp + cx) * zeta(m, 1, ks)) * &
+                   (1.0_rp - cx_lim / cx)**2
+            endif
+            vbar(m, 1, kn) = 0.5_rp * ((1.0_rp - cx) * vbar(m, 1, ks) + cx * vbar(m, 2, ks) + &
+                 vbar_south(m) - hx * (zx - zeta_south(m)))
+            vbar(m, 1, kn) = apply_mask(vbar(m, 1, kn), vmask(m, 1))
+          else
+            vbar(m, 1, kn) = 0.0_rp
+          endif
+        endif
+        if (en) then
+          if (on) then
+            cff = 0.5_rp * (h(m, ny) + h(m, ny + 1))
+            hx = sqrt(g / max(cff, 1.0_rp))
+            cx = dtf * cff * hx * 0.5_rp * (pn(m, ny) + pn(m, ny + 1))
+            zx = (0.5_rp + cx) * zeta(m, ny, ks) + (0.5_rp - cx) * zeta(m, ny + 1, ks)
+            if (cx > cx_lim) then
+              zx = zx + (zeta(m, ny, kn) + cx * zeta(m, ny + 1, ks) - (1.0_rp + cx) * zeta(m, ny, ks)) * &
+                   (1.0_rp - cx_lim / cx)**2
+            endif
+            vbar(m, ny + 1, kn) = 0.5_rp * ((1.0_rp - cx) * vbar(m, ny + 1, ks) + cx * vbar(m, ny, ks) + &
+                 vbar_north(m) + hx * (zx - zeta_north(m)))
+            vbar(m, ny + 1, kn) = apply_mask(vbar(m, ny + 1, kn), vmask(m, ny + 1))
+          else
+            vbar(m, ny + 1, kn) = 0.0_rp
+          endif
+        endif
+      endif
+      ! Tangent (CPU v2dbc_tile), transpose of u2dbc.
+      if (ew) then
+        if (ow) then
+          if (m >= j0 .and. m <= ny) then
+            g0m = vbar(0, m, ks) - vbar(0, m - 1, ks)
+            g0c = vbar(0, m + 1, ks) - vbar(0, m, ks)
+            g1m = vbar(1, m, ks) - vbar(1, m - 1, ks)
+            g1c = vbar(1, m + 1, ks) - vbar(1, m, ks)
+            cx = -0.125_rp * dtf * (ubar(1, m, ks) + ubar(1, m - 1, ks)) * &
+                 (pm(0, m) + pm(0, m - 1) + pm(1, m) + pm(1, m - 1))
+            cy = 0.125_rp * dtf * (vbar(0, m, ks) + vbar(1, m, ks)) * &
+                 (pn(0, m) + pn(0, m - 1) + pn(1, m) + pn(1, m - 1))
+            if (cx > 0.0_rp) then
+              cext = 0.0_rp
+            else
+              cext = -cx; cx = 0.0_rp
+            endif
+            vbar(0, m, kn) = (1.0_rp - cx) * (vbar(0, m, ks) &
+                 - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c) &
+                 + cx * (vbar(1, m, ks) - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c)
+            vbar(0, m, kn) = ((1.0_rp - cext) * vbar(0, m, kn) + cext * vbar_west(m)) * vmask(0, m)
+          endif
+        elseif (m >= 1 .and. m <= ny + 1) then
+          vbar(0, m, kn) = vbar(1, m, kn)
+        endif
+      endif
+      if (ee) then
+        if (oe) then
+          if (m >= j0 .and. m <= ny) then
+            g0m = vbar(nx, m, ks) - vbar(nx, m - 1, ks)
+            g0c = vbar(nx, m + 1, ks) - vbar(nx, m, ks)
+            g1m = vbar(nx + 1, m, ks) - vbar(nx + 1, m - 1, ks)
+            g1c = vbar(nx + 1, m + 1, ks) - vbar(nx + 1, m, ks)
+            cx = 0.125_rp * dtf * (ubar(nx + 1, m, ks) + ubar(nx + 1, m - 1, ks)) * &
+                 (pm(nx, m) + pm(nx, m - 1) + pm(nx + 1, m) + pm(nx + 1, m - 1))
+            cy = 0.125_rp * dtf * (vbar(nx, m, ks) + vbar(nx + 1, m, ks)) * &
+                 (pn(nx, m) + pn(nx, m - 1) + pn(nx + 1, m) + pn(nx + 1, m - 1))
+            if (cx > 0.0_rp) then
+              cext = 0.0_rp
+            else
+              cext = -cx; cx = 0.0_rp
+            endif
+            vbar(nx + 1, m, kn) = (1.0_rp - cx) * (vbar(nx + 1, m, ks) &
+                 - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c) &
+                 + cx * (vbar(nx, m, ks) - max(cy, 0.0_rp) * g0m - min(cy, 0.0_rp) * g0c)
+            vbar(nx + 1, m, kn) = ((1.0_rp - cext) * vbar(nx + 1, m, kn) + &
+                 cext * vbar_east(m)) * vmask(nx + 1, m)
+          endif
+        elseif (m >= 1 .and. m <= ny + 1) then
+          vbar(nx + 1, m, kn) = vbar(nx, m, kn)
+        endif
+      endif
+    enddo
+  end subroutine uv2dbc
 
   subroutine uv2dbc_corners()
     ! Corner values of ubar/vbar(knew) from the adjacent edge values

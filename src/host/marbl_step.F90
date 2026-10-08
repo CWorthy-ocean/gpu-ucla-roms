@@ -12,6 +12,9 @@ module marbl_gpu
   use gpu_state
   use time_state
   use arch_mod, only: sync_arch
+#ifdef USE_CUDA
+  use arch_mod, only: work_stream
+#endif
   use nc_io
   use frc_io, only: init_bgc_forcing, set_bgc_forces, uwnd, vwnd, bgc_frc_on
   use passive_mod, only: ntp, tp, set_passive_marbl, passive_marbl, passive_name
@@ -23,6 +26,7 @@ module marbl_gpu
   use cudafor
 #endif
   implicit none
+#include "cuf_launch.inc"
   private
 
   logical, public :: marbl_on = .false.
@@ -31,6 +35,11 @@ module marbl_gpu
   integer(ip), public :: marbl_timestep_ratio = 1
   real(rp), public :: xco2_default = 284.7_rp       ! ppm when no xco2 forcing (CPU default)
   integer(ip) :: ncalls = 0
+  ! The saturation depths (zsatcalc/zsatarag) are read only by the history
+  ! staging. A run that writes history stages its initial record before the
+  ! first MARBL call (init_output), so his_staged tells whether any record
+  ! can ever need them; without history they are not computed.
+  logical :: his_staged = .false.
   real(rp), parameter :: Cp = 3985.0_rp
 
   ! history diagnostics (2-D, surface flux module slots)
@@ -135,7 +144,7 @@ contains
   ! One MARBL call: at the end of the tracer step (after the passive
   ! corrector and its open boundaries), as the CPU driver.
   subroutine marbl_gpu_step()
-    integer(ip) :: i, j, m, nx, ny, nz, nn, islot, c
+    integer(ip) :: i, j, m, nx, ny, nz, nn, islot, c, nsf, nit
     real(rp) :: dtm, rc, tfrc
     if (.not. marbl_on) return
     if (mod(iic, marbl_timestep_ratio) /= 0) return
@@ -151,9 +160,7 @@ contains
     frc_slot = islot
     call set_bgc_forces(tfrc, sf_dust, sf_iron, sf_nox, sf_nhy, sf_xco2, sf_xco2_alt)
     ! wind speed squared (bulk winds on the device) and shortwave in W/m2
-#ifdef USE_CUDA
-    !$cuf kernel do(2) <<<*,*>>>
-#endif
+    CUF_DO2
     do j = 1, ny
       do i = 1, nx
         sf_u10sqr(i, j) = (uwnd(i, j)**2) + (vwnd(i, j)**2)
@@ -163,9 +170,7 @@ contains
     ! surface fluxes, applied to the top layer of slot nnew
     call marbl_sflux_compute(msf, ntp, nz, nz, nn, tp, nt, t, rmask)
     ! wet columns c of the interior are tp columns c (gpu_state, tpcol)
-#ifdef USE_CUDA
-    !$cuf kernel do(2) <<<*,*>>>
-#endif
+    CUF_DO2
     do m = 1, ntp
       do c = 1, nwet
         i = wet_i(c); j = wet_j(c)
@@ -175,14 +180,23 @@ contains
     enddo
     ! interior: carbonate chemistry, then the column ecosystem/sinking sweep
     call marbl_carbonate_compute(ntp, nz, nn, 3_ip, tp, nt, t, z_r, rmask)
-    call marbl_zsat_compute(nz, z_r, z_w, rmask)
+    if (his_staged) call marbl_zsat_compute(nz, z_r, z_w, rmask)
     call marbl_interior_compute(ntp, nz, nn, 3_ip, tp, nt, t, z_r, z_w, Hz, rmask, sf_dust, dtm, .false.)
     ncalls = ncalls + 1
     if (ncalls <= 3 .or. mod(ncalls, 24) == 0) then
-      call sync_arch()
+      ! failure counts as a device reduction (its result waits for the
+      ! kernels before it), so the managed sf_err/it_err stay on the device
+      nsf = 0; nit = 0
+      CUF_DO2
+      do j = 1, ny
+        do i = 1, nx
+          if (sf_err(i, j) /= 0) nsf = nsf + 1
+          nit = nit + it_err(i, j)
+        enddo
+      enddo
       write(*,'(a,i0,a,i0,a,i0,a,i0)') 'MARBL call ', ncalls, ' at iic ', iic, &
-           '  surface solver failures ', count(sf_err(1:nx, 1:ny) /= 0), &
-           '  interior solver failures ', sum(it_err(1:nx, 1:ny))
+           '  surface solver failures ', nsf, &
+           '  interior solver failures ', nit
     endif
   end subroutine marbl_gpu_step
 
@@ -220,6 +234,7 @@ contains
     integer, intent(in) :: i0, i1, j0, j1, di, dj
     integer :: n, nz
     if (.not. marbl_on) return
+    his_staged = .true.
     nz = decomp%nz
     do n = 1, NHIS
       call io_stage_2d(trim(his_name(n)), sf_diag(decomp%is, decomp%js, his_slot(n)), i0, i1, j0, j1, di, dj)

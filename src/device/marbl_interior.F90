@@ -24,22 +24,46 @@ module marbl_interior_mod
   use arch_mod, only: work_stream
 #endif
   use marbl_host, only: marbl_par_t, MA, MZ, MP, NTRMAX, ND_IT, marbl_host_fill_par
-  use marbl_sflux_mod, only: co2_coeffs, ta_fn, drtsafe1, pcorr, T0_Kelvin, salt_min, dic_min, alk_min
+  ! the carbonate helpers (co2_coeffs, ta_fn, drtsafe1, pcorr) are this
+  ! module's own copies (#include below), so carb_kernel inlines them
+  use marbl_sflux_mod, only: T0_Kelvin, salt_min, dic_min, alk_min, xacc, max_bracket_grow_it, maxit
 #ifdef USE_CUDA
   use cudafor
 #endif
   implicit none
   private
 
+  ! Compile-time PFT counts of the configuration the kernels are built for
+  ! (MARBL's CESM2 PFT defaults: sp, diat, diaz; zoo; three prey classes).
+  ! Fixed counts let every per-PFT loop unroll and its arrays live in
+  ! registers; set_marbl_par stops if the MARBL instance differs.
+  integer, parameter :: NAUTO = 3, NZOO = 1, NPREY = 3
+
   ! Parameter table (set once by set_marbl_par): a host copy and, in the
-  ! CUDA build, a static device copy read by the kernels (a managed
-  ! derived-type module variable gave illegal-address errors at run time).
+  ! CUDA build, a constant-memory copy read by the kernels (uniform
+  ! across a warp; a managed derived-type module variable gave
+  ! illegal-address errors at run time).
   type(marbl_par_t), public, save :: pr
+  ! derived flags: the temperature function of autotroph n (tf_same_a) or
+  ! zooplankton n (tf_same_z) is the same expression on the same operands
+  ! as autotroph 1's, so its value is reused
+  type :: marbl_xpar_t
+    integer(ip) :: tf_same_a(MA) = 0, tf_same_z(MZ) = 0
+    ! 1: prey class p of every grazer is autotroph p alone (no zooplankton
+    ! prey), so the grazing needs no gather/scatter over the prey lists
+    integer(ip) :: graze_ident = 0
+  end type marbl_xpar_t
+  type(marbl_xpar_t), save :: px
 #ifdef USE_CUDA
-  type(marbl_par_t), device, save :: prd
+  type(marbl_par_t), constant :: prd
+  type(marbl_xpar_t), constant :: pxd
 #define PR prd
+#define PX pxd
+#define TRK pp
 #else
 #define PR pr
+#define PX px
+#define TRK rp
 #endif
 
   ! K1 outputs (is:ie, js:je, nz): in-situ temperature, carbonate species,
@@ -82,11 +106,85 @@ contains
 
   subroutine set_marbl_par()
     type(marbl_par_t) :: h
+    type(marbl_xpar_t) :: x
+    integer(ip) :: n, m, prey, pred, cnt(NTRMAX)
+    logical :: ok
     call marbl_host_fill_par(h)
+    ! the kernels are compiled for NAUTO/NZOO/NPREY PFTs
+    if (h%nauto /= NAUTO .or. h%nzoo /= NZOO .or. h%nprey /= NPREY) then
+      write(*,'(a,3i4,a,3i4)') 'set_marbl_par: MARBL has nauto, nzoo, nprey =', h%nauto, h%nzoo, h%nprey, &
+           '; the interior kernel is built for', NAUTO, NZOO, NPREY
+      error stop 'set_marbl_par: change NAUTO/NZOO/NPREY in marbl_interior.F90'
+    endif
+    do pred = 1, NZOO
+      do prey = 1, NPREY
+        ok = h%g_nauto(prey, pred) >= 0 .and. h%g_nauto(prey, pred) <= NAUTO .and. &
+             h%g_nzoo(prey, pred) >= 0 .and. h%g_nzoo(prey, pred) <= NZOO
+        if (ok) then
+          do n = 1, h%g_nauto(prey, pred)
+            ok = ok .and. h%g_auto(n, prey, pred) >= 1 .and. h%g_auto(n, prey, pred) <= NAUTO
+          enddo
+          do n = 1, h%g_nzoo(prey, pred)
+            ok = ok .and. h%g_zoo(n, prey, pred) >= 1 .and. h%g_zoo(n, prey, pred) <= NZOO
+          enddo
+        endif
+        if (.not. ok) error stop 'set_marbl_par: grazing prey lists outside NAUTO/NZOO'
+      enddo
+    enddo
+    ! Every tracer must receive exactly one tendency: the kernel updates
+    ! only the tracers with a tendency (the old loop also rewrote the
+    ! others as tracer + 0*dt) and the host path returns them in place.
+    cnt = 0
+    call mark(h%po4); call mark(h%no3); call mark(h%sio3); call mark(h%nh4); call mark(h%fe)
+    call mark(h%lig); call mark(h%o2); call mark(h%dic); call mark(h%dica); call mark(h%alk)
+    call mark(h%alka); call mark(h%doc); call mark(h%don); call mark(h%dop); call mark(h%dopr)
+    call mark(h%donr); call mark(h%docr)
+    do n = 1, NZOO
+      call mark(h%z_c(n))
+    enddo
+    do n = 1, NAUTO
+      call mark(h%a_c(n)); call mark(h%a_chl(n)); call mark(h%a_fe(n))
+      if (h%a_p(n) > 0) call mark(h%a_p(n))
+      if (h%a_si(n) > 0) call mark(h%a_si(n))
+      if (h%a_caco3(n) > 0) call mark(h%a_caco3(n))
+    enddo
+    do m = 1, h%ntr
+      if (cnt(m) /= 1) error stop 'set_marbl_par: a MARBL tracer has no (or two) tendencies'
+    enddo
+    ok = (NPREY <= NAUTO)
+    do pred = 1, NZOO
+      do prey = 1, NPREY
+        ok = ok .and. h%g_nauto(prey, pred) == 1 .and. h%g_nzoo(prey, pred) == 0
+        if (ok) ok = (h%g_auto(1, prey, pred) == prey)
+      enddo
+    enddo
+    if (ok) x%graze_ident = 1
+    ! temperature-function reuse: same form; Tref for forms 1 and 2; Ea for form 2
+    do n = 1, NAUTO
+      if (same_tfunc(h%a_tfunc(n), h%a_Tref(n), h%a_Ea(n))) x%tf_same_a(n) = 1
+    enddo
+    do n = 1, NZOO
+      if (same_tfunc(h%z_tfunc(n), h%z_Tref(n), h%z_Ea(n))) x%tf_same_z(n) = 1
+    enddo
     pr = h
+    px = x
 #ifdef USE_CUDA
     prd = h
+    pxd = x
 #endif
+  contains
+    subroutine mark(m)
+      integer(ip), intent(in) :: m
+      if (m < 1 .or. m > h%ntr) error stop 'set_marbl_par: tracer index out of range'
+      cnt(m) = cnt(m) + 1
+    end subroutine mark
+    logical function same_tfunc(iopt, Tref, Ea)
+      integer(ip), intent(in) :: iopt
+      real(rp), intent(in) :: Tref, Ea
+      same_tfunc = (iopt == h%a_tfunc(1))
+      if (iopt == 1 .or. iopt == 2) same_tfunc = same_tfunc .and. (Tref == h%a_Tref(1))
+      if (iopt == 2) same_tfunc = same_tfunc .and. (Ea == h%a_Ea(1))
+    end function same_tfunc
   end subroutine set_marbl_par
 
   subroutine alloc_marbl_interior(nz, ntr, keep)
@@ -115,6 +213,8 @@ contains
   !===========================================================================
   ! device helpers
   !===========================================================================
+
+#include "marbl_carb_helpers.inc"
 
   ! marbl_temperature: adiabatic temperature gradient (degC/bar)
   DEVICE_ATTR
@@ -256,34 +356,62 @@ contains
     endif
   end subroutine tfunc1
 
+  ! Tendency t of tracer m: applied in place (lapply /= 0: tracer + t*dtm,
+  ! the model update) or stored as the tendency itself (lapply = 0, host
+  ! reference path); lsave /= 0 also keeps it in it_tend (tests).
+  DEVICE_ATTR
+  subroutine emit_tend(trv, m, t, dtm, lapply, lsave, i, j, kk)
+    real(TRK), intent(inout) :: trv(NTRMAX)
+    integer(ip), intent(in) :: m, lapply, lsave, i, j, kk
+    real(rp), intent(in) :: t, dtm
+    if (lapply /= 0) then
+      trv(m) = real(real(trv(m), rp) + t * dtm, TRK)
+    else
+      trv(m) = real(t, TRK)
+    endif
+    if (lsave /= 0) it_tend(i, j, kk, m) = t
+  end subroutine emit_tend
+
   !===========================================================================
   ! One level of the interior ecosystem for one column (MARBL level k; k = 1
   ! is the surface). State st is updated for the next level.
+  ! trv: the column's tracers at this level (in the kernel the tracer array
+  ! itself; tracers are read once at the start, then each tendency is
+  ! emitted with emit_tend). PFT counts are the compile-time NAUTO/NZOO/
+  ! NPREY and every per-PFT array is indexed by unrolled loop counters only,
+  ! so the arrays live in registers; the indirect grazing indices are
+  ! resolved by selects in the same accumulation order as MARBL.
   !===========================================================================
   DEVICE_ATTR
   subroutine level_step(k, kmt, dz, dz1, zw, zt, tins, h2co3, co3, co3a, co3sat, dust_flux, &
-                        tr, st, tend, dg, ldg)
-    integer(ip), intent(in) :: k, kmt, ldg
-    real(rp), intent(in) :: dz, dz1, zw, zt, tins, h2co3, co3, co3a, co3sat, dust_flux
-    real(rp), intent(in) :: tr(NTRMAX)
+                        trv, st, dtm, lapply, dg, ldg, lsave, i, j, kk)
+    integer(ip), intent(in) :: k, kmt, lapply, ldg, lsave, i, j, kk
+    real(rp), intent(in) :: dz, dz1, zw, zt, tins, h2co3, co3, co3a, co3sat, dust_flux, dtm
+    real(TRK), intent(inout) :: trv(NTRMAX)
     type(sink_t), intent(inout) :: st
-    real(rp), intent(out) :: tend(NTRMAX), dg(ND_IT)
+    real(rp), intent(out) :: dg(ND_IT)
 
-    integer(ip) :: m, n, j, i, pred, prey, nauto, nzoo, ntr
-    real(rp) :: trl(NTRMAX)
+    integer(ip) :: m, n, jj, pred, prey, na, imp_n
     ! autotroph locals and derived terms
-    real(rp) :: aChl(MA), aC(MA), aP(MA), aFe(MA), aSi(MA), aCaCO3(MA)
-    real(rp) :: Tfa(MA), Tfz(MZ), thetaC(MA), Qp(MA), gQp(MA), Qfe(MA), gQfe(MA), Qsi(MA), gQsi(MA), QCaCO3(MA)
-    real(rp) :: Pprime(MA), VNO3(MA), VNH4(MA), VNtot(MA), VFe(MA), f_nut(MA), VPO4(MA), VDOP(MA), VPtot(MA)
-    real(rp) :: VSiO3(MA), VCO2(MA), light_lim(MA), PCphoto(MA), photoacc(MA), photoC(MA)
-    real(rp) :: NO3_V(MA), NH4_V(MA), PO4_V(MA), DOP_V(MA), photoFe(MA), photoSi(MA), CaCO3_form(MA)
-    real(rp) :: Nfix(MA), Nexcrete(MA), auto_loss(MA), auto_agg(MA), auto_loss_poc(MA), auto_loss_doc(MA)
-    real(rp) :: auto_loss_dic(MA), auto_graze(MA), auto_graze_zootot(MA), auto_graze_poc(MA)
-    real(rp) :: auto_graze_doc(MA), auto_graze_dic(MA), remaining_P_pop(MA), remaining_P_dop(MA), remaining_P_dip(MA)
+    real(rp) :: aChl(NAUTO), aC(NAUTO), aP(NAUTO), aFe(NAUTO), aSi(NAUTO), aCaCO3(NAUTO)
+    real(rp) :: Tfa(NAUTO), Tfz(NZOO), thetaC(NAUTO), Qp(NAUTO), gQp(NAUTO), Qfe(NAUTO), gQfe(NAUTO)
+    real(rp) :: Qsi(NAUTO), gQsi(NAUTO), QCaCO3(NAUTO)
+    real(rp) :: Pprime(NAUTO), VNO3(NAUTO), VNH4(NAUTO), VNtot(NAUTO), VFe(NAUTO), f_nut(NAUTO)
+    real(rp) :: VPO4(NAUTO), VDOP(NAUTO), VPtot(NAUTO)
+    real(rp) :: VSiO3(NAUTO), VCO2(NAUTO), light_lim(NAUTO), PCphoto(NAUTO), photoacc(NAUTO), photoC(NAUTO)
+    real(rp) :: NO3_V(NAUTO), NH4_V(NAUTO), PO4_V(NAUTO), DOP_V(NAUTO), photoFe(NAUTO), photoSi(NAUTO)
+    real(rp) :: CaCO3_form(NAUTO)
+    real(rp) :: Nfix(NAUTO), Nexcrete(NAUTO), auto_loss(NAUTO), auto_agg(NAUTO), auto_loss_poc(NAUTO)
+    real(rp) :: auto_loss_doc(NAUTO)
+    real(rp) :: auto_loss_dic(NAUTO), auto_graze(NAUTO), auto_graze_zootot(NAUTO), auto_graze_poc(NAUTO)
+    real(rp) :: auto_graze_doc(NAUTO), auto_graze_dic(NAUTO), remaining_P_pop(NAUTO), remaining_P_dop(NAUTO)
+    real(rp) :: remaining_P_dip(NAUTO)
     ! zooplankton
-    real(rp) :: zooC(MZ), Zprime(MZ), zoo_loss(MZ), zoo_loss_bulk(MZ), zoo_loss_basal(MZ), zoo_graze(MZ)
-    real(rp) :: zoo_graze_zootot(MZ), zoo_graze_poc(MZ), zoo_graze_doc(MZ), zoo_graze_dic(MZ), x_graze_zoo(MZ)
-    real(rp) :: f_zoo_detr(MZ), zoo_loss_poc(MZ), zoo_loss_doc(MZ), zoo_loss_dic(MZ)
+    real(rp) :: zooC(NZOO), Zprime(NZOO), zoo_loss(NZOO), zoo_loss_bulk(NZOO), zoo_loss_basal(NZOO)
+    real(rp) :: zoo_graze(NZOO)
+    real(rp) :: zoo_graze_zootot(NZOO), zoo_graze_poc(NZOO), zoo_graze_doc(NZOO), zoo_graze_dic(NZOO)
+    real(rp) :: x_graze_zoo(NZOO)
+    real(rp) :: f_zoo_detr(NZOO), zoo_loss_poc(NZOO), zoo_loss_doc(NZOO), zoo_loss_dic(NZOO)
     ! scalars
     real(rp) :: totChl, work1, work2, work3, work4, kpardz, wpar, par_k, par_avg
     real(rp) :: f_loss_thres, C_loss_thres, PCmax, lls, pcs, pchl, pacc, picpoc, remaining_P
@@ -305,38 +433,41 @@ contains
     real(rp) :: cac_rho, sio_rho, dst_rho, dst_gamma, poc_mass, cac_mass, sio_mass, dst_mass, cac_gamma, sio_gamma
     real(rp) :: dst_diss0, Fe_desorb_in
     real(rp) :: O2l, NO3l, NH4l, PO4l, SiO3l, Fel, Ligl, DOCl, DONl, DOPl, DOPrl, DONrl, DOCrl
+    ! grazing gather/scatter
+    real(rp) :: pp_n, qc_n, gzt, gpoc, gdoc
+    ! PFT sums (zero-started, PFT order) and per-PFT terms of later sums
+    real(rp) :: s_no3v, s_nh4v, s_po4v, s_dopv, s_photoFe, s_aldoc, s_aldic, s_alpoc, s_aagg
+    real(rp) :: s_agdoc, s_rpdop, s_agpoc, s_rppop, s_agdic, s_rpdip
+    real(rp) :: s_zlpoc, s_zgpoc, s_zldic, s_zgdic
+    real(rp) :: afe(NAUTO), bfe(NAUTO), cfe(NAUTO), xsi(NAUTO), ydic(NAUTO), zalk(NAUTO)
+    ! tendencies of the named tracers
+    real(rp) :: t_no3, t_nh4, t_fe, t_lig, t_sio3, t_po4, t_doc, t_docr, t_don, t_donr, t_dop, t_dopr
+    real(rp) :: t_dic, t_dica, t_alk, t_alka, t_o2, photoC_tot
 
-    ntr = PR%ntr; nauto = PR%nauto; nzoo = PR%nzoo
-    do m = 1, NTRMAX
-      tend(m) = c0
+    !--- setup_local_tracers (max(0,.) of each tracer read)
+    PO4l = max(c0, real(trv(PR%po4), rp)); NO3l = max(c0, real(trv(PR%no3), rp))
+    SiO3l = max(c0, real(trv(PR%sio3), rp)); NH4l = max(c0, real(trv(PR%nh4), rp))
+    Fel = max(c0, real(trv(PR%fe), rp)); Ligl = max(c0, real(trv(PR%lig), rp))
+    O2l = max(c0, real(trv(PR%o2), rp)); DOCl = max(c0, real(trv(PR%doc), rp))
+    DONl = max(c0, real(trv(PR%don), rp)); DOPl = max(c0, real(trv(PR%dop), rp))
+    DOPrl = max(c0, real(trv(PR%dopr), rp)); DONrl = max(c0, real(trv(PR%donr), rp))
+    DOCrl = max(c0, real(trv(PR%docr), rp))
+    do n = 1, NZOO
+      zooC(n) = max(c0, real(trv(PR%z_c(n)), rp))
     enddo
-    do m = 1, ND_IT
-      dg(m) = c0
-    enddo
-
-    !--- setup_local_tracers
-    do m = 1, ntr
-      trl(m) = max(c0, tr(m))
-    enddo
-    PO4l = trl(PR%po4); NO3l = trl(PR%no3); SiO3l = trl(PR%sio3); NH4l = trl(PR%nh4); Fel = trl(PR%fe)
-    Ligl = trl(PR%lig); O2l = trl(PR%o2); DOCl = trl(PR%doc); DONl = trl(PR%don); DOPl = trl(PR%dop)
-    DOPrl = trl(PR%dopr); DONrl = trl(PR%donr); DOCrl = trl(PR%docr)
-    do n = 1, nzoo
-      zooC(n) = trl(PR%z_c(n))
-    enddo
-    do n = 1, nauto
-      aChl(n) = trl(PR%a_chl(n))
-      aC(n) = trl(PR%a_c(n))
+    do n = 1, NAUTO
+      aChl(n) = max(c0, real(trv(PR%a_chl(n)), rp))
+      aC(n) = max(c0, real(trv(PR%a_c(n)), rp))
       if (PR%a_p(n) > 0) then
-        aP(n) = trl(PR%a_p(n))
+        aP(n) = max(c0, real(trv(PR%a_p(n)), rp))
       else
         aP(n) = PR%a_Qp_fixed(n) * aC(n)
       endif
-      aFe(n) = trl(PR%a_fe(n))
+      aFe(n) = max(c0, real(trv(PR%a_fe(n)), rp))
       aSi(n) = c0
-      if (PR%a_si(n) > 0) aSi(n) = trl(PR%a_si(n))
+      if (PR%a_si(n) > 0) aSi(n) = max(c0, real(trv(PR%a_si(n)), rp))
       aCaCO3(n) = c0
-      if (PR%a_caco3(n) > 0) aCaCO3(n) = trl(PR%a_caco3(n))
+      if (PR%a_caco3(n) > 0) aCaCO3(n) = max(c0, real(trv(PR%a_caco3(n)), rp))
       ! autotroph_zero_consistency_enforce
       if (aChl(n) == c0 .or. aC(n) == c0 .or. aP(n) == c0 .or. aFe(n) == c0 .or. &
           (PR%a_si(n) > 0 .and. aSi(n) == c0)) then
@@ -349,7 +480,7 @@ contains
       kpardz = c0; par_k = c0; par_avg = c0
     else
       totChl = c0
-      do n = 1, nauto
+      do n = 1, NAUTO
         totChl = totChl + aChl(n)
       enddo
       work1 = max(totChl, 0.02_rp)
@@ -369,14 +500,32 @@ contains
       par_avg = st%par_in * (c1 - wpar) / kpardz
     endif
 
-    !--- temperature functions, elemental ratios, Pprime
-    do n = 1, nauto
-      call tfunc1(PR%a_tfunc(n), tins, PR%a_Tref(n), PR%a_Ea(n), PR%Q_10, Tfa(n))
+    !--- temperature functions (a PFT whose functional form and parameters
+    ! equal autotroph 1's reuses that result: the same expression on the
+    ! same operands), elemental ratios, Pprime
+    call tfunc1((PR%a_tfunc(1)), tins, (PR%a_Tref(1)), (PR%a_Ea(1)), (PR%Q_10), Tfa(1))
+    do n = 2, NAUTO
+      if (PX%tf_same_a(n) /= 0) then
+        Tfa(n) = Tfa(1)
+      else
+        call tfunc1((PR%a_tfunc(n)), tins, (PR%a_Tref(n)), (PR%a_Ea(n)), (PR%Q_10), Tfa(n))
+      endif
     enddo
-    do n = 1, nzoo
-      call tfunc1(PR%z_tfunc(n), tins, PR%z_Tref(n), PR%z_Ea(n), PR%Q_10, Tfz(n))
+    do n = 1, NZOO
+      if (PX%tf_same_z(n) /= 0) then
+        Tfz(n) = Tfa(1)
+      else
+        call tfunc1((PR%z_tfunc(n)), tins, (PR%z_Tref(n)), (PR%z_Ea(n)), (PR%Q_10), Tfz(n))
+      endif
     enddo
-    do n = 1, nauto
+    f_loss_thres = min(max((PR%thres_z2_auto - zt) / (PR%thres_z2_auto - PR%thres_z1_auto), c0), c1)
+    ! One loop over the PFTs for the per-PFT terms (MARBL's separate loops
+    ! fused: each PFT's terms depend on that PFT only), with the PFT sums
+    ! MARBL forms later accumulated here in the same order (from zero).
+    s_no3v = c0; s_nh4v = c0; s_po4v = c0; s_dopv = c0; photoC_tot = c0; s_photoFe = c0
+    s_aldoc = c0; s_aldic = c0; s_alpoc = c0; s_aagg = c0; o2_production = c0
+    !dir$ unroll
+    do n = 1, NAUTO
       thetaC(n) = aChl(n) / (aC(n) + epsC)
       if (PR%lvar_ptoc /= 0) then
         Qp(n) = aP(n) / (aC(n) + epsC)
@@ -406,19 +555,12 @@ contains
       endif
       QCaCO3(n) = c0
       if (PR%a_caco3(n) > 0) QCaCO3(n) = min(aCaCO3(n) / (aC(n) + epsC), PR%QCaCO3_max)
-    enddo
-    f_loss_thres = min(max((PR%thres_z2_auto - zt) / (PR%thres_z2_auto - PR%thres_z1_auto), c0), c1)
-    do n = 1, nauto
       if (tins < PR%a_temp_thres(n)) then
         C_loss_thres = f_loss_thres * PR%a_loss_thres2(n)
       else
         C_loss_thres = f_loss_thres * PR%a_loss_thres(n)
       endif
       Pprime(n) = max(aC(n) - C_loss_thres, c0)
-    enddo
-
-    !--- compute_autotroph_uptake
-    do n = 1, nauto
       VNO3(n) = (NO3l / PR%a_kNO3(n)) / (c1 + (NO3l / PR%a_kNO3(n)) + (NH4l / PR%a_kNH4(n)))
       VNH4(n) = (NH4l / PR%a_kNH4(n)) / (c1 + (NO3l / PR%a_kNO3(n)) + (NH4l / PR%a_kNH4(n)))
       if (PR%a_nfixer(n) /= 0) then
@@ -442,10 +584,6 @@ contains
         VCO2(n) = h2co3 / (h2co3 + PR%a_kCO2(n))
         f_nut(n) = min(f_nut(n), VCO2(n))
       endif
-    enddo
-
-    !--- compute_autotroph_photosynthesis (one subcolumn, col_frac = 1)
-    do n = 1, nauto
       if (tins < PR%a_temp_thres(n)) then
         PCmax = c0
       else
@@ -465,10 +603,6 @@ contains
         endif
         photoC(n) = PCphoto(n) * aC(n)
       endif
-    enddo
-
-    !--- compute_autotroph_nutrient_uptake
-    do n = 1, nauto
       if (VNtot(n) > c0) then
         NO3_V(n) = (VNO3(n) / VNtot(n)) * photoC(n) * PR%Q
         NH4_V(n) = (VNH4(n) / VNtot(n)) * photoC(n) * PR%Q
@@ -484,10 +618,6 @@ contains
       photoFe(n) = photoC(n) * gQfe(n)
       photoSi(n) = c0
       if (PR%a_si(n) > 0) photoSi(n) = photoC(n) * gQsi(n)
-    enddo
-
-    !--- compute_autotroph_calcification
-    do n = 1, nauto
       CaCO3_form(n) = c0
       if (PR%a_impcalc(n) /= 0) then
         CaCO3_form(n) = PR%f_prod_sp_CaCO3 * photoC(n)
@@ -505,20 +635,12 @@ contains
         picpoc = min(1.0_rp, max(0.0_rp, -0.48_rp * VPO4(n) + picpoc + 0.48_rp))
         CaCO3_form(n) = picpoc * photoC(n)
       endif
-    enddo
-
-    !--- compute_autotroph_nfixation
-    do n = 1, nauto
       Nfix(n) = c0; Nexcrete(n) = c0
       if (PR%a_nfixer(n) /= 0) then
         work1 = photoC(n) * PR%Q
         Nfix(n) = (work1 * PR%r_Nfix_photo) - NO3_V(n) - NH4_V(n)
         Nexcrete(n) = Nfix(n) + NO3_V(n) + NH4_V(n) - work1
       endif
-    enddo
-
-    !--- compute_autotroph_loss
-    do n = 1, nauto
       auto_loss(n) = PR%a_mort(n) * Pprime(n) * Tfa(n)
       auto_agg(n) = min((PR%a_agg_rate_max(n) * dps) * Pprime(n), PR%a_mort2(n) * Pprime(n)**PR%auto_mort2_exp)
       auto_agg(n) = max((PR%a_agg_rate_min(n) * dps) * Pprime(n), auto_agg(n))
@@ -529,11 +651,37 @@ contains
       endif
       auto_loss_doc(n) = (c1 - PR%labile_ratio) * (auto_loss(n) - auto_loss_poc(n))
       auto_loss_dic(n) = PR%labile_ratio * (auto_loss(n) - auto_loss_poc(n))
+      s_no3v = s_no3v + NO3_V(n)
+      s_nh4v = s_nh4v + NH4_V(n)
+      s_po4v = s_po4v + PO4_V(n)
+      s_dopv = s_dopv + DOP_V(n)
+      photoC_tot = photoC_tot + photoC(n)
+      s_photoFe = s_photoFe + photoFe(n)
+      s_aldoc = s_aldoc + auto_loss_doc(n)
+      s_aldic = s_aldic + auto_loss_dic(n)
+      s_alpoc = s_alpoc + auto_loss_poc(n)
+      s_aagg = s_aagg + auto_agg(n)
+      if (PR%a_nfixer(n) == 0) then
+        o2_production_denom = NO3_V(n) + NH4_V(n)
+        if (o2_production_denom > c0) then
+          o2_production = o2_production + photoC(n) &
+               * ((NO3_V(n) / (NO3_V(n) + NH4_V(n))) / PR%Red_D_C_O2 &
+                  + (NH4_V(n) / (NO3_V(n) + NH4_V(n))) / PR%Remin_D_C_O2)
+        endif
+      else
+        o2_production_denom = NO3_V(n) + NH4_V(n) + Nfix(n)
+        if (o2_production_denom > c0) then
+          o2_production = o2_production + photoC(n) &
+               * ((NO3_V(n) / (NO3_V(n) + NH4_V(n) + Nfix(n))) / PR%Red_D_C_O2 &
+                  + (NH4_V(n) / (NO3_V(n) + NH4_V(n) + Nfix(n))) / PR%Remin_D_C_O2 &
+                  + (Nfix(n) / (NO3_V(n) + NH4_V(n) + Nfix(n))) / PR%Red_D_C_O2_diaz)
+        endif
+      endif
     enddo
 
     !--- compute_Zprime
     f_loss_thres = min(max((PR%thres_z2_zoo - zt) / (PR%thres_z2_zoo - PR%thres_z1_zoo), c0), c1)
-    do n = 1, nzoo
+    do n = 1, NZOO
       C_loss_thres = f_loss_thres * PR%z_loss_thres(n)
       Zprime(n) = max(zooC(n) - C_loss_thres, c0)
       zoo_loss_basal(n) = PR%z_basal(n) * Zprime(n) * Tfz(n)
@@ -541,24 +689,78 @@ contains
       zoo_loss(n) = zoo_loss_basal(n) + zoo_loss_bulk(n)
     enddo
 
-    !--- compute_grazing
-    do n = 1, nauto
+    !--- compute_grazing. Prey members are gathered and the grazing terms
+    ! scattered back with selects over the PFTs (n == index), which adds
+    ! exactly the terms MARBL adds, in the same order.
+    do n = 1, NAUTO
       auto_graze(n) = c0; auto_graze_zootot(n) = c0; auto_graze_poc(n) = c0; auto_graze_doc(n) = c0
     enddo
-    do n = 1, nzoo
+    do n = 1, NZOO
       zoo_graze(n) = c0; zoo_graze_zootot(n) = c0; zoo_graze_poc(n) = c0; zoo_graze_doc(n) = c0
       x_graze_zoo(n) = c0
     enddo
-    do pred = 1, nzoo
+    do pred = 1, NZOO
       work3 = c0
       work4 = c0
-      do prey = 1, PR%nprey
+      if (PX%graze_ident /= 0) then
+      ! prey class prey is autotroph prey alone (MARBL's CESM2 defaults):
+      ! the same terms as below with the gather/scatter resolved
+      do prey = 1, min(NPREY, NAUTO)
         work1 = c0
-        do j = 1, PR%g_nauto(prey, pred)
-          work1 = work1 + Pprime(PR%g_auto(j, prey, pred))
+        work1 = work1 + Pprime(prey)
+        graze_rate = c0
+        if (PR%g_func(prey, pred) == 1) then
+          if (work1 > c0) then
+            graze_rate = PR%g_umax(prey, pred) * Tfz(pred) * zooC(pred) &
+                       * ( work1 / (work1 + PR%g_grz(prey, pred)) )
+          endif
+        else if (PR%g_func(prey, pred) == 2) then
+          if (work1 > c0) then
+            graze_rate = PR%g_umax(prey, pred) * Tfz(pred) * zooC(pred) &
+                       * ( work1**2 / (work1**2 + PR%g_grz(prey, pred)**2) )
+          endif
+        endif
+        if (work1 > c0) then
+          work2 = (Pprime(prey) / work1) * graze_rate
+        else
+          work2 = c0
+        endif
+        auto_graze(prey) = auto_graze(prey) + work2
+        auto_graze_zootot(prey) = auto_graze_zootot(prey) + PR%g_zoofrac(prey, pred) * work2
+        x_graze_zoo(pred) = x_graze_zoo(pred) + PR%g_zoofrac(prey, pred) * work2
+        if (PR%a_impcalc(prey) /= 0) then
+          auto_graze_poc(prey) = auto_graze_poc(prey) &
+               + work2 * max((PR%caco3_poc_min * QCaCO3(prey)), &
+                             min(PR%spc_poc_fac * (Pprime(prey) + 0.6_rp)**1.6_rp, PR%f_graze_sp_poc_lim))
+        else
+          auto_graze_poc(prey) = auto_graze_poc(prey) + PR%g_poc(prey, pred) * work2
+        endif
+        auto_graze_doc(prey) = auto_graze_doc(prey) + PR%g_doc(prey, pred) * work2
+        work3 = work3 + PR%g_fdetr(prey, pred) * (work2 + epsC * epsTinv)
+        work4 = work4 + (work2 + epsC * epsTinv)
+      enddo
+      else
+      do prey = 1, NPREY
+        work1 = c0
+        do jj = 1, NAUTO
+          if (jj <= PR%g_nauto(prey, pred)) then
+            na = PR%g_auto(jj, prey, pred)
+            pp_n = c0
+            do n = 1, NAUTO
+              pp_n = merge(Pprime(n), pp_n, n == na)
+            enddo
+            work1 = work1 + pp_n
+          endif
         enddo
-        do j = 1, PR%g_nzoo(prey, pred)
-          work1 = work1 + Zprime(PR%g_zoo(j, prey, pred))
+        do jj = 1, NZOO
+          if (jj <= PR%g_nzoo(prey, pred)) then
+            na = PR%g_zoo(jj, prey, pred)
+            pp_n = c0
+            do n = 1, NZOO
+              pp_n = merge(Zprime(n), pp_n, n == na)
+            enddo
+            work1 = work1 + pp_n
+          endif
         enddo
         graze_rate = c0
         if (PR%g_func(prey, pred) == 1) then
@@ -572,103 +774,90 @@ contains
                        * ( work1**2 / (work1**2 + PR%g_grz(prey, pred)**2) )
           endif
         endif
-        do j = 1, PR%g_nauto(prey, pred)
-          n = PR%g_auto(j, prey, pred)
-          if (work1 > c0) then
-            work2 = (Pprime(n) / work1) * graze_rate
-          else
-            work2 = c0
+        do jj = 1, NAUTO
+          if (jj <= PR%g_nauto(prey, pred)) then
+            na = PR%g_auto(jj, prey, pred)
+            pp_n = c0; qc_n = c0; imp_n = 0
+            do n = 1, NAUTO
+              pp_n = merge(Pprime(n), pp_n, n == na)
+              qc_n = merge(QCaCO3(n), qc_n, n == na)
+              imp_n = merge(PR%a_impcalc(n), imp_n, n == na)
+            enddo
+            if (work1 > c0) then
+              work2 = (pp_n / work1) * graze_rate
+            else
+              work2 = c0
+            endif
+            gzt = PR%g_zoofrac(prey, pred) * work2
+            if (imp_n /= 0) then
+              gpoc = work2 * max((PR%caco3_poc_min * qc_n), &
+                                 min(PR%spc_poc_fac * (pp_n + 0.6_rp)**1.6_rp, PR%f_graze_sp_poc_lim))
+            else
+              gpoc = PR%g_poc(prey, pred) * work2
+            endif
+            gdoc = PR%g_doc(prey, pred) * work2
+            do n = 1, NAUTO
+              auto_graze(n) = merge(auto_graze(n) + work2, auto_graze(n), n == na)
+              auto_graze_zootot(n) = merge(auto_graze_zootot(n) + gzt, auto_graze_zootot(n), n == na)
+              auto_graze_poc(n) = merge(auto_graze_poc(n) + gpoc, auto_graze_poc(n), n == na)
+              auto_graze_doc(n) = merge(auto_graze_doc(n) + gdoc, auto_graze_doc(n), n == na)
+            enddo
+            x_graze_zoo(pred) = x_graze_zoo(pred) + gzt
+            work3 = work3 + PR%g_fdetr(prey, pred) * (work2 + epsC * epsTinv)
+            work4 = work4 + (work2 + epsC * epsTinv)
           endif
-          auto_graze(n) = auto_graze(n) + work2
-          auto_graze_zootot(n) = auto_graze_zootot(n) + PR%g_zoofrac(prey, pred) * work2
-          x_graze_zoo(pred) = x_graze_zoo(pred) + PR%g_zoofrac(prey, pred) * work2
-          if (PR%a_impcalc(n) /= 0) then
-            auto_graze_poc(n) = auto_graze_poc(n) &
-                 + work2 * max((PR%caco3_poc_min * QCaCO3(n)), &
-                               min(PR%spc_poc_fac * (Pprime(n) + 0.6_rp)**1.6_rp, PR%f_graze_sp_poc_lim))
-          else
-            auto_graze_poc(n) = auto_graze_poc(n) + PR%g_poc(prey, pred) * work2
-          endif
-          auto_graze_doc(n) = auto_graze_doc(n) + PR%g_doc(prey, pred) * work2
-          work3 = work3 + PR%g_fdetr(prey, pred) * (work2 + epsC * epsTinv)
-          work4 = work4 + (work2 + epsC * epsTinv)
         enddo
-        do j = 1, PR%g_nzoo(prey, pred)
-          n = PR%g_zoo(j, prey, pred)
-          if (work1 > c0) then
-            work2 = (Zprime(n) / work1) * graze_rate
-          else
-            work2 = c0
+        do jj = 1, NZOO
+          if (jj <= PR%g_nzoo(prey, pred)) then
+            na = PR%g_zoo(jj, prey, pred)
+            pp_n = c0
+            do n = 1, NZOO
+              pp_n = merge(Zprime(n), pp_n, n == na)
+            enddo
+            if (work1 > c0) then
+              work2 = (pp_n / work1) * graze_rate
+            else
+              work2 = c0
+            endif
+            gzt = PR%g_zoofrac(prey, pred) * work2
+            gpoc = PR%g_poc(prey, pred) * work2
+            gdoc = PR%g_doc(prey, pred) * work2
+            do n = 1, NZOO
+              zoo_graze(n) = merge(zoo_graze(n) + work2, zoo_graze(n), n == na)
+              zoo_graze_zootot(n) = merge(zoo_graze_zootot(n) + gzt, zoo_graze_zootot(n), n == na)
+              zoo_graze_poc(n) = merge(zoo_graze_poc(n) + gpoc, zoo_graze_poc(n), n == na)
+              zoo_graze_doc(n) = merge(zoo_graze_doc(n) + gdoc, zoo_graze_doc(n), n == na)
+            enddo
+            x_graze_zoo(pred) = x_graze_zoo(pred) + gzt
+            work3 = work3 + PR%g_fdetr(prey, pred) * (work2 + epsC * epsTinv)
+            work4 = work4 + (work2 + epsC * epsTinv)
           endif
-          zoo_graze(n) = zoo_graze(n) + work2
-          zoo_graze_zootot(n) = zoo_graze_zootot(n) + PR%g_zoofrac(prey, pred) * work2
-          x_graze_zoo(pred) = x_graze_zoo(pred) + PR%g_zoofrac(prey, pred) * work2
-          zoo_graze_poc(n) = zoo_graze_poc(n) + PR%g_poc(prey, pred) * work2
-          zoo_graze_doc(n) = zoo_graze_doc(n) + PR%g_doc(prey, pred) * work2
-          work3 = work3 + PR%g_fdetr(prey, pred) * (work2 + epsC * epsTinv)
-          work4 = work4 + (work2 + epsC * epsTinv)
         enddo
       enddo
+      endif
       f_zoo_detr(pred) = work3 / work4
     enddo
 
-    !--- compute_routing
-    do n = 1, nauto
-      auto_graze_dic(n) = auto_graze(n) - (auto_graze_zootot(n) + auto_graze_poc(n) + auto_graze_doc(n))
-    enddo
-    do n = 1, nzoo
+    !--- compute_routing (zooplankton), zooplankton sums of the DOM,
+    ! detritus and tendency sections, zooplankton tracer tendencies
+    do n = 1, NZOO
       zoo_graze_dic(n) = zoo_graze(n) - (zoo_graze_zootot(n) + zoo_graze_poc(n) + zoo_graze_doc(n))
       zoo_loss_poc(n) = f_zoo_detr(n) * zoo_loss_bulk(n)
       zoo_loss_doc(n) = (c1 - PR%labile_ratio) * (c1 - f_zoo_detr(n)) * zoo_loss_bulk(n)
       zoo_loss_dic(n) = (PR%labile_ratio * (c1 - f_zoo_detr(n)) * zoo_loss_bulk(n)) + zoo_loss_basal(n)
     enddo
-    do n = 1, nauto
-      remaining_P_pop(n) = (auto_graze_poc(n) + auto_loss_poc(n) + auto_agg(n)) * Qp(n)
-      remaining_P = (auto_graze(n) + auto_loss(n) + auto_agg(n)) * Qp(n) &
-                  - auto_graze_zootot(n) * PR%Qp_zoo - remaining_P_pop(n)
-      if (remaining_P < c0) then
-        remaining_P_pop(n) = remaining_P_pop(n) + remaining_P
-        remaining_P = c0
-      endif
-      remaining_P_dop(n) = PR%f_toDOP * remaining_P
-      remaining_P_dip(n) = (c1 - PR%f_toDOP) * remaining_P
-    enddo
-
-    !--- compute_dissolved_organic_matter
-    s_zldoc = c0; s_zgdoc = c0
-    do n = 1, nzoo
+    s_zldoc = c0; s_zgdoc = c0; s_zlpoc = c0; s_zgpoc = c0; s_zldic = c0; s_zgdic = c0
+    do n = 1, NZOO
       s_zldoc = s_zldoc + zoo_loss_doc(n)
       s_zgdoc = s_zgdoc + zoo_graze_doc(n)
+      s_zlpoc = s_zlpoc + zoo_loss_poc(n)
+      s_zgpoc = s_zgpoc + zoo_graze_poc(n)
+      s_zldic = s_zldic + zoo_loss_dic(n)
+      s_zgdic = s_zgdic + zoo_graze_dic(n)
     enddo
-    work1 = c0; work2 = c0; work3 = c0
-    do n = 1, nauto
-      work1 = work1 + auto_loss_doc(n)
-      work2 = work2 + auto_graze_doc(n)
-      work3 = work3 + remaining_P_dop(n)
+    do n = 1, NZOO
+      call emit_tend(trv, (PR%z_c(n)), x_graze_zoo(n) - zoo_graze(n) - zoo_loss(n), dtm, lapply, lsave, i, j, kk)
     enddo
-    DOC_prod = s_zldoc + work1 + work2 + s_zgdoc
-    DON_prod = PR%Q * DOC_prod * PR%f_toDON
-    DOP_prod = PR%Qp_zoo * (s_zldoc + s_zgdoc) + work3
-    if (par_avg > 1.0_rp) then
-      DOC_reminR = PR%DOC_reminR_light; DON_reminR = PR%DON_reminR_light; DOP_reminR = PR%DOP_reminR_light
-    else
-      DOC_reminR = PR%DOC_reminR_dark; DON_reminR = PR%DON_reminR_dark; DOP_reminR = PR%DOP_reminR_dark
-    endif
-    DOCr_reminR = PR%DOCr_reminR0; DONr_reminR = PR%DONr_reminR0; DOPr_reminR = PR%DOPr_reminR0
-    if (k == 1) then
-      if (st%par_surf > 1.0_rp) then
-        work = (log(st%par_surf) * 0.4373_rp) * (10._rp * PR%m2len / dz1)
-        DOCr_reminR = DOCr_reminR + work * PR%DOMr_reminR_photo
-        DONr_reminR = DONr_reminR + work * PR%DOMr_reminR_photo
-        DOPr_reminR = DOPr_reminR + work * PR%DOMr_reminR_photo
-      endif
-    endif
-    DOC_remin  = DOCl  * DOC_reminR
-    DON_remin  = DONl  * DON_reminR
-    DOP_remin  = DOPl  * DOP_reminR
-    DOCr_remin = DOCrl * DOCr_reminR
-    DONr_remin = DONrl * DONr_reminR
-    DOPr_remin = DOPrl * DOPr_reminR
 
     !--- particle class constants (set_surface_particulate_terms)
     poc_mass = 12.01_rp
@@ -700,44 +889,95 @@ contains
     Lig_scavenge = FeLig1 * Lig_scavenge_rate
     Fe_scavenge = Fefree * Fe_scavenge_rate + FeLig1 * FeLig_scavenge_rate
 
-    !--- compute_large_detritus_prod
-    s_zld = c0; s_zgd = c0
-    do n = 1, nzoo
-      s_zld = s_zld + zoo_loss_poc(n)
-      s_zgd = s_zgd + zoo_graze_poc(n)
+    !--- compute_routing (autotrophs) and the autotroph tracer tendencies, with
+    ! the autotroph sums of the DOM, detritus and tendency sections (from
+    ! zero, in PFT order) and the per-PFT terms that MARBL adds to sums
+    ! starting from later values (same expressions)
+    s_agdoc = c0; s_rpdop = c0; s_agpoc = c0; s_rppop = c0; s_agdic = c0; s_rpdip = c0
+    cac_prod = c0; sio_prod = c0
+    fe_prod = (s_zlpoc + s_zgpoc) * PR%Qfe_zoo + Fe_scavenge
+    !dir$ unroll
+    do n = 1, NAUTO
+      auto_graze_dic(n) = auto_graze(n) - (auto_graze_zootot(n) + auto_graze_poc(n) + auto_graze_doc(n))
+      remaining_P_pop(n) = (auto_graze_poc(n) + auto_loss_poc(n) + auto_agg(n)) * Qp(n)
+      remaining_P = (auto_graze(n) + auto_loss(n) + auto_agg(n)) * Qp(n) &
+                  - auto_graze_zootot(n) * PR%Qp_zoo - remaining_P_pop(n)
+      if (remaining_P < c0) then
+        remaining_P_pop(n) = remaining_P_pop(n) + remaining_P
+        remaining_P = c0
+      endif
+      remaining_P_dop(n) = PR%f_toDOP * remaining_P
+      remaining_P_dip(n) = (c1 - PR%f_toDOP) * remaining_P
+      auto_sum = auto_graze(n) + auto_loss(n) + auto_agg(n)
+      call emit_tend(trv, (PR%a_c(n)), photoC(n) - auto_sum, dtm, lapply, lsave, i, j, kk)
+      if (PR%a_p(n) > 0) &
+        call emit_tend(trv, (PR%a_p(n)), PO4_V(n) + DOP_V(n) - Qp(n) * auto_sum, dtm, lapply, lsave, i, j, kk)
+      call emit_tend(trv, (PR%a_chl(n)), photoacc(n) - thetaC(n) * auto_sum, dtm, lapply, lsave, i, j, kk)
+      call emit_tend(trv, (PR%a_fe(n)), photoFe(n) - Qfe(n) * auto_sum, dtm, lapply, lsave, i, j, kk)
+      if (PR%a_si(n) > 0) &
+        call emit_tend(trv, (PR%a_si(n)), photoSi(n) - Qsi(n) * auto_sum, dtm, lapply, lsave, i, j, kk)
+      if (PR%a_caco3(n) > 0) &
+        call emit_tend(trv, (PR%a_caco3(n)), CaCO3_form(n) - QCaCO3(n) * auto_sum, dtm, lapply, lsave, i, j, kk)
+      s_agdoc = s_agdoc + auto_graze_doc(n)
+      s_rpdop = s_rpdop + remaining_P_dop(n)
+      s_agpoc = s_agpoc + auto_graze_poc(n)
+      s_rppop = s_rppop + remaining_P_pop(n)
+      s_agdic = s_agdic + auto_graze_dic(n)
+      s_rpdip = s_rpdip + remaining_P_dip(n)
+      if (PR%a_caco3(n) > 0) then
+        cac_prod = cac_prod + ((c1 - PR%f_graze_CaCO3_remin) * auto_graze(n) + auto_loss(n) + auto_agg(n)) * QCaCO3(n)
+        ydic(n) = PR%f_graze_CaCO3_remin * auto_graze(n) * QCaCO3(n)
+        zalk(n) = c2 * (PR%f_graze_CaCO3_remin * auto_graze(n) * QCaCO3(n) - CaCO3_form(n))
+      else
+        ydic(n) = c0; zalk(n) = c0
+      endif
+      if (PR%a_si(n) > 0) then
+        sio_prod = sio_prod + Qsi(n) * ((c1 - PR%f_graze_si_remin) * auto_graze(n) + auto_agg(n) &
+                   + PR%a_loss_poc(n) * auto_loss(n))
+        xsi(n) = Qsi(n) * (PR%f_graze_si_remin * auto_graze(n) + (c1 - PR%a_loss_poc(n)) * auto_loss(n))
+      else
+        xsi(n) = c0
+      endif
+      fe_prod = fe_prod + Qfe(n) * (auto_agg(n) + auto_graze_poc(n) + auto_loss_poc(n))
+      afe(n) = (Qfe(n) * (auto_loss_dic(n) + auto_graze_dic(n)))
+      bfe(n) = auto_graze_zootot(n) * (Qfe(n) - PR%Qfe_zoo)
+      cfe(n) = (Qfe(n) * (auto_loss_doc(n) + auto_graze_doc(n)))
     enddo
-    work1 = c0; work2 = c0; work3 = c0; work4 = c0
-    do n = 1, nauto
-      work1 = work1 + auto_graze_poc(n)
-      work2 = work2 + auto_agg(n)
-      work3 = work3 + auto_loss_poc(n)
-      work4 = work4 + remaining_P_pop(n)
-    enddo
-    POC_prod = s_zld + work1 + s_zgd + work2 + work3
-    POP_prod = PR%Qp_zoo * (s_zld + s_zgd) + work4
+
+    !--- compute_dissolved_organic_matter
+    DOC_prod = s_zldoc + s_aldoc + s_agdoc + s_zgdoc
+    DON_prod = PR%Q * DOC_prod * PR%f_toDON
+    DOP_prod = PR%Qp_zoo * (s_zldoc + s_zgdoc) + s_rpdop
+    if (par_avg > 1.0_rp) then
+      DOC_reminR = PR%DOC_reminR_light; DON_reminR = PR%DON_reminR_light; DOP_reminR = PR%DOP_reminR_light
+    else
+      DOC_reminR = PR%DOC_reminR_dark; DON_reminR = PR%DON_reminR_dark; DOP_reminR = PR%DOP_reminR_dark
+    endif
+    DOCr_reminR = PR%DOCr_reminR0; DONr_reminR = PR%DONr_reminR0; DOPr_reminR = PR%DOPr_reminR0
+    if (k == 1) then
+      if (st%par_surf > 1.0_rp) then
+        work = (log(st%par_surf) * 0.4373_rp) * (10._rp * PR%m2len / dz1)
+        DOCr_reminR = DOCr_reminR + work * PR%DOMr_reminR_photo
+        DONr_reminR = DONr_reminR + work * PR%DOMr_reminR_photo
+        DOPr_reminR = DOPr_reminR + work * PR%DOMr_reminR_photo
+      endif
+    endif
+    DOC_remin  = DOCl  * DOC_reminR
+    DON_remin  = DONl  * DON_reminR
+    DOP_remin  = DOPl  * DOP_reminR
+    DOCr_remin = DOCrl * DOCr_reminR
+    DONr_remin = DONrl * DONr_reminR
+    DOPr_remin = DOPrl * DOPr_reminR
+
+    !--- compute_large_detritus_prod (cac_prod, sio_prod, fe_prod above)
+    POC_prod = s_zlpoc + s_agpoc + s_zgpoc + s_aagg + s_alpoc
+    POP_prod = PR%Qp_zoo * (s_zlpoc + s_zgpoc) + s_rppop
     if (POP_prod < c0) then
       DOP_loss_P_bal = -POP_prod
       POP_prod = c0
     else
       DOP_loss_P_bal = c0
     endif
-    cac_prod = c0
-    do n = 1, nauto
-      if (PR%a_caco3(n) > 0) then
-        cac_prod = cac_prod + ((c1 - PR%f_graze_CaCO3_remin) * auto_graze(n) + auto_loss(n) + auto_agg(n)) * QCaCO3(n)
-      endif
-    enddo
-    sio_prod = c0
-    do n = 1, nauto
-      if (PR%a_si(n) > 0) then
-        sio_prod = sio_prod + Qsi(n) * ((c1 - PR%f_graze_si_remin) * auto_graze(n) + auto_agg(n) &
-                   + PR%a_loss_poc(n) * auto_loss(n))
-      endif
-    enddo
-    fe_prod = (s_zld + s_zgd) * PR%Qfe_zoo + Fe_scavenge
-    do n = 1, nauto
-      fe_prod = fe_prod + Qfe(n) * (auto_agg(n) + auto_graze_poc(n) + auto_loss_poc(n))
-    enddo
 
     !--- compute_particulate_terms (k <= kmt)
     scalelength = c1
@@ -902,11 +1142,7 @@ contains
       Lig_photochem = Ligl * rate_per_sec
     endif
     Lig_deg = poc_remin * PR%Lig_degrade_rate0
-    work1 = c0
-    do n = 1, nauto
-      work1 = work1 + photoFe(n)
-    enddo
-    Lig_loss = Lig_scavenge + 0.20_rp * work1 + Lig_photochem + Lig_deg
+    Lig_loss = Lig_scavenge + 0.20_rp * s_photoFe + Lig_photochem + Lig_deg
 
     !--- compute_nitrif
     nitrif = c0
@@ -930,131 +1166,77 @@ contains
       sed_denitrif = sed_denitrif * work
     endif
 
-    !--- compute_local_tendencies
-    ! sums over PFTs used several times
-    s_zld = c0; s_zgd = c0
-    do n = 1, nzoo
-      s_zld = s_zld + zoo_loss_dic(n)
-      s_zgd = s_zgd + zoo_graze_dic(n)
+    !--- compute_local_tendencies (the PFT tracers were emitted above; the
+    ! PFT sums were formed above)
+    t_no3 = nitrif - denitrif - sed_denitrif - s_no3v
+    t_nh4 = -s_nh4v - nitrif + DON_remin + DONr_remin &
+          + PR%Q * (s_zldic + s_zgdic + s_aldic + s_agdic + DOC_prod * (c1 - PR%f_toDON)) &
+          + pon_remin * (c1 - PR%PONremin_refract)
+    do n = 1, NAUTO
+      if (PR%a_nfixer(n) /= 0) t_nh4 = t_nh4 + Nexcrete(n)
     enddo
-    s_ald = c0; s_agd = c0
-    do n = 1, nauto
-      s_ald = s_ald + auto_loss_dic(n)
-      s_agd = s_agd + auto_graze_dic(n)
+    t_fe = fe_remin - s_photoFe - Fe_scavenge + PR%Qfe_zoo * (s_zldic + s_zldoc + s_zgdic + s_zgdoc)
+    do n = 1, NAUTO
+      t_fe = t_fe + afe(n) + bfe(n) + cfe(n)
     enddo
-    work1 = c0
-    do n = 1, nauto
-      work1 = work1 + NO3_V(n)
+    t_lig = Lig_prod - Lig_loss
+    t_sio3 = sio_remin
+    do n = 1, NAUTO
+      if (PR%a_si(n) > 0) t_sio3 = t_sio3 - photoSi(n) + xsi(n)
     enddo
-    tend(PR%no3) = nitrif - denitrif - sed_denitrif - work1
-    work2 = c0
-    do n = 1, nauto
-      work2 = work2 + NH4_V(n)
+    t_po4 = DOP_remin + DOPr_remin - s_po4v + (c1 - PR%POPremin_refract) * pop_remin + s_rpdip &
+          + PR%Qp_zoo * (s_zldic + s_zgdic)
+    t_doc = DOC_prod * (c1 - PR%DOCprod_refract) - DOC_remin
+    t_docr = DOC_prod * PR%DOCprod_refract - DOCr_remin + (poc_remin * PR%POCremin_refract)
+    t_don = (DON_prod * (c1 - PR%DONprod_refract)) - DON_remin
+    t_donr = (DON_prod * PR%DONprod_refract) - DONr_remin + (pon_remin * PR%PONremin_refract)
+    t_dop = (DOP_prod * (c1 - PR%DOPprod_refract)) - DOP_remin - s_dopv - DOP_loss_P_bal
+    t_dopr = (DOP_prod * PR%DOPprod_refract) - DOPr_remin + (pop_remin * PR%POPremin_refract)
+    t_dic = s_aldic + s_agdic - photoC_tot + DOC_remin + poc_remin * (c1 - PR%POCremin_refract) + s_zldic &
+          + s_zgdic + cac_remin + DOCr_remin
+    do n = 1, NAUTO
+      if (PR%a_caco3(n) > 0) t_dic = t_dic + ydic(n) - CaCO3_form(n)
     enddo
-    tend(PR%nh4) = -work2 - nitrif + DON_remin + DONr_remin &
-                 + PR%Q * (s_zld + s_zgd + s_ald + s_agd + DOC_prod * (c1 - PR%f_toDON)) &
-                 + pon_remin * (c1 - PR%PONremin_refract)
-    do n = 1, nauto
-      if (PR%a_nfixer(n) /= 0) tend(PR%nh4) = tend(PR%nh4) + Nexcrete(n)
+    t_dica = t_dic + (caca_remin - cac_remin)
+    t_alk = -t_no3 + t_nh4 + c2 * cac_remin
+    do n = 1, NAUTO
+      if (PR%a_caco3(n) > 0) t_alk = t_alk + zalk(n)
     enddo
-    work3 = c0
-    do n = 1, nauto
-      work3 = work3 + photoFe(n)
-    enddo
-    tend(PR%fe) = fe_remin - work3 - Fe_scavenge + PR%Qfe_zoo * (s_zld + s_zldoc + s_zgd + s_zgdoc)
-    do n = 1, nauto
-      tend(PR%fe) = tend(PR%fe) + (Qfe(n) * (auto_loss_dic(n) + auto_graze_dic(n))) &
-                  + auto_graze_zootot(n) * (Qfe(n) - PR%Qfe_zoo) &
-                  + (Qfe(n) * (auto_loss_doc(n) + auto_graze_doc(n)))
-    enddo
-    tend(PR%lig) = Lig_prod - Lig_loss
-    tend(PR%sio3) = sio_remin
-    do n = 1, nauto
-      if (PR%a_si(n) > 0) then
-        tend(PR%sio3) = tend(PR%sio3) - photoSi(n) + Qsi(n) * (PR%f_graze_si_remin * auto_graze(n) &
-                      + (c1 - PR%a_loss_poc(n)) * auto_loss(n))
-      endif
-    enddo
-    work1 = c0; work2 = c0
-    do n = 1, nauto
-      work1 = work1 + PO4_V(n)
-      work2 = work2 + remaining_P_dip(n)
-    enddo
-    tend(PR%po4) = DOP_remin + DOPr_remin - work1 + (c1 - PR%POPremin_refract) * pop_remin + work2 &
-                 + PR%Qp_zoo * (s_zld + s_zgd)
-    do n = 1, nzoo
-      tend(PR%z_c(n)) = x_graze_zoo(n) - zoo_graze(n) - zoo_loss(n)
-    enddo
-    do n = 1, nauto
-      auto_sum = auto_graze(n) + auto_loss(n) + auto_agg(n)
-      tend(PR%a_c(n)) = photoC(n) - auto_sum
-      if (PR%a_p(n) > 0) tend(PR%a_p(n)) = PO4_V(n) + DOP_V(n) - Qp(n) * auto_sum
-      tend(PR%a_chl(n)) = photoacc(n) - thetaC(n) * auto_sum
-      tend(PR%a_fe(n)) = photoFe(n) - Qfe(n) * auto_sum
-      if (PR%a_si(n) > 0) tend(PR%a_si(n)) = photoSi(n) - Qsi(n) * auto_sum
-      if (PR%a_caco3(n) > 0) tend(PR%a_caco3(n)) = CaCO3_form(n) - QCaCO3(n) * auto_sum
-    enddo
-    work1 = c0
-    do n = 1, nauto
-      work1 = work1 + DOP_V(n)
-    enddo
-    tend(PR%doc) = DOC_prod * (c1 - PR%DOCprod_refract) - DOC_remin
-    tend(PR%docr) = DOC_prod * PR%DOCprod_refract - DOCr_remin + (poc_remin * PR%POCremin_refract)
-    tend(PR%don) = (DON_prod * (c1 - PR%DONprod_refract)) - DON_remin
-    tend(PR%donr) = (DON_prod * PR%DONprod_refract) - DONr_remin + (pon_remin * PR%PONremin_refract)
-    tend(PR%dop) = (DOP_prod * (c1 - PR%DOPprod_refract)) - DOP_remin - work1 - DOP_loss_P_bal
-    tend(PR%dopr) = (DOP_prod * PR%DOPprod_refract) - DOPr_remin + (pop_remin * PR%POPremin_refract)
-    work2 = c0
-    do n = 1, nauto
-      work2 = work2 + photoC(n)
-    enddo
-    tend(PR%dic) = s_ald + s_agd - work2 + DOC_remin + poc_remin * (c1 - PR%POCremin_refract) + s_zld &
-                 + s_zgd + cac_remin + DOCr_remin
-    do n = 1, nauto
-      if (PR%a_caco3(n) > 0) then
-        tend(PR%dic) = tend(PR%dic) + PR%f_graze_CaCO3_remin * auto_graze(n) * QCaCO3(n) - CaCO3_form(n)
-      endif
-    enddo
-    tend(PR%dica) = tend(PR%dic) + (caca_remin - cac_remin)
-    tend(PR%alk) = -tend(PR%no3) + tend(PR%nh4) + c2 * cac_remin
-    do n = 1, nauto
-      if (PR%a_caco3(n) > 0) then
-        tend(PR%alk) = tend(PR%alk) + c2 * (PR%f_graze_CaCO3_remin * auto_graze(n) * QCaCO3(n) - CaCO3_form(n))
-      endif
-    enddo
-    tend(PR%alka) = tend(PR%alk) + c2 * (caca_remin - cac_remin)
-    o2_production = c0
-    do n = 1, nauto
-      if (PR%a_nfixer(n) == 0) then
-        o2_production_denom = NO3_V(n) + NH4_V(n)
-        if (o2_production_denom > c0) then
-          o2_production = o2_production + photoC(n) &
-               * ((NO3_V(n) / (NO3_V(n) + NH4_V(n))) / PR%Red_D_C_O2 &
-                  + (NH4_V(n) / (NO3_V(n) + NH4_V(n))) / PR%Remin_D_C_O2)
-        endif
-      else
-        o2_production_denom = NO3_V(n) + NH4_V(n) + Nfix(n)
-        if (o2_production_denom > c0) then
-          o2_production = o2_production + photoC(n) &
-               * ((NO3_V(n) / (NO3_V(n) + NH4_V(n) + Nfix(n))) / PR%Red_D_C_O2 &
-                  + (NH4_V(n) / (NO3_V(n) + NH4_V(n) + Nfix(n))) / PR%Remin_D_C_O2 &
-                  + (Nfix(n) / (NO3_V(n) + NH4_V(n) + Nfix(n))) / PR%Red_D_C_O2_diaz)
-        endif
-      endif
-    enddo
+    t_alka = t_alk + c2 * (caca_remin - cac_remin)
     o2_consumption = (O2l - PR%o2_min) / PR%o2_min_delta
     o2_consumption = min(max(o2_consumption, c0), c1)
     o2_consumption = o2_consumption * ((poc_remin * (c1 - PR%POCremin_refract) + DOC_remin + DOCr_remin &
-                     - (sed_denitrif * PR%denitrif_C_N) - other_remin + s_zld + s_zgd + s_ald + s_agd) &
+                     - (sed_denitrif * PR%denitrif_C_N) - other_remin + s_zldic + s_zgdic + s_aldic + s_agdic) &
                      / PR%Remin_D_C_O2 + (c2 * nitrif))
-    tend(PR%o2) = o2_production - o2_consumption
+    t_o2 = o2_production - o2_consumption
 
-    !--- diagnostics (tests)
+    call emit_tend(trv, (PR%no3), t_no3, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%nh4), t_nh4, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%fe), t_fe, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%lig), t_lig, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%sio3), t_sio3, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%po4), t_po4, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%doc), t_doc, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%docr), t_docr, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%don), t_don, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%donr), t_donr, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%dop), t_dop, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%dopr), t_dopr, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%dic), t_dic, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%dica), t_dica, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%alk), t_alk, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%alka), t_alka, dtm, lapply, lsave, i, j, kk)
+    call emit_tend(trv, (PR%o2), t_o2, dtm, lapply, lsave, i, j, kk)
+
+    !--- diagnostics (tests; dg(14) is filled by the caller)
     if (ldg /= 0) then
+      do m = 1, ND_IT
+        dg(m) = c0
+      enddo
       dg(1) = par_avg
       dg(2) = nitrif
       dg(3) = denitrif
-      dg(4) = work2                      ! photoC_TOT
+      dg(4) = photoC_tot                 ! photoC_TOT
       dg(5) = st%poc_s + st%poc_h        ! POC_FLUX_IN
       dg(6) = poc_remin * (c1 - PR%POCremin_refract)
       dg(7) = o2_production
@@ -1083,7 +1265,12 @@ contains
   ! K1: carbonate chemistry at every wet point
   !===========================================================================
 #ifdef USE_CUDA
-  attributes(global) &
+  ! 4 blocks of 128 per SM (128 registers): faster than the uncapped 206
+  ! registers / 2 blocks (A100, Pac 4x2: 7.8 -> 6.3 ms). The interior
+  ! kernels are fastest at 2 blocks (255 registers; 168 with 3 blocks was
+  ! 26% slower) and say so explicitly: nvfortran 25.9 gave the kernels of
+  ! this module without launch_bounds the 128-register cap of this one.
+  attributes(global) launch_bounds(128, 4) &
   subroutine carb_kernel(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, nwet, wet_i, wet_j, tr, ncl, ts, z_r, mask)
     integer(ip), value :: ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny
     integer(ip), value :: nwet
@@ -1124,7 +1311,7 @@ contains
       phlo = PR%phlo_3d_init; phhi = PR%phhi_3d_init
     endif
     ph0 = ph
-    call co2calc_interior1(t_dic, t_alk, t_po4, t_sio3, PR%mass_to_vol, &
+    call co2calc_interior1(t_dic, t_alk, t_po4, t_sio3, (PR%mass_to_vol), &
          k1, k2, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, ph, h2co3, hco3, co3, ierr)
     pha = it_pha(i, j, kk)
     if (t_dica == t_dic .and. t_alka == t_alk .and. pha == ph0) then
@@ -1138,10 +1325,10 @@ contains
       else
         phlo = PR%phlo_3d_init; phhi = PR%phhi_3d_init
       endif
-      call co2calc_interior1(t_dica, t_alka, t_po4, t_sio3, PR%mass_to_vol, &
+      call co2calc_interior1(t_dica, t_alka, t_po4, t_sio3, (PR%mass_to_vol), &
            k1, k2, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, pha, h2co3a, hco3a, co3a, ierr2)
     endif
-    call co3_sat1(tins, salt, press, PR%mass_to_vol, csat, asat)
+    call co3_sat1(tins, salt, press, (PR%mass_to_vol), csat, asat)
     it_ph(i, j, kk) = ph
     it_pha(i, j, kk) = pha
     it_h2co3(i, j, kk) = h2co3
@@ -1157,7 +1344,7 @@ contains
   !===========================================================================
   ! K2: interior ecosystem, one thread per column, surface to bottom
   !===========================================================================
-  attributes(global) &
+  attributes(global) launch_bounds(128, 2) &
   subroutine interior_kernel(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, nwet, wet_i, wet_j, dtm, ldg, &
                              tr, ncl, ts, z_r, z_w, Hz, mask, dust)
     integer(ip), value :: ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, ldg
@@ -1170,9 +1357,9 @@ contains
     real(rp), device, intent(in) :: ts(is:ie, js:je, nz, nslot, nts)
     real(rp), device, intent(in) :: z_r(is:ie, js:je, nz), z_w(is:ie, js:je, 0:nz), Hz(is:ie, js:je, nz)
     real(rp), device, intent(in) :: mask(is:ie, js:je), dust(is:ie, js:je)
-    integer(ip) :: i, j, k, kk, m
+    integer(ip) :: i, j, k, kk, m, lapply, l0
     real(rp) :: dz, dz1, zw, zt, tins, h2co3, co3, co3a, co3sat, dust_flux, dst_rho
-    real(rp) :: trk(NTRMAX), tend(NTRMAX), dg(ND_IT)
+    real(rp) :: dg(ND_IT)
     type(sink_t) :: st
 
     c = (blockIdx%x - 1) * blockDim%x + threadIdx%x
@@ -1193,6 +1380,7 @@ contains
     dst_rho = dst_rho * PR%nmol2mol_prefix * PR%mass2g
     st%qa_dust_def = dst_rho * (st%dst_s + st%dst_h)
     dz1 = Hz(i, j, nz)
+    lapply = 1; l0 = 0
     do k = 1, nz
       kk = nz - k + 1
       dz = Hz(i, j, kk)
@@ -1200,25 +1388,70 @@ contains
       zt = -z_r(i, j, kk)
       tins = it_temp(i, j, kk)
       h2co3 = it_h2co3(i, j, kk); co3 = it_co3(i, j, kk); co3a = it_co3a(i, j, kk); co3sat = it_co3sat(i, j, kk)
-      do m = 1, ntr
-        trk(m) = real(tr(m, c, kk, slot), rp)
-      enddo
+      ! the level's tracers are read and updated in place (tr + tend*dtm)
+      ! inside level_step; ldg also keeps the tendencies (it_tend)
       call level_step(k, nz, dz, dz1, zw, zt, tins, h2co3, co3, co3a, co3sat, dust_flux, &
-                      trk, st, tend, dg, ldg)
-      do m = 1, ntr
-        tr(m, c, kk, slot) = real(trk(m) + tend(m) * dtm, pp)
-      enddo
+                      tr(1, c, kk, slot), st, dtm, lapply, dg, l0, l0, i, j, kk)
+    enddo
+  end subroutine interior_kernel
+
+  ! the same with the test outputs (it_tend, it_diag)
+  attributes(global) launch_bounds(128, 2) &
+  subroutine interior_kernel_dbg(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, nwet, wet_i, wet_j, dtm, ldg, &
+                             tr, ncl, ts, z_r, z_w, Hz, mask, dust)
+    integer(ip), value :: ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, ldg
+    integer(ip), value :: nwet
+    integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
+    integer(ip) :: c
+    real(rp), value :: dtm
+    integer(ip), value :: ncl
+    real(pp), device, intent(inout) :: tr(ntr, 0:ncl, nz, nslot)
+    real(rp), device, intent(in) :: ts(is:ie, js:je, nz, nslot, nts)
+    real(rp), device, intent(in) :: z_r(is:ie, js:je, nz), z_w(is:ie, js:je, 0:nz), Hz(is:ie, js:je, nz)
+    real(rp), device, intent(in) :: mask(is:ie, js:je), dust(is:ie, js:je)
+    integer(ip) :: i, j, k, kk, m, lapply
+    real(rp) :: dz, dz1, zw, zt, tins, h2co3, co3, co3a, co3sat, dust_flux, dst_rho
+    real(rp) :: dg(ND_IT)
+    type(sink_t) :: st
+
+    c = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+    if (c > nwet) return
+    i = wet_i(c); j = wet_j(c)
+    if (mask(i, j) == c0) return
+    dust_flux = dust(i, j)
+    ! set_surface_particulate_terms + PAR at the surface
+    st%par_surf = PR%f_qsw_par * it_qsw(i, j)
+    if (st%par_surf < PAR_threshold) st%par_surf = c0
+    st%par_in = st%par_surf
+    st%poc_s = c0; st%poc_h = c0; st%pop_s = c0; st%pop_h = c0
+    st%cac_s = c0; st%cac_h = c0; st%caca_s = c0; st%caca_h = c0
+    st%sio_s = c0; st%sio_h = c0; st%fe_s = c0; st%fe_h = c0
+    st%dst_s = (c1 - 0.98_rp) * dust_flux
+    st%dst_h = 0.98_rp * dust_flux
+    dst_rho = PR%hPOC_dust_ratio * 1.0e9_rp / 12.01_rp
+    dst_rho = dst_rho * PR%nmol2mol_prefix * PR%mass2g
+    st%qa_dust_def = dst_rho * (st%dst_s + st%dst_h)
+    dz1 = Hz(i, j, nz)
+    lapply = 1
+    do k = 1, nz
+      kk = nz - k + 1
+      dz = Hz(i, j, kk)
+      zw = -z_w(i, j, kk - 1)
+      zt = -z_r(i, j, kk)
+      tins = it_temp(i, j, kk)
+      h2co3 = it_h2co3(i, j, kk); co3 = it_co3(i, j, kk); co3a = it_co3a(i, j, kk); co3sat = it_co3sat(i, j, kk)
+      ! the level's tracers are read and updated in place (tr + tend*dtm)
+      ! inside level_step; ldg also keeps the tendencies (it_tend)
+      call level_step(k, nz, dz, dz1, zw, zt, tins, h2co3, co3, co3a, co3sat, dust_flux, &
+                      tr(1, c, kk, slot), st, dtm, lapply, dg, ldg, ldg, i, j, kk)
       if (ldg /= 0) then
-        do m = 1, ntr
-          it_tend(i, j, kk, m) = tend(m)
-        enddo
         dg(14) = it_ph(i, j, kk)
         do m = 1, ND_IT
           it_diag(i, j, kk, m) = dg(m)
         enddo
       endif
     enddo
-  end subroutine interior_kernel
+  end subroutine interior_kernel_dbg
 #endif
 
 
@@ -1238,9 +1471,10 @@ contains
     real(rp) :: tins(nz), h2co3(nz), co3(nz), co3a(nz), csat(nz), asat(nz), hco3, h2co3a, hco3a
     real(rp) :: k0, k1, k2, ff, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi
     real(rp) :: t_dic, t_alk, t_po4, t_sio3, t_dica, t_alka, dst_rho
-    real(rp) :: trk(NTRMAX), tendk(NTRMAX), dg(ND_IT)
+    real(rp) :: trk(NTRMAX), dg(ND_IT)
     type(sink_t) :: sk
-    integer(ip), parameter :: lpress = 1, ldg = 1
+    integer(ip), parameter :: lpress = 1, ldg = 1, lapply = 0, lsave = 0
+    real(rp), parameter :: dtm0 = 0.0_rp
     ierr = 0
     do k = 1, nz
       call potemp_s(salt(k), potemp(k), c0, press(k), tins(k))
@@ -1252,16 +1486,16 @@ contains
       else
         phlo = PR%phlo_3d_init; phhi = PR%phhi_3d_init
       endif
-      call co2calc_interior1(t_dic, t_alk, t_po4, t_sio3, PR%mass_to_vol, &
+      call co2calc_interior1(t_dic, t_alk, t_po4, t_sio3, (PR%mass_to_vol), &
            k1, k2, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, ph(k), h2co3(k), hco3, co3(k), ie1)
       if (ph_alt(k) /= c0) then
         phlo = ph_alt(k) - PR%del_ph; phhi = ph_alt(k) + PR%del_ph
       else
         phlo = PR%phlo_3d_init; phhi = PR%phhi_3d_init
       endif
-      call co2calc_interior1(t_dica, t_alka, t_po4, t_sio3, PR%mass_to_vol, &
+      call co2calc_interior1(t_dica, t_alka, t_po4, t_sio3, (PR%mass_to_vol), &
            k1, k2, kw, kb, ks, kf, k1p, k2p, k3p, ksi, bt, st, ft, phlo, phhi, ph_alt(k), h2co3a, hco3a, co3a(k), ie2)
-      call co3_sat1(tins(k), salt(k), press(k), PR%mass_to_vol, csat(k), asat(k))
+      call co3_sat1(tins(k), salt(k), press(k), (PR%mass_to_vol), csat(k), asat(k))
       if (ie1 /= 0 .or. ie2 /= 0) ierr = ierr + 1
     enddo
     sk%par_surf = PR%f_qsw_par * qsw
@@ -1279,10 +1513,11 @@ contains
       do m = 1, PR%ntr
         trk(m) = tr(m, k)
       enddo
+      ! lapply = 0: level_step returns the tendencies in trk
       call level_step(k, nz, dz(k), dz(1), zw(k), zt(k), tins(k), h2co3(k), co3(k), co3a(k), csat(k), dust, &
-                      trk, sk, tendk, dg, ldg)
+                      trk, sk, dtm0, lapply, dg, ldg, lsave, 1_ip, 1_ip, k)
       do m = 1, PR%ntr
-        tend(m, k) = tendk(m)
+        tend(m, k) = trk(m)
       enddo
       dg(14) = ph(k)
       diag(:, k) = dg
@@ -1329,9 +1564,15 @@ contains
     if (keep .and. allocated(it_tend)) ldg = 1
     block = dim3(128, 1, 1)
     grid = dim3((nwet + 127) / 128, 1, 1)
-    call interior_kernel<<<grid, block, 0, work_stream>>>(ntr, nz, slot, nslot, nts, &
-         decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, nwet, wet_i, wet_j, dtm, ldg, &
-         tr, ntpcol, ts, z_r, z_w, Hz, mask, dust)
+    if (ldg /= 0) then
+      call interior_kernel_dbg<<<grid, block, 0, work_stream>>>(ntr, nz, slot, nslot, nts, &
+           decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, nwet, wet_i, wet_j, dtm, ldg, &
+           tr, ntpcol, ts, z_r, z_w, Hz, mask, dust)
+    else
+      call interior_kernel<<<grid, block, 0, work_stream>>>(ntr, nz, slot, nslot, nts, &
+           decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, nwet, wet_i, wet_j, dtm, ldg, &
+           tr, ntpcol, ts, z_r, z_w, Hz, mask, dust)
+    endif
 #else
     error stop 'marbl_interior_compute: CUDA build required'
 #endif
@@ -1346,19 +1587,22 @@ contains
     real(rp), WORK_ATTR intent(in) :: z_r(decomp%is:decomp%ie, decomp%js:decomp%je, nz)
     real(rp), WORK_ATTR intent(in) :: z_w(decomp%is:decomp%ie, decomp%js:decomp%je, 0:nz)
     real(rp), WORK_ATTR intent(in) :: mask(decomp%is:decomp%ie, decomp%js:decomp%je)
-    call zsat_field(nz, it_co3, it_co3sat, z_r, z_w, mask, it_zsatc)
-    call zsat_field(nz, it_co3, it_co3sata, z_r, z_w, mask, it_zsata)
+    call zsat_fields(nz, it_co3, it_co3sat, it_co3sata, z_r, z_w, mask, it_zsatc, it_zsata)
   end subroutine marbl_zsat_compute
 
-  subroutine zsat_field(nz, co3, sat, z_r, z_w, mask, zout)
+  subroutine zsat_fields(nz, co3, satc, sata, z_r, z_w, mask, zc, za)
+    ! Both depths in one sweep per column (CO3 read once); the sweep stops
+    ! at the first undersaturated level of both, which is all it uses.
     integer(ip), intent(in) :: nz
     real(rp), WORK_ATTR intent(in) :: co3(decomp%is:decomp%ie, decomp%js:decomp%je, nz)
-    real(rp), WORK_ATTR intent(in) :: sat(decomp%is:decomp%ie, decomp%js:decomp%je, nz)
+    real(rp), WORK_ATTR intent(in) :: satc(decomp%is:decomp%ie, decomp%js:decomp%je, nz)
+    real(rp), WORK_ATTR intent(in) :: sata(decomp%is:decomp%ie, decomp%js:decomp%je, nz)
     real(rp), WORK_ATTR intent(in) :: z_r(decomp%is:decomp%ie, decomp%js:decomp%je, nz)
     real(rp), WORK_ATTR intent(in) :: z_w(decomp%is:decomp%ie, decomp%js:decomp%je, 0:nz)
     real(rp), WORK_ATTR intent(in) :: mask(decomp%is:decomp%ie, decomp%js:decomp%je)
-    real(rp), WORK_ATTR intent(inout) :: zout(decomp%is:decomp%ie, decomp%js:decomp%je)
-    integer(ip) :: i, j, k, kf, nx, ny
+    real(rp), WORK_ATTR intent(inout) :: zc(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: za(decomp%is:decomp%ie, decomp%js:decomp%je)
+    integer(ip) :: i, j, k, kfc, kfa, nx, ny
     real(rp) :: a, x1, x2, y1, y2, z
     nx = decomp%nx; ny = decomp%ny
 #ifdef USE_CUDA
@@ -1368,29 +1612,47 @@ contains
       do i = 1, nx
         if (mask(i, j) /= c0) then
           ! kf = first MARBL level (1 = surface) with CO3 - sat <= 0, 0 if none
-          kf = 0
+          kfc = 0; kfa = 0
           do k = 1, nz
-            a = co3(i, j, nz + 1 - k) - sat(i, j, nz + 1 - k)
-            if (a <= c0 .and. kf == 0) kf = k
+            a = co3(i, j, nz + 1 - k) - satc(i, j, nz + 1 - k)
+            if (a <= c0 .and. kfc == 0) kfc = k
+            a = co3(i, j, nz + 1 - k) - sata(i, j, nz + 1 - k)
+            if (a <= c0 .and. kfa == 0) kfa = k
+            if (kfc /= 0 .and. kfa /= 0) exit
           enddo
-          if (kf == 0) then
+          if (kfc == 0) then
             z = -z_w(i, j, 0)                 ! supersaturated down to the bottom
-          else if (kf == 1) then
+          else if (kfc == 1) then
             z = c0                            ! undersaturated at the surface
           else
-            x1 = -z_r(i, j, nz + 2 - kf); x2 = -z_r(i, j, nz + 1 - kf)
-            y1 = co3(i, j, nz + 2 - kf) - sat(i, j, nz + 2 - kf)
-            y2 = co3(i, j, nz + 1 - kf) - sat(i, j, nz + 1 - kf)
+            x1 = -z_r(i, j, nz + 2 - kfc); x2 = -z_r(i, j, nz + 1 - kfc)
+            y1 = co3(i, j, nz + 2 - kfc) - satc(i, j, nz + 2 - kfc)
+            y2 = co3(i, j, nz + 1 - kfc) - satc(i, j, nz + 1 - kfc)
             if (y2 == c0) then
               z = x2
             else
               z = x1 - (x2 - x1) / (y2 - y1) * y1   ! marbl_utils_linear_root
             endif
           endif
-          zout(i, j) = z
+          zc(i, j) = z
+          if (kfa == 0) then
+            z = -z_w(i, j, 0)
+          else if (kfa == 1) then
+            z = c0
+          else
+            x1 = -z_r(i, j, nz + 2 - kfa); x2 = -z_r(i, j, nz + 1 - kfa)
+            y1 = co3(i, j, nz + 2 - kfa) - sata(i, j, nz + 2 - kfa)
+            y2 = co3(i, j, nz + 1 - kfa) - sata(i, j, nz + 1 - kfa)
+            if (y2 == c0) then
+              z = x2
+            else
+              z = x1 - (x2 - x1) / (y2 - y1) * y1
+            endif
+          endif
+          za(i, j) = z
         endif
       enddo
     enddo
-  end subroutine zsat_field
+  end subroutine zsat_fields
 
 end module marbl_interior_mod

@@ -34,6 +34,7 @@ contains
     real(rp) :: dtau, cf_stp, cf_bak, cff, FlxDiv
     real(rp) :: u_fwd(COL_KMAX)
     real(rp) :: fck, wck, cfk, fcm, wcm, cfm
+    real(rp) :: dc0, am3, dcp, uk
     logical :: probe_u, fused_v, keep
 
     nx = decomp%nx
@@ -58,7 +59,7 @@ contains
     limm = dry_lim(G_MOM)
 
 #ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
+    !$cuf kernel do(3) <<<*,(32,16,1)>>>
 #endif
     do k = 1, nz
       do j = 0, ny
@@ -138,6 +139,64 @@ contains
     enddo
     if (ntp > 0) call passive_predictor(dtau, cf_stp, cf_bak, n_stp, n_new, indx)
 
+    probe_u = .false.
+    if (.not. probe_on) then
+    ! AM3 + ru (the former col_dc(1:nz), col_dc(0)) computed level by level
+    ! inside the Thomas sweep that consumes it (same expressions; u(indx)
+    ! is read before it is overwritten at each level), the back-substituted
+    ! velocity of the previous level kept in a register. Probe steps keep the
+    ! two-kernel form below for the 'am3' / 'pred AM3' dumps.
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, ny
+      do i = i_u0, i_u1
+        if (limm > 0) then; if (colact(i, j) == 0) cycle; end if
+        dc0 = dtau * 0.25_rp * (pm(i, j) + pm(i - 1, j)) * (pn(i, j) + pn(i - 1, j))
+        am3 = 0.5_rp * (Hz_bak(i, j, nz) + Hz_bak(i - 1, j, nz)) * ( &
+              cf_stp * u(i, j, nz, n_stp) + cf_bak * u(i, j, nz, indx)) + dc0 * ru(i, j, nz)
+        u(i, j, nz, indx) = 0.5_rp * (Hz(i, j, nz) + Hz(i - 1, j, nz)) * u(i, j, nz, n_stp)
+        fck = 2.0_rp * dtau * (Akv(i, j, nz - 1) + Akv(i - 1, j, nz - 1)) / &
+             (Hz_fwd(i, j, nz) + Hz_fwd(i - 1, j, nz) + Hz_fwd(i, j, nz - 1) + Hz_fwd(i - 1, j, nz - 1))
+        wck = dc0 * 0.5_rp * (Wi(i, j, nz - 1) + Wi(i - 1, j, nz - 1))
+        cff = 1.0_rp / (0.5_rp * (Hz_fwd(i, j, nz) + Hz_fwd(i - 1, j, nz)) + &
+             fck - min(wck, 0.0_rp))
+        cfk = cff * (fck + max(wck, 0.0_rp))
+        col_cf(i, j, nz - 1) = cfk
+        dcp = cff * (am3 + dtau * sustr(i, j))
+        col_dc(i, j, nz) = dcp
+        do k = nz - 1, 2, -1
+          am3 = 0.5_rp * (Hz_bak(i, j, k) + Hz_bak(i - 1, j, k)) * ( &
+                cf_stp * u(i, j, k, n_stp) + cf_bak * u(i, j, k, indx)) + dc0 * ru(i, j, k)
+          u(i, j, k, indx) = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * u(i, j, k, n_stp)
+          fcm = 2.0_rp * dtau * (Akv(i, j, k - 1) + Akv(i - 1, j, k - 1)) / &
+               (Hz_fwd(i, j, k) + Hz_fwd(i - 1, j, k) + Hz_fwd(i, j, k - 1) + Hz_fwd(i - 1, j, k - 1))
+          wcm = dc0 * 0.5_rp * (Wi(i, j, k - 1) + Wi(i - 1, j, k - 1))
+          cff = 1.0_rp / (0.5_rp * (Hz_fwd(i, j, k) + Hz_fwd(i - 1, j, k)) + &
+                          fcm - min(wcm, 0.0_rp) + &
+                          fck + max(wck, 0.0_rp) - &
+                          cfk * (fck - min(wck, 0.0_rp)))
+          cfm = cff * (fcm + max(wcm, 0.0_rp))
+          col_cf(i, j, k - 1) = cfm
+          dcp = cff * (am3 + dcp * (fck - min(wck, 0.0_rp)))
+          col_dc(i, j, k) = dcp
+          fck = fcm; wck = wcm; cfk = cfm
+        enddo
+        am3 = 0.5_rp * (Hz_bak(i, j, 1) + Hz_bak(i - 1, j, 1)) * ( &
+              cf_stp * u(i, j, 1, n_stp) + cf_bak * u(i, j, 1, indx)) + dc0 * ru(i, j, 1)
+        u(i, j, 1, indx) = 0.5_rp * (Hz(i, j, 1) + Hz(i - 1, j, 1)) * u(i, j, 1, n_stp)
+        uk = (am3 + dcp * (fck - min(wck, 0.0_rp))) / &
+             (0.5_rp * (Hz_fwd(i, j, 1) + Hz_fwd(i - 1, j, 1)) + 0.5_rp * dtau * (r_D(i, j) + r_D(i - 1, j)) + &
+              fck + max(wck, 0.0_rp) - &
+              cfk * (fck - min(wck, 0.0_rp)))
+        u(i, j, 1, n_new) = uk
+        do k = 2, nz
+          uk = col_dc(i, j, k) + col_cf(i, j, k - 1) * uk
+          u(i, j, k, n_new) = uk
+        enddo
+      enddo
+    enddo
+    else
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -210,6 +269,7 @@ contains
         enddo
       enddo
     enddo
+    endif
     if (probe_u) then
       call sync_arch()
       call dump_uvisc_at('fwd', ip4, jp4, u_fwd)
@@ -218,6 +278,63 @@ contains
     call dump_pre_u('impl', indx, dtau, cf_stp, cf_bak, .true.)
 
     call dump_vim('pred visc in')
+    if (.not. probe_on) then
+    ! AM3 + ru (the former col_dc(1:nz), col_dc(0)) computed level by level
+    ! inside the Thomas sweep that consumes it (same expressions; u(indx)
+    ! is read before it is overwritten at each level), the back-substituted
+    ! velocity of the previous level kept in a register. Probe steps keep the
+    ! two-kernel form below for the 'am3' / 'pred AM3' dumps.
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = j_v0, ny
+      do i = 1, nx
+        if (limm > 0) then; if (colact(i, j) == 0) cycle; end if
+        dc0 = dtau * 0.25_rp * (pm(i, j) + pm(i, j - 1)) * (pn(i, j) + pn(i, j - 1))
+        am3 = 0.5_rp * (Hz_bak(i, j, nz) + Hz_bak(i, j - 1, nz)) * ( &
+              cf_stp * v(i, j, nz, n_stp) + cf_bak * v(i, j, nz, indx)) + dc0 * rv(i, j, nz)
+        v(i, j, nz, indx) = 0.5_rp * (Hz(i, j, nz) + Hz(i, j - 1, nz)) * v(i, j, nz, n_stp)
+        fck = 2.0_rp * dtau * (Akv(i, j, nz - 1) + Akv(i, j - 1, nz - 1)) / &
+             (Hz_fwd(i, j, nz) + Hz_fwd(i, j - 1, nz) + Hz_fwd(i, j, nz - 1) + Hz_fwd(i, j - 1, nz - 1))
+        wck = dc0 * 0.5_rp * (Wi(i, j, nz - 1) + Wi(i, j - 1, nz - 1))
+        cff = 1.0_rp / (0.5_rp * (Hz_fwd(i, j, nz) + Hz_fwd(i, j - 1, nz)) + &
+             fck - min(wck, 0.0_rp))
+        cfk = cff * (fck + max(wck, 0.0_rp))
+        col_cf(i, j, nz - 1) = cfk
+        dcp = cff * (am3 + dtau * svstr(i, j))
+        col_dc(i, j, nz) = dcp
+        do k = nz - 1, 2, -1
+          am3 = 0.5_rp * (Hz_bak(i, j, k) + Hz_bak(i, j - 1, k)) * ( &
+                cf_stp * v(i, j, k, n_stp) + cf_bak * v(i, j, k, indx)) + dc0 * rv(i, j, k)
+          v(i, j, k, indx) = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * v(i, j, k, n_stp)
+          fcm = 2.0_rp * dtau * (Akv(i, j, k - 1) + Akv(i, j - 1, k - 1)) / &
+               (Hz_fwd(i, j, k) + Hz_fwd(i, j - 1, k) + Hz_fwd(i, j, k - 1) + Hz_fwd(i, j - 1, k - 1))
+          wcm = dc0 * 0.5_rp * (Wi(i, j, k - 1) + Wi(i, j - 1, k - 1))
+          cff = 1.0_rp / (0.5_rp * (Hz_fwd(i, j, k) + Hz_fwd(i, j - 1, k)) + &
+                          fcm - min(wcm, 0.0_rp) + &
+                          fck + max(wck, 0.0_rp) - &
+                          cfk * (fck - min(wck, 0.0_rp)))
+          cfm = cff * (fcm + max(wcm, 0.0_rp))
+          col_cf(i, j, k - 1) = cfm
+          dcp = cff * (am3 + dcp * (fck - min(wck, 0.0_rp)))
+          col_dc(i, j, k) = dcp
+          fck = fcm; wck = wcm; cfk = cfm
+        enddo
+        am3 = 0.5_rp * (Hz_bak(i, j, 1) + Hz_bak(i, j - 1, 1)) * ( &
+              cf_stp * v(i, j, 1, n_stp) + cf_bak * v(i, j, 1, indx)) + dc0 * rv(i, j, 1)
+        v(i, j, 1, indx) = 0.5_rp * (Hz(i, j, 1) + Hz(i, j - 1, 1)) * v(i, j, 1, n_stp)
+        uk = (am3 + dcp * (fck - min(wck, 0.0_rp))) / &
+             (0.5_rp * (Hz_fwd(i, j, 1) + Hz_fwd(i, j - 1, 1)) + 0.5_rp * dtau * (r_D(i, j) + r_D(i, j - 1)) + &
+              fck + max(wck, 0.0_rp) - &
+              cfk * (fck - min(wck, 0.0_rp)))
+        v(i, j, 1, n_new) = uk
+        do k = 2, nz
+          uk = col_dc(i, j, k) + col_cf(i, j, k - 1) * uk
+          v(i, j, k, n_new) = uk
+        enddo
+      enddo
+    enddo
+    else
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -278,6 +395,7 @@ contains
       enddo
     enddo
 
+    endif
     call dump_vn3('after pred impl')
     call u3dbc()
     call v3dbc()

@@ -1,3 +1,4 @@
+#include "mem_attr.inc"
 module uv_rhs
   ! UV_COR + CURVGRID metric terms, UPSTREAM_UV (corrector) or centered
   ! (predictor) horizontal advection, and SPLINE_UV vertical advection. Adds into gpu_state ru, rv (already holding the PGF).
@@ -22,6 +23,10 @@ module uv_rhs
   ! P1 south-V corrector accumulators (host). Reset at k=1 each step.
   real(rp) :: p1_sum, p1_r1, p1_r50, p1_rnz
   real(rp) :: p1_f1, p1_f2, p1_f3, p1_f4
+
+  ! f/max(pm*pn,1e-30) at rho points (the Coriolis factor of the 3-D kernels),
+  ! built once by ensure_fomn: f, pm, pn are static after the grid load.
+  real(rp), WORK_ATTR allocatable :: fomn_r(:,:)
 
 contains
 
@@ -363,6 +368,27 @@ contains
     endif
   end subroutine add_horiz_uv_rhs
 
+  subroutine ensure_fomn()
+    ! The same expression the kernels evaluated per point, once per rho point.
+    integer(ip) :: i, j, is, ie, js, je
+    is = decomp%is; ie = decomp%ie
+    js = decomp%js; je = decomp%je
+    if (allocated(fomn_r)) then
+      if (lbound(fomn_r, 1) == is .and. ubound(fomn_r, 1) == ie .and. &
+          lbound(fomn_r, 2) == js .and. ubound(fomn_r, 2) == je) return
+      deallocate(fomn_r)
+    endif
+    allocate(fomn_r(is:ie, js:je))
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = js, je
+      do i = is, ie
+        fomn_r(i, j) = f(i, j) / max(pm(i, j) * pn(i, j), 1.0e-30_rp)
+      enddo
+    enddo
+  end subroutine ensure_fomn
+
   subroutine add_horiz_uv_rhs_3d(upstream)
     ! add_horiz_uv_rhs for all levels at once: the same per-point
     ! arithmetic as 3-D kernels on 3-D work arrays (no probes).
@@ -375,6 +401,10 @@ contains
     integer(ip) :: ii, jj, lim
     real(rp) :: c_0, c_m, rr, uxm, ux0, uxp, fxm, fx0, fxp, uem, ue0, uep, fvm_j, fv0_j, fvm_jp, fv0_jp
     real(rp) :: fa_m, fa_0, fb_0, fb_p
+    real(rp) :: cfu, u_0, u_e, u_w, u_s, u_n, v_0, v_n, v_s, v_w, v_e
+    real(rp) :: g_w, g_0, g_e, g_s, g_se, h_0, h_w, h_n, h_nw, h_s
+    integer(ip) :: ipr, jpr, nip, njp
+    logical :: two, act0, act1
 
     nx = decomp%nx
     ny = decomp%ny
@@ -440,31 +470,42 @@ contains
       i_vx_hi = nx + 1
     endif
     lim = dry_lim(G_UVRHS)
-    ! ---- ru: one kernel. Per point: the Coriolis/curvature term of the two
-    ! neighbouring rho points, the u-by-FlxU faces i-1 and i, the u-by-FlxV
-    ! faces j and j+1, each face the same expression as before (curvatures
-    ! evaluated inline), and the same accumulation order:
-    ! ru + 0.5*(cor_i + cor_im1) - fa_i + fa_im1 - fb_jp1 + fb_j.
+    call ensure_fomn()
+    nip = (i_u1 - i_u0 + 2) / 2
+    njp = (j_v1 - j_v0 + 2) / 2
+    if (up) then
+    ! ---- ru (UPSTREAM_UV faces), each thread the points i and i+1; per point the
+    ! Coriolis/curvature term of the two neighbouring rho points, the u-by-FlxU faces
+    ! i-1 and i, the u-by-FlxV faces j and j+1, each face the same expression as
+    ! upstream_uv_face (expanded here: as a call from this kernel it was not inlined),
+    ! and the same accumulation order: ru + 0.5*(cor_i + cor_im1) - fa_i + fa_im1 - fb_jp1 + fb_j.
 #ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
+    !$cuf kernel do(3) <<<*,(32,16,1)>>>
 #endif
     do kk = 1, nz
       do j = 1, ny
-        do i = i_u0, i_u1
-          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
-          ! Coriolis / curvature at rho points i and i-1
-          fomn = f(i, j) / max(pm(i, j) * pn(i, j), 1.0e-30_rp)
-          cff = 0.5_rp * Hz(i, j, kk) * (fomn + 0.5_rp * ( &
+        do ipr = 0, nip - 1
+          i = i_u0 + 2 * ipr
+          two = (i + 1 <= i_u1)
+          act0 = .true.
+          act1 = two
+          if (lim > 0) then
+            act0 = (colact(i, j) /= 0)
+            if (two) act1 = (colact(i + 1, j) /= 0)
+          endif
+          if (.not. (act0 .or. act1)) cycle
+          ! ---- point i
+          u_0 = u(i, j, kk, n_rhs)
+          u_e = u(i + 1, j, kk, n_rhs)
+          u_w = u(i - 1, j, kk, n_rhs)
+          cff = 0.5_rp * Hz(i, j, kk) * (fomn_r(i, j) + 0.5_rp * ( &
                (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs)) * dndx(i, j) - &
-               (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs)) * dmde(i, j)))
+               (u_0 + u_e) * dmde(i, j)))
           c_0 = cff * (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs))
-          fomn = f(i - 1, j) / max(pm(i - 1, j) * pn(i - 1, j), 1.0e-30_rp)
-          cff = 0.5_rp * Hz(i - 1, j, kk) * (fomn + 0.5_rp * ( &
+          cff = 0.5_rp * Hz(i - 1, j, kk) * (fomn_r(i - 1, j) + 0.5_rp * ( &
                (v(i - 1, j, kk, n_rhs) + v(i - 1, j + 1, kk, n_rhs)) * dndx(i - 1, j) - &
-               (u(i - 1, j, kk, n_rhs) + u(i, j, kk, n_rhs)) * dmde(i - 1, j)))
+               (u_w + u_0) * dmde(i - 1, j)))
           c_m = cff * (v(i - 1, j, kk, n_rhs) + v(i - 1, j + 1, kk, n_rhs))
-          rr = ru(i, j, kk) + 0.5_rp * (c_0 + c_m)
-          ! u-by-FlxU faces i-1 and i: curvatures at i-1, i, i+1 (clamped at open edges)
           ii = max(i - 1, i_ux_lo)
           uxm = u(ii - 1, j, kk, n_rhs) - 2.0_rp * u(ii, j, kk, n_rhs) + u(ii + 1, j, kk, n_rhs)
           fxm = FlxU(ii - 1, j, kk) - 2.0_rp * FlxU(ii, j, kk) + FlxU(ii + 1, j, kk)
@@ -474,63 +515,116 @@ contains
           ii = min(i + 1, i_ux_hi)
           uxp = u(ii - 1, j, kk, n_rhs) - 2.0_rp * u(ii, j, kk, n_rhs) + u(ii + 1, j, kk, n_rhs)
           fxp = FlxU(ii - 1, j, kk) - 2.0_rp * FlxU(ii, j, kk) + FlxU(ii + 1, j, kk)
-          if (up) then
-            fa_m = upstream_uv_face(u(i - 1, j, kk, n_rhs), u(i, j, kk, n_rhs), uxm, ux0, fxm, fx0, &
-                                    FlxU(i - 1, j, kk), FlxU(i, j, kk))
-            fa_0 = upstream_uv_face(u(i, j, kk, n_rhs), u(i + 1, j, kk, n_rhs), ux0, uxp, fx0, fxp, &
-                                    FlxU(i, j, kk), FlxU(i + 1, j, kk))
-          else
-            fa_m = centered_uv_face(u(i - 1, j, kk, n_rhs), u(i, j, kk, n_rhs), uxm, ux0, fxm, fx0, &
-                                    FlxU(i - 1, j, kk), FlxU(i, j, kk))
-            fa_0 = centered_uv_face(u(i, j, kk, n_rhs), u(i + 1, j, kk, n_rhs), ux0, uxp, fx0, fxp, &
-                                    FlxU(i, j, kk), FlxU(i + 1, j, kk))
-          endif
-          ! u-by-FlxV faces j and j+1: uee at j-1, j, j+1 (clamped), FlxV curvature in x at i-1 and i
+          g_w = FlxU(i - 1, j, kk)
+          g_0 = FlxU(i, j, kk)
+          g_e = FlxU(i + 1, j, kk)
+          cfu = g_w + g_0 - uv_delta * (fxm + fx0)
+          fa_m = 0.25_rp * (cfu * (u_w + u_0) - uv_gamma * ( &
+               max(cfu, 0.0_rp) * uxm + min(cfu, 0.0_rp) * ux0))
+          cfu = g_0 + g_e - uv_delta * (fx0 + fxp)
+          fa_0 = 0.25_rp * (cfu * (u_0 + u_e) - uv_gamma * ( &
+               max(cfu, 0.0_rp) * ux0 + min(cfu, 0.0_rp) * uxp))
+          u_s = u(i, j - 1, kk, n_rhs)
+          u_n = u(i, j + 1, kk, n_rhs)
           jj = max(j - 1, j_ue_lo)
           uem = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
-          jj = j
-          ue0 = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
+          ue0 = u_s - 2.0_rp * u_0 + u_n
           jj = min(j + 1, j_ue_hi)
           uep = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
-          fvm_j = FlxV(i - 2, j, kk) - 2.0_rp * FlxV(i - 1, j, kk) + FlxV(i, j, kk)
-          fv0_j = FlxV(i - 1, j, kk) - 2.0_rp * FlxV(i, j, kk) + FlxV(i + 1, j, kk)
-          fvm_jp = FlxV(i - 2, j + 1, kk) - 2.0_rp * FlxV(i - 1, j + 1, kk) + FlxV(i, j + 1, kk)
-          fv0_jp = FlxV(i - 1, j + 1, kk) - 2.0_rp * FlxV(i, j + 1, kk) + FlxV(i + 1, j + 1, kk)
-          if (up) then
-            fb_0 = upstream_uv_face(u(i, j - 1, kk, n_rhs), u(i, j, kk, n_rhs), uem, ue0, fvm_j, fv0_j, &
-                                    FlxV(i, j, kk), FlxV(i - 1, j, kk))
-            fb_p = upstream_uv_face(u(i, j, kk, n_rhs), u(i, j + 1, kk, n_rhs), ue0, uep, fvm_jp, fv0_jp, &
-                                    FlxV(i, j + 1, kk), FlxV(i - 1, j + 1, kk))
-          else
-            fb_0 = centered_uv_face(u(i, j - 1, kk, n_rhs), u(i, j, kk, n_rhs), uem, ue0, fvm_j, fv0_j, &
-                                    FlxV(i, j, kk), FlxV(i - 1, j, kk))
-            fb_p = centered_uv_face(u(i, j, kk, n_rhs), u(i, j + 1, kk, n_rhs), ue0, uep, fvm_jp, fv0_jp, &
-                                    FlxV(i, j + 1, kk), FlxV(i - 1, j + 1, kk))
+          h_w = FlxV(i - 1, j, kk)
+          h_nw = FlxV(i - 1, j + 1, kk)
+          h_0 = FlxV(i, j, kk)
+          h_n = FlxV(i, j + 1, kk)
+          fvm_j = FlxV(i - 2, j, kk) - 2.0_rp * h_w + h_0
+          fvm_jp = FlxV(i - 2, j + 1, kk) - 2.0_rp * h_nw + h_n
+          fv0_j = h_w - 2.0_rp * h_0 + FlxV(i + 1, j, kk)
+          fv0_jp = h_nw - 2.0_rp * h_n + FlxV(i + 1, j + 1, kk)
+          cfu = h_0 + h_w - uv_delta * (fvm_j + fv0_j)
+          fb_0 = 0.25_rp * (cfu * (u_s + u_0) - uv_gamma * ( &
+               max(cfu, 0.0_rp) * uem + min(cfu, 0.0_rp) * ue0))
+          cfu = h_n + h_nw - uv_delta * (fvm_jp + fv0_jp)
+          fb_p = 0.25_rp * (cfu * (u_0 + u_n) - uv_gamma * ( &
+               max(cfu, 0.0_rp) * ue0 + min(cfu, 0.0_rp) * uep))
+          if (act0) ru(i, j, kk) = ru(i, j, kk) + 0.5_rp * (c_0 + c_m) - fa_0 + fa_m - fb_p + fb_0
+          if (act1) then
+            ! ---- point i+1. Reused from point i (same expressions, same operands):
+            ! Coriolis at rho i (c_m), face fa_m = fa_0 (curvatures max(i,lo) =
+            ! min(max(i,lo),hi) and min(max(i+1,lo),hi) = min(i+1,hi) for i_u0 <= i < i_u1),
+            ! FlxV x-curvatures at i (fvm_j, fvm_jp = fv0_j, fv0_jp of point i).
+            i = i + 1
+            c_m = c_0
+            fa_m = fa_0
+            ux0 = uxp
+            fx0 = fxp
+            u_w = u_0
+            u_0 = u_e
+            u_e = u(i + 1, j, kk, n_rhs)
+            g_0 = g_e
+            g_e = FlxU(i + 1, j, kk)
+            cff = 0.5_rp * Hz(i, j, kk) * (fomn_r(i, j) + 0.5_rp * ( &
+                 (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs)) * dndx(i, j) - &
+                 (u_0 + u_e) * dmde(i, j)))
+            c_0 = cff * (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs))
+            ii = min(i + 1, i_ux_hi)
+            uxp = u(ii - 1, j, kk, n_rhs) - 2.0_rp * u(ii, j, kk, n_rhs) + u(ii + 1, j, kk, n_rhs)
+            fxp = FlxU(ii - 1, j, kk) - 2.0_rp * FlxU(ii, j, kk) + FlxU(ii + 1, j, kk)
+            cfu = g_0 + g_e - uv_delta * (fx0 + fxp)
+            fa_0 = 0.25_rp * (cfu * (u_0 + u_e) - uv_gamma * ( &
+                 max(cfu, 0.0_rp) * ux0 + min(cfu, 0.0_rp) * uxp))
+            fvm_j = fv0_j
+            fvm_jp = fv0_jp
+            h_w = h_0
+            h_nw = h_n
+            u_s = u(i, j - 1, kk, n_rhs)
+            u_n = u(i, j + 1, kk, n_rhs)
+            jj = max(j - 1, j_ue_lo)
+            uem = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
+            ue0 = u_s - 2.0_rp * u_0 + u_n
+            jj = min(j + 1, j_ue_hi)
+            uep = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
+            h_0 = FlxV(i, j, kk)
+            h_n = FlxV(i, j + 1, kk)
+            fv0_j = h_w - 2.0_rp * h_0 + FlxV(i + 1, j, kk)
+            fv0_jp = h_nw - 2.0_rp * h_n + FlxV(i + 1, j + 1, kk)
+            cfu = h_0 + h_w - uv_delta * (fvm_j + fv0_j)
+            fb_0 = 0.25_rp * (cfu * (u_s + u_0) - uv_gamma * ( &
+                 max(cfu, 0.0_rp) * uem + min(cfu, 0.0_rp) * ue0))
+            cfu = h_n + h_nw - uv_delta * (fvm_jp + fv0_jp)
+            fb_p = 0.25_rp * (cfu * (u_0 + u_n) - uv_gamma * ( &
+                 max(cfu, 0.0_rp) * ue0 + min(cfu, 0.0_rp) * uep))
+            ru(i, j, kk) = ru(i, j, kk) + 0.5_rp * (c_0 + c_m) - fa_0 + fa_m - fb_p + fb_0
           endif
-          ru(i, j, kk) = rr - fa_0 + fa_m - fb_p + fb_0
         enddo
       enddo
     enddo
-    ! ---- rv: rv - 0.5*(cor_j + cor_jm1) - fc_ip1 + fc_i - fd_j + fd_jm1
+    ! ---- rv, each thread the points j and j+1: rv - 0.5*(cor_j + cor_jm1) - fc_ip1 + fc_i - fd_j + fd_jm1
 #ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
+    !$cuf kernel do(3) <<<*,(32,16,1)>>>
 #endif
     do kk = 1, nz
-      do j = j_v0, j_v1
+      do jpr = 0, njp - 1
         do i = 1, nx
-          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
-          fomn = f(i, j) / max(pm(i, j) * pn(i, j), 1.0e-30_rp)
-          cff = 0.5_rp * Hz(i, j, kk) * (fomn + 0.5_rp * ( &
-               (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs)) * dndx(i, j) - &
+          j = j_v0 + 2 * jpr
+          two = (j + 1 <= j_v1)
+          act0 = .true.
+          act1 = two
+          if (lim > 0) then
+            act0 = (colact(i, j) /= 0)
+            if (two) act1 = (colact(i, j + 1) /= 0)
+          endif
+          if (.not. (act0 .or. act1)) cycle
+          ! ---- point j
+          v_0 = v(i, j, kk, n_rhs)
+          v_n = v(i, j + 1, kk, n_rhs)
+          v_s = v(i, j - 1, kk, n_rhs)
+          cff = 0.5_rp * Hz(i, j, kk) * (fomn_r(i, j) + 0.5_rp * ( &
+               (v_0 + v_n) * dndx(i, j) - &
                (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs)) * dmde(i, j)))
           c_0 = cff * (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs))
-          fomn = f(i, j - 1) / max(pm(i, j - 1) * pn(i, j - 1), 1.0e-30_rp)
-          cff = 0.5_rp * Hz(i, j - 1, kk) * (fomn + 0.5_rp * ( &
-               (v(i, j - 1, kk, n_rhs) + v(i, j, kk, n_rhs)) * dndx(i, j - 1) - &
+          cff = 0.5_rp * Hz(i, j - 1, kk) * (fomn_r(i, j - 1) + 0.5_rp * ( &
+               (v_s + v_0) * dndx(i, j - 1) - &
                (u(i, j - 1, kk, n_rhs) + u(i + 1, j - 1, kk, n_rhs)) * dmde(i, j - 1)))
           c_m = cff * (u(i, j - 1, kk, n_rhs) + u(i + 1, j - 1, kk, n_rhs))
-          rr = rv(i, j, kk) - 0.5_rp * (c_0 + c_m)
-          ! v-by-FlxV faces j-1 and j: vee and FlxV curvature at j-1, j, j+1 (both clamped)
           jj = max(j - 1, j_ve_lo)
           uxm = v(i, jj - 1, kk, n_rhs) - 2.0_rp * v(i, jj, kk, n_rhs) + v(i, jj + 1, kk, n_rhs)
           fxm = FlxV(i, jj - 1, kk) - 2.0_rp * FlxV(i, jj, kk) + FlxV(i, jj + 1, kk)
@@ -540,43 +634,313 @@ contains
           jj = min(j + 1, j_ve_hi)
           uxp = v(i, jj - 1, kk, n_rhs) - 2.0_rp * v(i, jj, kk, n_rhs) + v(i, jj + 1, kk, n_rhs)
           fxp = FlxV(i, jj - 1, kk) - 2.0_rp * FlxV(i, jj, kk) + FlxV(i, jj + 1, kk)
-          if (up) then
-            fa_m = upstream_uv_face(v(i, j - 1, kk, n_rhs), v(i, j, kk, n_rhs), uxm, ux0, fxm, fx0, &
-                                    FlxV(i, j - 1, kk), FlxV(i, j, kk))
-            fa_0 = upstream_uv_face(v(i, j, kk, n_rhs), v(i, j + 1, kk, n_rhs), ux0, uxp, fx0, fxp, &
-                                    FlxV(i, j, kk), FlxV(i, j + 1, kk))
-          else
-            fa_m = centered_uv_face(v(i, j - 1, kk, n_rhs), v(i, j, kk, n_rhs), uxm, ux0, fxm, fx0, &
-                                    FlxV(i, j - 1, kk), FlxV(i, j, kk))
-            fa_0 = centered_uv_face(v(i, j, kk, n_rhs), v(i, j + 1, kk, n_rhs), ux0, uxp, fx0, fxp, &
-                                    FlxV(i, j, kk), FlxV(i, j + 1, kk))
-          endif
-          ! v-by-FlxU faces i and i+1: vxx at i-1, i, i+1 (clamped), FlxU curvature in y at j-1 and j
+          h_s = FlxV(i, j - 1, kk)
+          h_0 = FlxV(i, j, kk)
+          h_n = FlxV(i, j + 1, kk)
+          cfu = h_s + h_0 - uv_delta * (fxm + fx0)
+          fa_m = 0.25_rp * (cfu * (v_s + v_0) - uv_gamma * ( &
+               max(cfu, 0.0_rp) * uxm + min(cfu, 0.0_rp) * ux0))
+          cfu = h_0 + h_n - uv_delta * (fx0 + fxp)
+          fa_0 = 0.25_rp * (cfu * (v_0 + v_n) - uv_gamma * ( &
+               max(cfu, 0.0_rp) * ux0 + min(cfu, 0.0_rp) * uxp))
+          v_w = v(i - 1, j, kk, n_rhs)
+          v_e = v(i + 1, j, kk, n_rhs)
           ii = max(i - 1, i_vx_lo)
           uem = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
-          ii = i
-          ue0 = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
+          ue0 = v_w - 2.0_rp * v_0 + v_e
           ii = min(i + 1, i_vx_hi)
           uep = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
-          fvm_j = FlxU(i, j - 2, kk) - 2.0_rp * FlxU(i, j - 1, kk) + FlxU(i, j, kk)
-          fv0_j = FlxU(i, j - 1, kk) - 2.0_rp * FlxU(i, j, kk) + FlxU(i, j + 1, kk)
-          fvm_jp = FlxU(i + 1, j - 2, kk) - 2.0_rp * FlxU(i + 1, j - 1, kk) + FlxU(i + 1, j, kk)
-          fv0_jp = FlxU(i + 1, j - 1, kk) - 2.0_rp * FlxU(i + 1, j, kk) + FlxU(i + 1, j + 1, kk)
-          if (up) then
-            fb_0 = upstream_uv_face(v(i - 1, j, kk, n_rhs), v(i, j, kk, n_rhs), uem, ue0, fvm_j, fv0_j, &
-                                    FlxU(i, j, kk), FlxU(i, j - 1, kk))
-            fb_p = upstream_uv_face(v(i, j, kk, n_rhs), v(i + 1, j, kk, n_rhs), ue0, uep, fvm_jp, fv0_jp, &
-                                    FlxU(i + 1, j, kk), FlxU(i + 1, j - 1, kk))
-          else
-            fb_0 = centered_uv_face(v(i - 1, j, kk, n_rhs), v(i, j, kk, n_rhs), uem, ue0, fvm_j, fv0_j, &
-                                    FlxU(i, j, kk), FlxU(i, j - 1, kk))
-            fb_p = centered_uv_face(v(i, j, kk, n_rhs), v(i + 1, j, kk, n_rhs), ue0, uep, fvm_jp, fv0_jp, &
-                                    FlxU(i + 1, j, kk), FlxU(i + 1, j - 1, kk))
+          g_s = FlxU(i, j - 1, kk)
+          g_se = FlxU(i + 1, j - 1, kk)
+          g_0 = FlxU(i, j, kk)
+          g_e = FlxU(i + 1, j, kk)
+          fvm_j = FlxU(i, j - 2, kk) - 2.0_rp * g_s + g_0
+          fvm_jp = FlxU(i + 1, j - 2, kk) - 2.0_rp * g_se + g_e
+          fv0_j = g_s - 2.0_rp * g_0 + FlxU(i, j + 1, kk)
+          fv0_jp = g_se - 2.0_rp * g_e + FlxU(i + 1, j + 1, kk)
+          cfu = g_0 + g_s - uv_delta * (fvm_j + fv0_j)
+          fb_0 = 0.25_rp * (cfu * (v_w + v_0) - uv_gamma * ( &
+               max(cfu, 0.0_rp) * uem + min(cfu, 0.0_rp) * ue0))
+          cfu = g_e + g_se - uv_delta * (fvm_jp + fv0_jp)
+          fb_p = 0.25_rp * (cfu * (v_0 + v_e) - uv_gamma * ( &
+               max(cfu, 0.0_rp) * ue0 + min(cfu, 0.0_rp) * uep))
+          if (act0) rv(i, j, kk) = rv(i, j, kk) - 0.5_rp * (c_0 + c_m) - fb_p + fb_0 - fa_0 + fa_m
+          if (act1) then
+            ! ---- point j+1. Reused from point j (same expressions, same operands):
+            ! Coriolis at rho j (c_m), face fa_m = fa_0 (curvatures max(j,lo) =
+            ! min(max(j,lo),hi) and min(max(j+1,lo),hi) = min(j+1,hi) for j_v0 <= j < j_v1,
+            ! j_ve_hi = j_v1), FlxU y-curvatures at j (fvm_j, fvm_jp = fv0_j, fv0_jp of point j).
+            j = j + 1
+            c_m = c_0
+            fa_m = fa_0
+            ux0 = uxp
+            fx0 = fxp
+            v_s = v_0
+            v_0 = v_n
+            v_n = v(i, j + 1, kk, n_rhs)
+            h_0 = h_n
+            h_n = FlxV(i, j + 1, kk)
+            cff = 0.5_rp * Hz(i, j, kk) * (fomn_r(i, j) + 0.5_rp * ( &
+                 (v_0 + v_n) * dndx(i, j) - &
+                 (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs)) * dmde(i, j)))
+            c_0 = cff * (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs))
+            jj = min(j + 1, j_ve_hi)
+            uxp = v(i, jj - 1, kk, n_rhs) - 2.0_rp * v(i, jj, kk, n_rhs) + v(i, jj + 1, kk, n_rhs)
+            fxp = FlxV(i, jj - 1, kk) - 2.0_rp * FlxV(i, jj, kk) + FlxV(i, jj + 1, kk)
+            cfu = h_0 + h_n - uv_delta * (fx0 + fxp)
+            fa_0 = 0.25_rp * (cfu * (v_0 + v_n) - uv_gamma * ( &
+                 max(cfu, 0.0_rp) * ux0 + min(cfu, 0.0_rp) * uxp))
+            fvm_j = fv0_j
+            fvm_jp = fv0_jp
+            g_s = g_0
+            g_se = g_e
+            v_w = v(i - 1, j, kk, n_rhs)
+            v_e = v(i + 1, j, kk, n_rhs)
+            ii = max(i - 1, i_vx_lo)
+            uem = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
+            ue0 = v_w - 2.0_rp * v_0 + v_e
+            ii = min(i + 1, i_vx_hi)
+            uep = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
+            g_0 = FlxU(i, j, kk)
+            g_e = FlxU(i + 1, j, kk)
+            fv0_j = g_s - 2.0_rp * g_0 + FlxU(i, j + 1, kk)
+            fv0_jp = g_se - 2.0_rp * g_e + FlxU(i + 1, j + 1, kk)
+            cfu = g_0 + g_s - uv_delta * (fvm_j + fv0_j)
+            fb_0 = 0.25_rp * (cfu * (v_w + v_0) - uv_gamma * ( &
+                 max(cfu, 0.0_rp) * uem + min(cfu, 0.0_rp) * ue0))
+            cfu = g_e + g_se - uv_delta * (fvm_jp + fv0_jp)
+            fb_p = 0.25_rp * (cfu * (v_0 + v_e) - uv_gamma * ( &
+                 max(cfu, 0.0_rp) * ue0 + min(cfu, 0.0_rp) * uep))
+            rv(i, j, kk) = rv(i, j, kk) - 0.5_rp * (c_0 + c_m) - fb_p + fb_0 - fa_0 + fa_m
           endif
-          rv(i, j, kk) = rr - fb_p + fb_0 - fa_0 + fa_m
         enddo
       enddo
     enddo
+    else
+    ! ---- the same with centered_uv_face (predictor)
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*,(32,16,1)>>>
+#endif
+    do kk = 1, nz
+      do j = 1, ny
+        do ipr = 0, nip - 1
+          i = i_u0 + 2 * ipr
+          two = (i + 1 <= i_u1)
+          act0 = .true.
+          act1 = two
+          if (lim > 0) then
+            act0 = (colact(i, j) /= 0)
+            if (two) act1 = (colact(i + 1, j) /= 0)
+          endif
+          if (.not. (act0 .or. act1)) cycle
+          ! ---- point i
+          u_0 = u(i, j, kk, n_rhs)
+          u_e = u(i + 1, j, kk, n_rhs)
+          u_w = u(i - 1, j, kk, n_rhs)
+          cff = 0.5_rp * Hz(i, j, kk) * (fomn_r(i, j) + 0.5_rp * ( &
+               (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs)) * dndx(i, j) - &
+               (u_0 + u_e) * dmde(i, j)))
+          c_0 = cff * (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs))
+          cff = 0.5_rp * Hz(i - 1, j, kk) * (fomn_r(i - 1, j) + 0.5_rp * ( &
+               (v(i - 1, j, kk, n_rhs) + v(i - 1, j + 1, kk, n_rhs)) * dndx(i - 1, j) - &
+               (u_w + u_0) * dmde(i - 1, j)))
+          c_m = cff * (v(i - 1, j, kk, n_rhs) + v(i - 1, j + 1, kk, n_rhs))
+          ii = max(i - 1, i_ux_lo)
+          uxm = u(ii - 1, j, kk, n_rhs) - 2.0_rp * u(ii, j, kk, n_rhs) + u(ii + 1, j, kk, n_rhs)
+          fxm = FlxU(ii - 1, j, kk) - 2.0_rp * FlxU(ii, j, kk) + FlxU(ii + 1, j, kk)
+          ii = min(max(i, i_ux_lo), i_ux_hi)
+          ux0 = u(ii - 1, j, kk, n_rhs) - 2.0_rp * u(ii, j, kk, n_rhs) + u(ii + 1, j, kk, n_rhs)
+          fx0 = FlxU(ii - 1, j, kk) - 2.0_rp * FlxU(ii, j, kk) + FlxU(ii + 1, j, kk)
+          ii = min(i + 1, i_ux_hi)
+          uxp = u(ii - 1, j, kk, n_rhs) - 2.0_rp * u(ii, j, kk, n_rhs) + u(ii + 1, j, kk, n_rhs)
+          fxp = FlxU(ii - 1, j, kk) - 2.0_rp * FlxU(ii, j, kk) + FlxU(ii + 1, j, kk)
+          g_w = FlxU(i - 1, j, kk)
+          g_0 = FlxU(i, j, kk)
+          g_e = FlxU(i + 1, j, kk)
+          fa_m = 0.25_rp * (u_w + u_0 - uv_delta * (uxm + ux0)) * &
+               (g_w + g_0 - uv_delta * (fxm + fx0))
+          fa_0 = 0.25_rp * (u_0 + u_e - uv_delta * (ux0 + uxp)) * &
+               (g_0 + g_e - uv_delta * (fx0 + fxp))
+          u_s = u(i, j - 1, kk, n_rhs)
+          u_n = u(i, j + 1, kk, n_rhs)
+          jj = max(j - 1, j_ue_lo)
+          uem = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
+          ue0 = u_s - 2.0_rp * u_0 + u_n
+          jj = min(j + 1, j_ue_hi)
+          uep = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
+          h_w = FlxV(i - 1, j, kk)
+          h_nw = FlxV(i - 1, j + 1, kk)
+          h_0 = FlxV(i, j, kk)
+          h_n = FlxV(i, j + 1, kk)
+          fvm_j = FlxV(i - 2, j, kk) - 2.0_rp * h_w + h_0
+          fvm_jp = FlxV(i - 2, j + 1, kk) - 2.0_rp * h_nw + h_n
+          fv0_j = h_w - 2.0_rp * h_0 + FlxV(i + 1, j, kk)
+          fv0_jp = h_nw - 2.0_rp * h_n + FlxV(i + 1, j + 1, kk)
+          fb_0 = 0.25_rp * (u_s + u_0 - uv_delta * (uem + ue0)) * &
+               (h_0 + h_w - uv_delta * (fvm_j + fv0_j))
+          fb_p = 0.25_rp * (u_0 + u_n - uv_delta * (ue0 + uep)) * &
+               (h_n + h_nw - uv_delta * (fvm_jp + fv0_jp))
+          if (act0) ru(i, j, kk) = ru(i, j, kk) + 0.5_rp * (c_0 + c_m) - fa_0 + fa_m - fb_p + fb_0
+          if (act1) then
+            ! ---- point i+1. Reused from point i (same expressions, same operands):
+            ! Coriolis at rho i (c_m), face fa_m = fa_0 (curvatures max(i,lo) =
+            ! min(max(i,lo),hi) and min(max(i+1,lo),hi) = min(i+1,hi) for i_u0 <= i < i_u1),
+            ! FlxV x-curvatures at i (fvm_j, fvm_jp = fv0_j, fv0_jp of point i).
+            i = i + 1
+            c_m = c_0
+            fa_m = fa_0
+            ux0 = uxp
+            fx0 = fxp
+            u_w = u_0
+            u_0 = u_e
+            u_e = u(i + 1, j, kk, n_rhs)
+            g_0 = g_e
+            g_e = FlxU(i + 1, j, kk)
+            cff = 0.5_rp * Hz(i, j, kk) * (fomn_r(i, j) + 0.5_rp * ( &
+                 (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs)) * dndx(i, j) - &
+                 (u_0 + u_e) * dmde(i, j)))
+            c_0 = cff * (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs))
+            ii = min(i + 1, i_ux_hi)
+            uxp = u(ii - 1, j, kk, n_rhs) - 2.0_rp * u(ii, j, kk, n_rhs) + u(ii + 1, j, kk, n_rhs)
+            fxp = FlxU(ii - 1, j, kk) - 2.0_rp * FlxU(ii, j, kk) + FlxU(ii + 1, j, kk)
+            fa_0 = 0.25_rp * (u_0 + u_e - uv_delta * (ux0 + uxp)) * &
+                 (g_0 + g_e - uv_delta * (fx0 + fxp))
+            fvm_j = fv0_j
+            fvm_jp = fv0_jp
+            h_w = h_0
+            h_nw = h_n
+            u_s = u(i, j - 1, kk, n_rhs)
+            u_n = u(i, j + 1, kk, n_rhs)
+            jj = max(j - 1, j_ue_lo)
+            uem = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
+            ue0 = u_s - 2.0_rp * u_0 + u_n
+            jj = min(j + 1, j_ue_hi)
+            uep = u(i, jj - 1, kk, n_rhs) - 2.0_rp * u(i, jj, kk, n_rhs) + u(i, jj + 1, kk, n_rhs)
+            h_0 = FlxV(i, j, kk)
+            h_n = FlxV(i, j + 1, kk)
+            fv0_j = h_w - 2.0_rp * h_0 + FlxV(i + 1, j, kk)
+            fv0_jp = h_nw - 2.0_rp * h_n + FlxV(i + 1, j + 1, kk)
+            fb_0 = 0.25_rp * (u_s + u_0 - uv_delta * (uem + ue0)) * &
+                 (h_0 + h_w - uv_delta * (fvm_j + fv0_j))
+            fb_p = 0.25_rp * (u_0 + u_n - uv_delta * (ue0 + uep)) * &
+                 (h_n + h_nw - uv_delta * (fvm_jp + fv0_jp))
+            ru(i, j, kk) = ru(i, j, kk) + 0.5_rp * (c_0 + c_m) - fa_0 + fa_m - fb_p + fb_0
+          endif
+        enddo
+      enddo
+    enddo
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*,(32,16,1)>>>
+#endif
+    do kk = 1, nz
+      do jpr = 0, njp - 1
+        do i = 1, nx
+          j = j_v0 + 2 * jpr
+          two = (j + 1 <= j_v1)
+          act0 = .true.
+          act1 = two
+          if (lim > 0) then
+            act0 = (colact(i, j) /= 0)
+            if (two) act1 = (colact(i, j + 1) /= 0)
+          endif
+          if (.not. (act0 .or. act1)) cycle
+          ! ---- point j
+          v_0 = v(i, j, kk, n_rhs)
+          v_n = v(i, j + 1, kk, n_rhs)
+          v_s = v(i, j - 1, kk, n_rhs)
+          cff = 0.5_rp * Hz(i, j, kk) * (fomn_r(i, j) + 0.5_rp * ( &
+               (v_0 + v_n) * dndx(i, j) - &
+               (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs)) * dmde(i, j)))
+          c_0 = cff * (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs))
+          cff = 0.5_rp * Hz(i, j - 1, kk) * (fomn_r(i, j - 1) + 0.5_rp * ( &
+               (v_s + v_0) * dndx(i, j - 1) - &
+               (u(i, j - 1, kk, n_rhs) + u(i + 1, j - 1, kk, n_rhs)) * dmde(i, j - 1)))
+          c_m = cff * (u(i, j - 1, kk, n_rhs) + u(i + 1, j - 1, kk, n_rhs))
+          jj = max(j - 1, j_ve_lo)
+          uxm = v(i, jj - 1, kk, n_rhs) - 2.0_rp * v(i, jj, kk, n_rhs) + v(i, jj + 1, kk, n_rhs)
+          fxm = FlxV(i, jj - 1, kk) - 2.0_rp * FlxV(i, jj, kk) + FlxV(i, jj + 1, kk)
+          jj = min(max(j, j_ve_lo), j_ve_hi)
+          ux0 = v(i, jj - 1, kk, n_rhs) - 2.0_rp * v(i, jj, kk, n_rhs) + v(i, jj + 1, kk, n_rhs)
+          fx0 = FlxV(i, jj - 1, kk) - 2.0_rp * FlxV(i, jj, kk) + FlxV(i, jj + 1, kk)
+          jj = min(j + 1, j_ve_hi)
+          uxp = v(i, jj - 1, kk, n_rhs) - 2.0_rp * v(i, jj, kk, n_rhs) + v(i, jj + 1, kk, n_rhs)
+          fxp = FlxV(i, jj - 1, kk) - 2.0_rp * FlxV(i, jj, kk) + FlxV(i, jj + 1, kk)
+          h_s = FlxV(i, j - 1, kk)
+          h_0 = FlxV(i, j, kk)
+          h_n = FlxV(i, j + 1, kk)
+          fa_m = 0.25_rp * (v_s + v_0 - uv_delta * (uxm + ux0)) * &
+               (h_s + h_0 - uv_delta * (fxm + fx0))
+          fa_0 = 0.25_rp * (v_0 + v_n - uv_delta * (ux0 + uxp)) * &
+               (h_0 + h_n - uv_delta * (fx0 + fxp))
+          v_w = v(i - 1, j, kk, n_rhs)
+          v_e = v(i + 1, j, kk, n_rhs)
+          ii = max(i - 1, i_vx_lo)
+          uem = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
+          ue0 = v_w - 2.0_rp * v_0 + v_e
+          ii = min(i + 1, i_vx_hi)
+          uep = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
+          g_s = FlxU(i, j - 1, kk)
+          g_se = FlxU(i + 1, j - 1, kk)
+          g_0 = FlxU(i, j, kk)
+          g_e = FlxU(i + 1, j, kk)
+          fvm_j = FlxU(i, j - 2, kk) - 2.0_rp * g_s + g_0
+          fvm_jp = FlxU(i + 1, j - 2, kk) - 2.0_rp * g_se + g_e
+          fv0_j = g_s - 2.0_rp * g_0 + FlxU(i, j + 1, kk)
+          fv0_jp = g_se - 2.0_rp * g_e + FlxU(i + 1, j + 1, kk)
+          fb_0 = 0.25_rp * (v_w + v_0 - uv_delta * (uem + ue0)) * &
+               (g_0 + g_s - uv_delta * (fvm_j + fv0_j))
+          fb_p = 0.25_rp * (v_0 + v_e - uv_delta * (ue0 + uep)) * &
+               (g_e + g_se - uv_delta * (fvm_jp + fv0_jp))
+          if (act0) rv(i, j, kk) = rv(i, j, kk) - 0.5_rp * (c_0 + c_m) - fb_p + fb_0 - fa_0 + fa_m
+          if (act1) then
+            ! ---- point j+1. Reused from point j (same expressions, same operands):
+            ! Coriolis at rho j (c_m), face fa_m = fa_0 (curvatures max(j,lo) =
+            ! min(max(j,lo),hi) and min(max(j+1,lo),hi) = min(j+1,hi) for j_v0 <= j < j_v1,
+            ! j_ve_hi = j_v1), FlxU y-curvatures at j (fvm_j, fvm_jp = fv0_j, fv0_jp of point j).
+            j = j + 1
+            c_m = c_0
+            fa_m = fa_0
+            ux0 = uxp
+            fx0 = fxp
+            v_s = v_0
+            v_0 = v_n
+            v_n = v(i, j + 1, kk, n_rhs)
+            h_0 = h_n
+            h_n = FlxV(i, j + 1, kk)
+            cff = 0.5_rp * Hz(i, j, kk) * (fomn_r(i, j) + 0.5_rp * ( &
+                 (v_0 + v_n) * dndx(i, j) - &
+                 (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs)) * dmde(i, j)))
+            c_0 = cff * (u(i, j, kk, n_rhs) + u(i + 1, j, kk, n_rhs))
+            jj = min(j + 1, j_ve_hi)
+            uxp = v(i, jj - 1, kk, n_rhs) - 2.0_rp * v(i, jj, kk, n_rhs) + v(i, jj + 1, kk, n_rhs)
+            fxp = FlxV(i, jj - 1, kk) - 2.0_rp * FlxV(i, jj, kk) + FlxV(i, jj + 1, kk)
+            fa_0 = 0.25_rp * (v_0 + v_n - uv_delta * (ux0 + uxp)) * &
+                 (h_0 + h_n - uv_delta * (fx0 + fxp))
+            fvm_j = fv0_j
+            fvm_jp = fv0_jp
+            g_s = g_0
+            g_se = g_e
+            v_w = v(i - 1, j, kk, n_rhs)
+            v_e = v(i + 1, j, kk, n_rhs)
+            ii = max(i - 1, i_vx_lo)
+            uem = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
+            ue0 = v_w - 2.0_rp * v_0 + v_e
+            ii = min(i + 1, i_vx_hi)
+            uep = v(ii - 1, j, kk, n_rhs) - 2.0_rp * v(ii, j, kk, n_rhs) + v(ii + 1, j, kk, n_rhs)
+            g_0 = FlxU(i, j, kk)
+            g_e = FlxU(i + 1, j, kk)
+            fv0_j = g_s - 2.0_rp * g_0 + FlxU(i, j + 1, kk)
+            fv0_jp = g_se - 2.0_rp * g_e + FlxU(i + 1, j + 1, kk)
+            fb_0 = 0.25_rp * (v_w + v_0 - uv_delta * (uem + ue0)) * &
+                 (g_0 + g_s - uv_delta * (fvm_j + fv0_j))
+            fb_p = 0.25_rp * (v_0 + v_e - uv_delta * (ue0 + uep)) * &
+                 (g_e + g_se - uv_delta * (fvm_jp + fv0_jp))
+            rv(i, j, kk) = rv(i, j, kk) - 0.5_rp * (c_0 + c_m) - fb_p + fb_0 - fa_0 + fa_m
+          endif
+        enddo
+      enddo
+    enddo
+    endif
   end subroutine add_horiz_uv_rhs_3d
 
   subroutine dump_p1_rvh(tag, k)
@@ -945,9 +1309,14 @@ contains
     ! thread per column (the k-recurrences stay serial in the thread); the
     ! u pass over all rows runs before the v pass, as the col_* scratch is
     ! reused per column. Was called once per row.
+    ! The forward sweep stores only what the backward sweep reads (col_cf,
+    ! col_wc); DC and the back-substituted FC of the previous level stay in
+    ! registers. Probe steps (keep) also store the full col_dc/col_wc/col_cf
+    ! columns that dump_vert_b prints. Same operations in the same order.
     integer(ip), intent(in) :: j0, j1
     integer(ip) :: i, k, nx, nz, jj, n_rhs, i_u0, i_u1, j_v0, j_v1, jv0, jv1, jp, lim
-    real(rp) :: cff
+    real(rp) :: cff, dc_k, dc_kp, cf_k, wc_km1, wc_k, wc_p, dc_p
+    logical :: keep
 
     nx = decomp%nx
     nz = decomp%nz
@@ -957,6 +1326,7 @@ contains
     i_u1 = nx + 1
     if (decomp%edge_e) i_u1 = nx
     lim = dry_lim(G_UVRHS)
+    keep = probe_on
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
@@ -964,29 +1334,47 @@ contains
     do jj = j0, j1
     do i = i_u0, i_u1
       if (lim > 0) then; if (colact(i, jj) == 0) cycle; end if
-      col_dc(i, jj, 1) = 0.5625_rp * (Hz(i, jj, 1) + Hz(i - 1, jj, 1)) - &
-                         0.0625_rp * (Hz(i + 1, jj, 1) + Hz(i - 2, jj, 1))
-      col_cf(i, jj, 1) = 1.0_rp
-      col_wc(i, jj, 0) = 2.0_rp * u(i, jj, 1, n_rhs)
+      dc_k = 0.5625_rp * (Hz(i, jj, 1) + Hz(i - 1, jj, 1)) - &
+             0.0625_rp * (Hz(i + 1, jj, 1) + Hz(i - 2, jj, 1))
+      cf_k = 1.0_rp
+      wc_km1 = 2.0_rp * u(i, jj, 1, n_rhs)
+      if (keep) then
+        col_cf(i, jj, 1) = cf_k
+        col_wc(i, jj, 0) = wc_km1
+      endif
       do k = 1, nz - 1
-        col_dc(i, jj, k + 1) = 0.5625_rp * (Hz(i, jj, k + 1) + Hz(i - 1, jj, k + 1)) - &
-                               0.0625_rp * (Hz(i + 1, jj, k + 1) + Hz(i - 2, jj, k + 1))
-        cff = 1.0_rp / (2.0_rp * col_dc(i, jj, k) + col_dc(i, jj, k + 1) * (2.0_rp - col_cf(i, jj, k)))
-        col_cf(i, jj, k + 1) = cff * col_dc(i, jj, k)
-        col_wc(i, jj, k) = cff * (3.0_rp * (col_dc(i, jj, k) * u(i, jj, k + 1, n_rhs) + &
-             col_dc(i, jj, k + 1) * u(i, jj, k, n_rhs)) - col_dc(i, jj, k + 1) * col_wc(i, jj, k - 1))
+        dc_kp = 0.5625_rp * (Hz(i, jj, k + 1) + Hz(i - 1, jj, k + 1)) - &
+                0.0625_rp * (Hz(i + 1, jj, k + 1) + Hz(i - 2, jj, k + 1))
+        cff = 1.0_rp / (2.0_rp * dc_k + dc_kp * (2.0_rp - cf_k))
+        cf_k = cff * dc_k
+        col_cf(i, jj, k + 1) = cf_k
+        wc_k = cff * (3.0_rp * (dc_k * u(i, jj, k + 1, n_rhs) + &
+             dc_kp * u(i, jj, k, n_rhs)) - dc_kp * wc_km1)
+        col_wc(i, jj, k) = wc_k
+        wc_km1 = wc_k
+        dc_k = dc_kp
       enddo
-      col_wc(i, jj, nz) = (2.0_rp * u(i, jj, nz, n_rhs) - col_wc(i, jj, nz - 1)) / &
-           (1.0_rp - col_cf(i, jj, nz))
-      col_dc(i, jj, nz) = 0.0_rp
+      wc_p = (2.0_rp * u(i, jj, nz, n_rhs) - wc_km1) / &
+           (1.0_rp - cf_k)
+      dc_p = 0.0_rp
+      if (keep) then
+        col_wc(i, jj, nz) = wc_p
+        col_dc(i, jj, nz) = dc_p
+      endif
       do k = nz - 1, 1, -1
-        col_wc(i, jj, k) = col_wc(i, jj, k) - col_cf(i, jj, k + 1) * col_wc(i, jj, k + 1)
-        col_dc(i, jj, k) = col_wc(i, jj, k) * 0.5_rp * (We(i, jj, k) + We(i - 1, jj, k) - 0.125_rp * ( &
+        wc_k = col_wc(i, jj, k) - col_cf(i, jj, k + 1) * wc_p
+        dc_k = wc_k * 0.5_rp * (We(i, jj, k) + We(i - 1, jj, k) - 0.125_rp * ( &
              (We(i + 1, jj, k) - We(i, jj, k)) * umask(i + 1, jj) - &
              (We(i - 1, jj, k) - We(i - 2, jj, k)) * umask(i - 1, jj)))
-        ru(i, jj, k + 1) = ru(i, jj, k + 1) - col_dc(i, jj, k + 1) + col_dc(i, jj, k)
+        ru(i, jj, k + 1) = ru(i, jj, k + 1) - dc_p + dc_k
+        if (keep) then
+          col_wc(i, jj, k) = wc_k
+          col_dc(i, jj, k) = dc_k
+        endif
+        wc_p = wc_k
+        dc_p = dc_k
       enddo
-      ru(i, jj, 1) = ru(i, jj, 1) - col_dc(i, jj, 1)
+      ru(i, jj, 1) = ru(i, jj, 1) - dc_p
     enddo
     enddo
     jp = jprb_pt(4)
@@ -1005,29 +1393,47 @@ contains
       do jj = jv0, jv1
       do i = 1, nx
         if (lim > 0) then; if (colact(i, jj) == 0) cycle; end if
-        col_dc(i, jj, 1) = 0.5625_rp * (Hz(i, jj, 1) + Hz(i, jj - 1, 1)) - &
-                           0.0625_rp * (Hz(i, jj + 1, 1) + Hz(i, jj - 2, 1))
-        col_cf(i, jj, 1) = 1.0_rp
-        col_wc(i, jj, 0) = 2.0_rp * v(i, jj, 1, n_rhs)
+        dc_k = 0.5625_rp * (Hz(i, jj, 1) + Hz(i, jj - 1, 1)) - &
+               0.0625_rp * (Hz(i, jj + 1, 1) + Hz(i, jj - 2, 1))
+        cf_k = 1.0_rp
+        wc_km1 = 2.0_rp * v(i, jj, 1, n_rhs)
+        if (keep) then
+          col_cf(i, jj, 1) = cf_k
+          col_wc(i, jj, 0) = wc_km1
+        endif
         do k = 1, nz - 1
-          col_dc(i, jj, k + 1) = 0.5625_rp * (Hz(i, jj, k + 1) + Hz(i, jj - 1, k + 1)) - &
-                                 0.0625_rp * (Hz(i, jj + 1, k + 1) + Hz(i, jj - 2, k + 1))
-          cff = 1.0_rp / (2.0_rp * col_dc(i, jj, k) + col_dc(i, jj, k + 1) * (2.0_rp - col_cf(i, jj, k)))
-          col_cf(i, jj, k + 1) = cff * col_dc(i, jj, k)
-          col_wc(i, jj, k) = cff * (3.0_rp * (col_dc(i, jj, k) * v(i, jj, k + 1, n_rhs) + &
-               col_dc(i, jj, k + 1) * v(i, jj, k, n_rhs)) - col_dc(i, jj, k + 1) * col_wc(i, jj, k - 1))
+          dc_kp = 0.5625_rp * (Hz(i, jj, k + 1) + Hz(i, jj - 1, k + 1)) - &
+                  0.0625_rp * (Hz(i, jj + 1, k + 1) + Hz(i, jj - 2, k + 1))
+          cff = 1.0_rp / (2.0_rp * dc_k + dc_kp * (2.0_rp - cf_k))
+          cf_k = cff * dc_k
+          col_cf(i, jj, k + 1) = cf_k
+          wc_k = cff * (3.0_rp * (dc_k * v(i, jj, k + 1, n_rhs) + &
+               dc_kp * v(i, jj, k, n_rhs)) - dc_kp * wc_km1)
+          col_wc(i, jj, k) = wc_k
+          wc_km1 = wc_k
+          dc_k = dc_kp
         enddo
-        col_wc(i, jj, nz) = (2.0_rp * v(i, jj, nz, n_rhs) - col_wc(i, jj, nz - 1)) / &
-             (1.0_rp - col_cf(i, jj, nz))
-        col_dc(i, jj, nz) = 0.0_rp
+        wc_p = (2.0_rp * v(i, jj, nz, n_rhs) - wc_km1) / &
+             (1.0_rp - cf_k)
+        dc_p = 0.0_rp
+        if (keep) then
+          col_wc(i, jj, nz) = wc_p
+          col_dc(i, jj, nz) = dc_p
+        endif
         do k = nz - 1, 1, -1
-          col_wc(i, jj, k) = col_wc(i, jj, k) - col_cf(i, jj, k + 1) * col_wc(i, jj, k + 1)
-          col_dc(i, jj, k) = col_wc(i, jj, k) * 0.5_rp * (We(i, jj, k) + We(i, jj - 1, k) - 0.125_rp * ( &
+          wc_k = col_wc(i, jj, k) - col_cf(i, jj, k + 1) * wc_p
+          dc_k = wc_k * 0.5_rp * (We(i, jj, k) + We(i, jj - 1, k) - 0.125_rp * ( &
                (We(i, jj + 1, k) - We(i, jj, k)) * vmask(i, jj + 1) - &
                (We(i, jj - 1, k) - We(i, jj - 2, k)) * vmask(i, jj - 1)))
-          rv(i, jj, k + 1) = rv(i, jj, k + 1) - col_dc(i, jj, k + 1) + col_dc(i, jj, k)
+          rv(i, jj, k + 1) = rv(i, jj, k + 1) - dc_p + dc_k
+          if (keep) then
+            col_wc(i, jj, k) = wc_k
+            col_dc(i, jj, k) = dc_k
+          endif
+          wc_p = wc_k
+          dc_p = dc_k
         enddo
-        rv(i, jj, 1) = rv(i, jj, 1) - col_dc(i, jj, 1)
+        rv(i, jj, 1) = rv(i, jj, 1) - dc_p
       enddo
       enddo
       if (probe_on .and. jp >= jv0 .and. jp <= jv1) call dump_vert_b('v', jp)

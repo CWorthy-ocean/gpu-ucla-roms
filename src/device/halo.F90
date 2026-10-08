@@ -86,13 +86,18 @@ module halo_mod
   real(rp), pinned, allocatable :: hs_lo(:), hs_hi(:), hr_lo(:), hr_hi(:)
   integer :: hbuf_n = 0
 #endif
-  ! All-tracer passive exchange buffers: (h, js:je, nz*ntr) and (is:ie, h, nz*ntr)
+  ! All-tracer passive exchange buffers: (h*ntr, js:je, nz) and (h*ntr, is:ie, nz), tracer innermost
 #ifdef USE_CUDA
   real(rp), device, allocatable :: tew_slo(:,:,:), tew_shi(:,:,:), tew_rlo(:,:,:), tew_rhi(:,:,:)
   real(rp), device, allocatable :: tns_slo(:,:,:), tns_shi(:,:,:), tns_rlo(:,:,:), tns_rhi(:,:,:)
 #else
   real(rp), allocatable :: tew_slo(:,:,:), tew_shi(:,:,:), tew_rlo(:,:,:), tew_rhi(:,:,:)
   real(rp), allocatable :: tns_slo(:,:,:), tns_shi(:,:,:), tns_rlo(:,:,:), tns_rhi(:,:,:)
+#endif
+#ifdef USE_CUDA
+  ! Event after the fast-loop exchange pack (halo_fill_zuv_n / zuv_mid).
+  type(cudaEvent) :: zuv_ev
+  logical :: zuv_ev_made = .false.
 #endif
   ! Non-blocking all-tracer exchange in flight (halo_tp_start/mid/finish):
   ! 0 none, 1 east-west posted, 2 north-south posted.
@@ -280,18 +285,31 @@ contains
     endif
   end subroutine halo_fill_uv_n
 
-  subroutine halo_fill_zuv_n(z2, u2, v2)
+  subroutine halo_fill_zuv_n(z2, u2, v2, mid)
     ! zeta, ubar and vbar at slot fast%knew in ONE exchange per direction
     ! (levels 2, 0 and 1 of the 3-D buffers; the rho-cell exchange bounds
     ! are the same for every stagger, as halo_fill_2d_n uses for zeta).
+    ! mid (optional): device work queued right after the first pack; the
+    ! MPI transfer waits for the pack only (event), so mid runs during it.
+    ! It must not touch the exchanged halo cells or the buffers.
     real(rp), WORK_ATTR intent(inout) :: z2(decomp%is:decomp%ie, decomp%js:decomp%je, 4)
     real(rp), WORK_ATTR intent(inout) :: u2(decomp%is:decomp%ie, decomp%js:decomp%je, 4)
     real(rp), WORK_ATTR intent(inout) :: v2(decomp%is:decomp%ie, decomp%js:decomp%je, 4)
+    interface
+      subroutine mid_i()
+      end subroutine mid_i
+    end interface
+    procedure(mid_i), optional :: mid
     integer(ip) :: i1, i2, j1, j2, h, i, j, m, n, ilo, ihi
-    if (no_neighbors()) return
+    logical :: lo, hi, mid_done
+    if (no_neighbors()) then
+      if (present(mid)) call mid()
+      return
+    endif
     call ensure_bufs()
     call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
     h = decomp%halo
+    mid_done = .not. present(mid)
     if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
       CUF_DO2
       do j = j1, j2
@@ -305,30 +323,27 @@ contains
           ew_shi(m, j, 2) = z2(i2 - h + m, j, n)
         enddo
       enddo
+      call zuv_mid(mid, mid_done)
       call deliver3(decomp%nbr_w, decomp%nbr_e, ew_slo(:, :, 0:2), ew_shi(:, :, 0:2), &
-                    ew_rlo(:, :, 0:2), ew_rhi(:, :, 0:2))
-      if (decomp%nbr_w /= NBR_NONE) then
-        CUF_DO2
-        do j = j1, j2
-          do m = 1, h
-            n = fast%knew
+                    ew_rlo(:, :, 0:2), ew_rhi(:, :, 0:2), ev_wait=present(mid))
+      lo = (decomp%nbr_w /= NBR_NONE); hi = (decomp%nbr_e /= NBR_NONE)
+      ! west and east halo columns in one launch (disjoint cells)
+      CUF_DO2
+      do j = j1, j2
+        do m = 1, h
+          n = fast%knew
+          if (lo) then
             u2(i1 - h + m - 1, j, n) = ew_rlo(m, j, 0)
             v2(i1 - h + m - 1, j, n) = ew_rlo(m, j, 1)
             z2(i1 - h + m - 1, j, n) = ew_rlo(m, j, 2)
-          enddo
-        enddo
-      endif
-      if (decomp%nbr_e /= NBR_NONE) then
-        CUF_DO2
-        do j = j1, j2
-          do m = 1, h
-            n = fast%knew
+          endif
+          if (hi) then
             u2(i2 + m, j, n) = ew_rhi(m, j, 0)
             v2(i2 + m, j, n) = ew_rhi(m, j, 1)
             z2(i2 + m, j, n) = ew_rhi(m, j, 2)
-          enddo
+          endif
         enddo
-      endif
+      enddo
     endif
     if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
       ilo = i1 - h; ihi = i2 + h
@@ -344,32 +359,58 @@ contains
           ns_shi(i, m, 2) = z2(i, j2 - h + m, n)
         enddo
       enddo
+      call zuv_mid(mid, mid_done)
       call deliver3(decomp%nbr_s, decomp%nbr_n, ns_slo(:, :, 0:2), ns_shi(:, :, 0:2), &
-                    ns_rlo(:, :, 0:2), ns_rhi(:, :, 0:2))
-      if (decomp%nbr_s /= NBR_NONE) then
-        CUF_DO2
-        do m = 1, h
-          do i = ilo, ihi
-            n = fast%knew
+                    ns_rlo(:, :, 0:2), ns_rhi(:, :, 0:2), ev_wait=present(mid))
+      lo = (decomp%nbr_s /= NBR_NONE); hi = (decomp%nbr_n /= NBR_NONE)
+      ! south and north halo rows in one launch (disjoint cells)
+      CUF_DO2
+      do m = 1, h
+        do i = ilo, ihi
+          n = fast%knew
+          if (lo) then
             u2(i, j1 - h + m - 1, n) = ns_rlo(i, m, 0)
             v2(i, j1 - h + m - 1, n) = ns_rlo(i, m, 1)
             z2(i, j1 - h + m - 1, n) = ns_rlo(i, m, 2)
-          enddo
-        enddo
-      endif
-      if (decomp%nbr_n /= NBR_NONE) then
-        CUF_DO2
-        do m = 1, h
-          do i = ilo, ihi
-            n = fast%knew
+          endif
+          if (hi) then
             u2(i, j2 + m, n) = ns_rhi(i, m, 0)
             v2(i, j2 + m, n) = ns_rhi(i, m, 1)
             z2(i, j2 + m, n) = ns_rhi(i, m, 2)
-          enddo
+          endif
         enddo
-      endif
+      enddo
     endif
+    if (.not. mid_done) call mid()
   end subroutine halo_fill_zuv_n
+
+  subroutine zuv_mid(mid, mid_done)
+    ! After a pack: record the pack event (the transfer waits for it), then
+    ! queue mid once.
+    interface
+      subroutine mid_i()
+      end subroutine mid_i
+    end interface
+    procedure(mid_i), optional :: mid
+    logical, intent(inout) :: mid_done
+#ifdef USE_CUDA
+    integer :: ierr
+#endif
+    if (.not. present(mid)) return
+#ifdef USE_CUDA
+    if (.not. zuv_ev_made) then
+      ierr = cudaEventCreateWithFlags(zuv_ev, cudaEventDisableTiming)
+      if (ierr /= 0) error stop 'halo: zuv event create'
+      zuv_ev_made = .true.
+    endif
+    ierr = cudaEventRecord(zuv_ev, work_stream)
+    if (ierr /= 0) error stop 'halo: zuv event record'
+#endif
+    if (.not. mid_done) then
+      call mid()
+      mid_done = .true.
+    endif
+  end subroutine zuv_mid
 
   ! ------------------------------------------------------------ group exchange
   subroutine hg_begin()
@@ -1080,19 +1121,24 @@ contains
     enddo
   end subroutine halo_fill_3d_t
 
-  subroutine tp_ensure_bufs(nk)
-    integer(ip), intent(in) :: nk
-    integer(ip) :: h, is, ie, js, je
+  subroutine tp_ensure_bufs(nk, ntr)
+    ! Buffer layout tracer-innermost, (q, j, k) east-west and (q, i, k)
+    ! north-south with q = (m-1)*ntr + itr, so a warp packs/unpacks
+    ! consecutive tracers of one cell (one coalesced line of tp) and writes
+    ! consecutive buffer elements. Same element count as (h, j, nz*ntr).
+    integer(ip), intent(in) :: nk, ntr
+    integer(ip) :: h, is, ie, js, je, nq, nz
     h = decomp%halo; is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    nq = h * ntr; nz = nk / ntr
     if (allocated(tew_slo)) then
-      if (ubound(tew_slo, 3) /= nk .or. lbound(tew_slo, 2) /= js .or. ubound(tew_slo, 2) /= je .or. &
-          lbound(tns_slo, 1) /= is .or. ubound(tns_slo, 1) /= ie) then
+      if (ubound(tew_slo, 1) /= nq .or. ubound(tew_slo, 3) /= nz .or. lbound(tew_slo, 2) /= js .or. &
+          ubound(tew_slo, 2) /= je .or. lbound(tns_slo, 2) /= is .or. ubound(tns_slo, 2) /= ie) then
         deallocate(tew_slo, tew_shi, tew_rlo, tew_rhi, tns_slo, tns_shi, tns_rlo, tns_rhi)
       endif
     endif
     if (.not. allocated(tew_slo)) then
-      allocate(tew_slo(h, js:je, nk), tew_shi(h, js:je, nk), tew_rlo(h, js:je, nk), tew_rhi(h, js:je, nk))
-      allocate(tns_slo(is:ie, h, nk), tns_shi(is:ie, h, nk), tns_rlo(is:ie, h, nk), tns_rhi(is:ie, h, nk))
+      allocate(tew_slo(nq, js:je, nz), tew_shi(nq, js:je, nz), tew_rlo(nq, js:je, nz), tew_rhi(nq, js:je, nz))
+      allocate(tns_slo(nq, is:ie, nz), tns_shi(nq, is:ie, nz), tns_rlo(nq, is:ie, nz), tns_rhi(nq, is:ie, nz))
       tew_slo = 0.0_rp; tew_shi = 0.0_rp; tew_rlo = 0.0_rp; tew_rhi = 0.0_rp
       tns_slo = 0.0_rp; tns_shi = 0.0_rp; tns_rlo = 0.0_rp; tns_rhi = 0.0_rp
     endif
@@ -1101,15 +1147,16 @@ contains
   subroutine tp_pack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
     real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, n, nk, h, i1, i2, j1, j2
-    integer(ip) :: kk, j, m, k, itr
+    integer(ip) :: q, j, m, k, itr, nz
+    nz = nk / ntr
     CUF_DO3
-    do kk = 1, nk
+    do k = 1, nz
       do j = j1, j2
-        do m = 1, h
-          k = (kk - 1) / ntr + 1
-          itr = kk - (k - 1) * ntr
-          tew_slo(m, j, kk) = real(a(itr, tpcol(i1 + m - 1, j), k, n), rp)
-          tew_shi(m, j, kk) = real(a(itr, tpcol(i2 - h + m, j), k, n), rp)
+        do q = 1, h * ntr
+          m = (q - 1) / ntr + 1
+          itr = q - (m - 1) * ntr
+          tew_slo(q, j, k) = real(a(itr, tpcol(i1 + m - 1, j), k, n), rp)
+          tew_shi(q, j, k) = real(a(itr, tpcol(i2 - h + m, j), k, n), rp)
         enddo
       enddo
     enddo
@@ -1118,45 +1165,42 @@ contains
   subroutine tp_unpack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
     real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, n, nk, h, i1, i2, j1, j2
-    integer(ip) :: kk, j, m, k, itr
-    if (decomp%nbr_w /= NBR_NONE) then
-      CUF_DO3
-      do kk = 1, nk
-        do j = j1, j2
-          do m = 1, h
-            k = (kk - 1) / ntr + 1
-            itr = kk - (k - 1) * ntr
-            if (tpcol(i1 - h + m - 1, j) > 0) a(itr, tpcol(i1 - h + m - 1, j), k, n) = real(tew_rlo(m, j, kk), pp)
-          enddo
+    integer(ip) :: q, j, m, k, itr, nz
+    logical :: w, e
+    nz = nk / ntr
+    w = (decomp%nbr_w /= NBR_NONE); e = (decomp%nbr_e /= NBR_NONE)
+    if (.not. (w .or. e)) return
+    ! west and east halo columns in one launch (disjoint cells)
+    CUF_DO3
+    do k = 1, nz
+      do j = j1, j2
+        do q = 1, h * ntr
+          m = (q - 1) / ntr + 1
+          itr = q - (m - 1) * ntr
+          if (w) then
+            if (tpcol(i1 - h + m - 1, j) > 0) a(itr, tpcol(i1 - h + m - 1, j), k, n) = real(tew_rlo(q, j, k), pp)
+          endif
+          if (e) then
+            if (tpcol(i2 + m, j) > 0) a(itr, tpcol(i2 + m, j), k, n) = real(tew_rhi(q, j, k), pp)
+          endif
         enddo
       enddo
-    endif
-    if (decomp%nbr_e /= NBR_NONE) then
-      CUF_DO3
-      do kk = 1, nk
-        do j = j1, j2
-          do m = 1, h
-            k = (kk - 1) / ntr + 1
-            itr = kk - (k - 1) * ntr
-            if (tpcol(i2 + m, j) > 0) a(itr, tpcol(i2 + m, j), k, n) = real(tew_rhi(m, j, kk), pp)
-          enddo
-        enddo
-      enddo
-    endif
+    enddo
   end subroutine tp_unpack_ew
 
   subroutine tp_pack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
     real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, n, nk, h, ilo, ihi, j1, j2
-    integer(ip) :: kk, i, m, k, itr
+    integer(ip) :: q, i, m, k, itr, nz
+    nz = nk / ntr
     CUF_DO3
-    do kk = 1, nk
-      do m = 1, h
-        do i = ilo, ihi
-          k = (kk - 1) / ntr + 1
-          itr = kk - (k - 1) * ntr
-          tns_slo(i, m, kk) = real(a(itr, tpcol(i, j1 + m - 1), k, n), rp)
-          tns_shi(i, m, kk) = real(a(itr, tpcol(i, j2 - h + m), k, n), rp)
+    do k = 1, nz
+      do i = ilo, ihi
+        do q = 1, h * ntr
+          m = (q - 1) / ntr + 1
+          itr = q - (m - 1) * ntr
+          tns_slo(q, i, k) = real(a(itr, tpcol(i, j1 + m - 1), k, n), rp)
+          tns_shi(q, i, k) = real(a(itr, tpcol(i, j2 - h + m), k, n), rp)
         enddo
       enddo
     enddo
@@ -1165,31 +1209,27 @@ contains
   subroutine tp_unpack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
     real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, n, nk, h, ilo, ihi, j1, j2
-    integer(ip) :: kk, i, m, k, itr
-    if (decomp%nbr_s /= NBR_NONE) then
-      CUF_DO3
-      do kk = 1, nk
-        do m = 1, h
-          do i = ilo, ihi
-            k = (kk - 1) / ntr + 1
-            itr = kk - (k - 1) * ntr
-            if (tpcol(i, j1 - h + m - 1) > 0) a(itr, tpcol(i, j1 - h + m - 1), k, n) = real(tns_rlo(i, m, kk), pp)
-          enddo
+    integer(ip) :: q, i, m, k, itr, nz
+    logical :: so, no
+    nz = nk / ntr
+    so = (decomp%nbr_s /= NBR_NONE); no = (decomp%nbr_n /= NBR_NONE)
+    if (.not. (so .or. no)) return
+    ! south and north halo rows in one launch (disjoint cells)
+    CUF_DO3
+    do k = 1, nz
+      do i = ilo, ihi
+        do q = 1, h * ntr
+          m = (q - 1) / ntr + 1
+          itr = q - (m - 1) * ntr
+          if (so) then
+            if (tpcol(i, j1 - h + m - 1) > 0) a(itr, tpcol(i, j1 - h + m - 1), k, n) = real(tns_rlo(q, i, k), pp)
+          endif
+          if (no) then
+            if (tpcol(i, j2 + m) > 0) a(itr, tpcol(i, j2 + m), k, n) = real(tns_rhi(q, i, k), pp)
+          endif
         enddo
       enddo
-    endif
-    if (decomp%nbr_n /= NBR_NONE) then
-      CUF_DO3
-      do kk = 1, nk
-        do m = 1, h
-          do i = ilo, ihi
-            k = (kk - 1) / ntr + 1
-            itr = kk - (k - 1) * ntr
-            if (tpcol(i, j2 + m) > 0) a(itr, tpcol(i, j2 + m), k, n) = real(tns_rhi(i, m, kk), pp)
-          enddo
-        enddo
-      enddo
-    endif
+    enddo
   end subroutine tp_unpack_ns
 
   subroutine sync_work_stream()
@@ -1214,7 +1254,7 @@ contains
     if (tp_pending /= 0) error stop 'halo_fill_3d_tp: a non-blocking all-tracer exchange is pending'
     h = decomp%halo; nk = decomp%nz * ntr; n = slot
     call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
-    call tp_ensure_bufs(nk)
+    call tp_ensure_bufs(nk, ntr)
     if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
       call tp_pack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
       call deliver3(decomp%nbr_w, decomp%nbr_e, tew_slo, tew_shi, tew_rlo, tew_rhi)
@@ -1249,7 +1289,7 @@ contains
     if (tp_check_wanted()) continue
     h = decomp%halo; nk = decomp%nz * ntr; n = slot
     call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
-    call tp_ensure_bufs(nk)
+    call tp_ensure_bufs(nk, ntr)
     tp_slot_p = int(slot); tp_ntr_p = int(ntr)
     tp_ew_posted = .false.; tp_ns_posted = .false.
     if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
@@ -2123,7 +2163,10 @@ contains
     enddo
   end subroutine deliver2_ns
 
-  subroutine deliver3(nbr_lo, nbr_hi, send_lo, send_hi, recv_lo, recv_hi)
+  subroutine deliver3(nbr_lo, nbr_hi, send_lo, send_hi, recv_lo, recv_hi, ev_wait)
+    ! ev_wait: the packs were followed by zuv_ev; wait for that event, not
+    ! for everything queued on work_stream (GPU-direct path).
+    logical, intent(in), optional :: ev_wait
     integer(ip), intent(in) :: nbr_lo, nbr_hi
 #ifdef USE_CUDA
     real(rp), device, intent(inout), contiguous :: send_lo(:,:,:), send_hi(:,:,:)
@@ -2136,7 +2179,7 @@ contains
     if (nbr_lo == NBR_NONE .and. nbr_hi == NBR_NONE) return
     if (nbr_lo >= 0 .or. nbr_hi >= 0) then
 #ifdef USE_CUDA
-      call deliver_dev(nbr_lo, nbr_hi, send_lo, send_hi, recv_lo, recv_hi)
+      call deliver_dev(nbr_lo, nbr_hi, send_lo, send_hi, recv_lo, recv_hi, ev_wait)
 #else
       call sync_arch()
       call comm_exchange3(nbr_lo, nbr_hi, send_lo, send_hi, recv_lo, recv_hi)
@@ -2168,20 +2211,28 @@ contains
   end subroutine deliver3
 
 #ifdef USE_CUDA
-  subroutine deliver_dev(nbr_lo, nbr_hi, s_lo, s_hi, r_lo, r_hi)
+  subroutine deliver_dev(nbr_lo, nbr_hi, s_lo, s_hi, r_lo, r_hi, ev_wait)
     ! MPI delivery of packed device buffers through pinned host memory,
     ! stream-ordered after the pack kernels and before the unpack kernels.
     integer(ip), intent(in) :: nbr_lo, nbr_hi
     real(rp), device, intent(inout), contiguous :: s_lo(:,:,:), s_hi(:,:,:)
     real(rp), device, intent(inout), contiguous :: r_lo(:,:,:), r_hi(:,:,:)
+    logical, intent(in), optional :: ev_wait
     integer :: n, ierr
+    logical :: use_ev
+    use_ev = .false.
+    if (present(ev_wait)) use_ev = ev_wait
     n = size(s_lo)
     if (size(s_hi) /= n .or. size(r_lo) /= n .or. size(r_hi) /= n) &
          error stop 'deliver_dev: buffer size mismatch'
     if (comm_gpu_direct) then
       ! GPU-aware MPI: the pack kernels (work_stream) must have completed;
       ! the blocking Sendrecv returns with r_lo/r_hi filled on the device.
-      ierr = cudaStreamSynchronize(work_stream)
+      if (use_ev) then
+        ierr = cudaEventSynchronize(zuv_ev)
+      else
+        ierr = cudaStreamSynchronize(work_stream)
+      endif
       if (ierr /= 0) error stop 'deliver_dev: stream sync'
       call comm_sendrecv_dev(nbr_lo, nbr_hi, n, s_lo, s_hi, r_lo, r_hi)
       return

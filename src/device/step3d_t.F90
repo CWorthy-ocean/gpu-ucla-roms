@@ -7,7 +7,7 @@ module step3d_t_mod
   use time_state
   use halo_mod
   use arch_mod, only: sync_arch
-  use column_solve, only: implicit_tracer_columns
+  use column_solve, only: implicit_tracer_columns, implicit_tracer_columns_frc
   use advect, only: horiz_up3_fluxes, vert_u3_fluxes, dump_horiz_flux_probe, &
                     fuse_tracers, cor_tracers_fused
   use obc, only: t3dbc
@@ -95,6 +95,13 @@ contains
           enddo
         endif
       endif
+      if (.not. probe_on) then
+        ! Forcing applied inside the implicit solve's forward sweep (same
+        ! operations, same order); probe steps keep the separate kernel for
+        ! the 'cor forc' dump.
+        iAkt = min(itrc, 2)
+        call implicit_tracer_columns_frc(nx, ny, nz, n_new, itrc, iAkt, dt_loc)
+      else
 #ifdef USE_CUDA
       !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -123,6 +130,7 @@ contains
       if (itrc == itemp) call dump_cor_col('cor forc', 4)
       iAkt = min(itrc, 2)
       call implicit_tracer_columns(nx, ny, nz, n_new, itrc, iAkt, dt_loc, .false.)
+      endif
       if (itrc == itemp) call dump_cor_col('cor impl', 5)
       call t3dbc(itrc)
       ! no exchange here: MARBL and t3dmix read t(nnew) at the point only

@@ -234,16 +234,24 @@ contains
     endif
     lim = dry_lim(G_GEOM)
 
+    ! Zero Wi, We except where the kernel below assigns them: in its
+    ! columns (1:nx, 1:ny with the same dry skip) it writes Wi(1:nz) and
+    ! We(0:nz), so only Wi(0) is zeroed there; halo-frame columns are
+    ! zeroed in full, skipped dry columns are left alone (as before).
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = decomp%js, decomp%je
       do i = decomp%is, decomp%ie
         if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
-        do k = 0, nz
-          Wi(i, j, k) = 0.0_rp
-          We(i, j, k) = 0.0_rp
-        enddo
+        if (i >= 1 .and. i <= nx .and. j >= 1 .and. j <= ny) then
+          Wi(i, j, 0) = 0.0_rp
+        else
+          do k = 0, nz
+            Wi(i, j, k) = 0.0_rp
+            We(i, j, k) = 0.0_rp
+          enddo
+        endif
       enddo
     enddo
 

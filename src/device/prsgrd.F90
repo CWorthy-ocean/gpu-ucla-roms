@@ -39,7 +39,9 @@ contains
     integer(ip) :: i_fc_lo, i_fc_hi, j_fc_lo, j_fc_hi
     integer(ip) :: i_ru_lo, i_ru_hi, j_rv_lo, j_rv_hi
     real(rp) :: HalfGRho, dpth, cff, dzk
-    integer(ip) :: ii, im_lo, im_hi
+    real(rp) :: cf_c, cf_l, fc_c, fc_l, fck, rho_k, rho_p, fc_p, dz_p, zr_k, zr_p, P_p
+    integer(ip) :: ii, im_lo, im_hi, ipr, jpr, npr
+    logical :: two, act0, act1
     real(rp) :: za_m, za_0, za_p, ra_m, ra_0, ra_p, zc_m, zc_0, rc_m, rc_0
     logical :: do_tides, edge_w, edge_e, edge_s, edge_n
 
@@ -61,22 +63,90 @@ contains
     ! are left alone once dry skipping is on.
     lim = dry_lim(G_PGF)
 
-    ! Zero ru, rv on the device (not a host memset of managed memory).
+    i_ru_lo = merge(2, 1, edge_w)
+    i_ru_hi = merge(nx, nx + 1, edge_e)
+    j_rv_lo = merge(2, 1, edge_s)
+    j_rv_hi = merge(ny, ny + 1, edge_n)
+
+    ! Zero ru, rv on the device (not a host memset of managed memory), only
+    ! outside the ranges the ru (i_ru_lo:i_ru_hi, 1:ny) and rv (1:nx,
+    ! j_rv_lo:j_rv_hi) kernels below assign at every level (with the same
+    ! dry-column skip), so every element ends as before.
 #ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
+    !$cuf kernel do(2) <<<*,*>>>
 #endif
-    do k = 1, nz
-      do j = decomp%js, decomp%je
-        do i = decomp%is, decomp%ie
-          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
-          ru(i, j, k) = 0.0_rp
-          rv(i, j, k) = 0.0_rp
-        enddo
+    do j = decomp%js, decomp%je
+      do i = decomp%is, decomp%ie
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
+        if (i < i_ru_lo .or. i > i_ru_hi .or. j < 1 .or. j > ny) then
+          do k = 1, nz
+            ru(i, j, k) = 0.0_rp
+          enddo
+        endif
+        if (i < 1 .or. i > nx .or. j < j_rv_lo .or. j > j_rv_hi) then
+          do k = 1, nz
+            rv(i, j, k) = 0.0_rp
+          enddo
+        endif
       enddo
     enddo
 
     ! CPU column kernel is j=0:ny, i=0:nx. Do not build P on the
     ! north/east OBC rho rows (j=ny+1 / i=nx+1).
+    if (.not. probe_on) then
+      ! One downward sweep. dZ/dR of levels k and k-1 (col_cf/col_fc
+      ! before averaging, with the k=0/nz edge copies), the averaged dZ/dR
+      ! and rho of level k+1, and P(k+1) stay in registers; only rho and P
+      ! are stored (the ru/rv kernels read them at neighbouring points).
+      ! Same operations in the same order as the three-sweep form below,
+      ! which probe steps keep (dump_pgf_h prints col_fc/col_cf).
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 0, ny
+      do i = 0, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
+        ! level nz: col_cf(nz) = col_cf(nz-1), col_fc(nz) = col_fc(nz-1)
+        cf_c = z_r(i, j, nz) - z_r(i, j, nz - 1)
+        fc_c = adiabatic_diff(rho1(i, j, nz), rho1(i, j, nz - 1), &
+                              qp1(i, j, nz), qp1(i, j, nz - 1), &
+                              z_r(i, j, nz), z_r(i, j, nz - 1))
+        rho_p = 0.0_rp; fc_p = 0.0_rp; dz_p = 0.0_rp; zr_p = 0.0_rp; P_p = 0.0_rp
+        do k = nz, 1, -1
+          if (k >= 2) then
+            cf_l = z_r(i, j, k) - z_r(i, j, k - 1)
+            fc_l = adiabatic_diff(rho1(i, j, k), rho1(i, j, k - 1), &
+                                  qp1(i, j, k), qp1(i, j, k - 1), &
+                                  z_r(i, j, k), z_r(i, j, k - 1))
+          else
+            ! col_cf(0) = col_cf(1), col_fc(0) = col_fc(1)
+            cf_l = cf_c
+            fc_l = fc_c
+          endif
+          cff = 2.0_rp * cf_c * cf_l
+          dzk = cff / max(cf_c + cf_l, 1.0e-30_rp)
+          zr_k = z_r(i, j, k)
+          dpth = -zr_k
+          fck = harmonic_avg((fc_c), (fc_l)) &
+                - qp1(i, j, k) * dzk * (1.0_rp - 2.0_rp * qp2 * dpth)
+          rho_k = split_eos_insitu(rho1(i, j, k), qp1(i, j, k), (zr_k))
+          rho(i, j, k) = rho_k
+          if (k < nz) then
+            if (k == nz - 1) then
+              P_p = surface_P(z_w(i, j, nz), (zr_p), (zr_k), (rho_p), (rho_k))
+              if (do_tides) P_p = P_p - g * ptide(i, j)
+              P(i, j, nz) = P_p
+            endif
+            P_p = P_p + HalfGRho * dens_jacobian( &
+                  (rho_p), (rho_k), (zr_p), (zr_k), (fc_p), (fck), (dz_p), (dzk))
+            P(i, j, k) = P_p
+          endif
+          rho_p = rho_k; fc_p = fck; dz_p = dzk; zr_p = zr_k
+          cf_c = cf_l; fc_c = fc_l
+        enddo
+      enddo
+    enddo
+    else
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -115,6 +185,7 @@ contains
         enddo
       enddo
     enddo
+    endif
     call dump_pgf_h('after pgf P')
 
     if (edge_w) then
@@ -141,11 +212,6 @@ contains
     else
       j_fc_hi = ny + 2
     endif
-    i_ru_lo = merge(2, 1, edge_w)
-    i_ru_hi = merge(nx, nx + 1, edge_e)
-    j_rv_lo = merge(2, 1, edge_s)
-    j_rv_hi = merge(ny, ny + 1, edge_n)
-
     if (probe_on) then
       ! Probe steps: per-level path (dump_pgf_v reads the 2-D work arrays).
       do k = nz, 1, -1
@@ -265,15 +331,26 @@ contains
       ! averages (former wrk3c/wrk3d) and the update, all per point with the
       ! same expressions: bit-identical to the multi-kernel version.
       ! Scalar call arguments parenthesized: see rho_eos (fixed single-block launch otherwise).
+      ! Each thread two neighbouring faces (i, i+1 for ru; j, j+1 for rv): the
+      ! second reuses the first's face values and averaged pair (same values).
       im_lo = i_fc_lo; im_hi = i_fc_hi
+      npr = (i_ru_hi - i_ru_lo + 2) / 2
 #ifdef USE_CUDA
-      !$cuf kernel do(3) <<<*,*>>>
+      !$cuf kernel do(3) <<<*,(32,16,1)>>>
 #endif
       do k = 1, nz
         do j = 1, ny
-          do i = i_ru_lo, i_ru_hi
-            if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
-            ! faces i-1, i, i+1 (clamped to the computed range at the open edges)
+          do ipr = 0, npr - 1
+            i = i_ru_lo + 2 * ipr
+            two = (i + 1 <= i_ru_hi)
+            act0 = .true.
+            act1 = two
+            if (lim > 0) then
+              act0 = (colact(i, j) /= 0)
+              if (two) act1 = (colact(i + 1, j) /= 0)
+            endif
+            if (.not. (act0 .or. act1)) cycle
+            ! faces -1, 0, +1 (clamped to the computed range at the open edges)
             ii = max(i - 1, im_lo)
             za_m = apply_mask(z_r(ii, j, k) - z_r(ii - 1, j, k), umask(ii, j))
             ra_m = apply_mask(adiabatic_diff(rho1(ii, j, k), rho1(ii - 1, j, k), qp1(ii, j, k), qp1(ii - 1, j, k), &
@@ -291,22 +368,53 @@ contains
             zc_0 = harmonic_avg((za_0), (za_p))
             rc_0 = harmonic_avg((ra_0), (ra_p))
             rc_0 = rc_0 - qp1(i, j, k) * zc_0 * (1.0_rp + 2.0_rp * qp2 * z_r(i, j, k))
-            ru(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j) * ( &
+            if (act0) ru(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j) * ( &
                           P(i - 1, j, k) - P(i, j, k) - HalfGRho * dens_jacobian( &
                           rho(i, j, k), rho(i - 1, j, k), &
                           z_r(i, j, k), z_r(i - 1, j, k), &
                           (rc_0), (rc_m), (zc_0), (zc_m)))
+            if (act1) then
+              ! point +1: its faces -1/0 and its averaged pair (-1, 0) are this point's
+              ! faces 0/+1 and pair (0, +1) (max(i,im_lo) = i, min(i+1,im_hi) = i+1 here)
+              i = i + 1
+              za_0 = za_p
+              ra_0 = ra_p
+              zc_m = zc_0
+              rc_m = rc_0
+              ii = min(i + 1, im_hi)
+              za_p = apply_mask(z_r(ii, j, k) - z_r(ii - 1, j, k), umask(ii, j))
+              ra_p = apply_mask(adiabatic_diff(rho1(ii, j, k), rho1(ii - 1, j, k), qp1(ii, j, k), qp1(ii - 1, j, k), &
+                                               z_r(ii, j, k), z_r(ii - 1, j, k)), umask(ii, j))
+              zc_0 = harmonic_avg((za_0), (za_p))
+              rc_0 = harmonic_avg((ra_0), (ra_p))
+              rc_0 = rc_0 - qp1(i, j, k) * zc_0 * (1.0_rp + 2.0_rp * qp2 * z_r(i, j, k))
+              ru(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j) * ( &
+                            P(i - 1, j, k) - P(i, j, k) - HalfGRho * dens_jacobian( &
+                            rho(i, j, k), rho(i - 1, j, k), &
+                            z_r(i, j, k), z_r(i - 1, j, k), &
+                            (rc_0), (rc_m), (zc_0), (zc_m)))
+            endif
           enddo
         enddo
       enddo
       im_lo = j_fc_lo; im_hi = j_fc_hi
+      npr = (j_rv_hi - j_rv_lo + 2) / 2
 #ifdef USE_CUDA
-      !$cuf kernel do(3) <<<*,*>>>
+      !$cuf kernel do(3) <<<*,(32,16,1)>>>
 #endif
       do k = 1, nz
-        do j = j_rv_lo, j_rv_hi
+        do jpr = 0, npr - 1
           do i = 1, nx
-            if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
+            j = j_rv_lo + 2 * jpr
+            two = (j + 1 <= j_rv_hi)
+            act0 = .true.
+            act1 = two
+            if (lim > 0) then
+              act0 = (colact(i, j) /= 0)
+              if (two) act1 = (colact(i, j + 1) /= 0)
+            endif
+            if (.not. (act0 .or. act1)) cycle
+            ! faces -1, 0, +1 (clamped to the computed range at the open edges)
             ii = max(j - 1, im_lo)
             za_m = apply_mask(z_r(i, ii, k) - z_r(i, ii - 1, k), vmask(i, ii))
             ra_m = apply_mask(adiabatic_diff(rho1(i, ii, k), rho1(i, ii - 1, k), qp1(i, ii, k), qp1(i, ii - 1, k), &
@@ -324,11 +432,32 @@ contains
             zc_0 = harmonic_avg((za_0), (za_p))
             rc_0 = harmonic_avg((ra_0), (ra_p))
             rc_0 = rc_0 - qp1(i, j, k) * zc_0 * (1.0_rp + 2.0_rp * qp2 * z_r(i, j, k))
-            rv(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j) * ( &
+            if (act0) rv(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j) * ( &
                           P(i, j - 1, k) - P(i, j, k) - HalfGRho * dens_jacobian( &
                           rho(i, j, k), rho(i, j - 1, k), &
                           z_r(i, j, k), z_r(i, j - 1, k), &
                           (rc_0), (rc_m), (zc_0), (zc_m)))
+            if (act1) then
+              ! point +1: its faces -1/0 and its averaged pair (-1, 0) are this point's
+              ! faces 0/+1 and pair (0, +1) (max(j,im_lo) = j, min(j+1,im_hi) = j+1 here)
+              j = j + 1
+              za_0 = za_p
+              ra_0 = ra_p
+              zc_m = zc_0
+              rc_m = rc_0
+              ii = min(j + 1, im_hi)
+              za_p = apply_mask(z_r(i, ii, k) - z_r(i, ii - 1, k), vmask(i, ii))
+              ra_p = apply_mask(adiabatic_diff(rho1(i, ii, k), rho1(i, ii - 1, k), qp1(i, ii, k), qp1(i, ii - 1, k), &
+                                               z_r(i, ii, k), z_r(i, ii - 1, k)), vmask(i, ii))
+              zc_0 = harmonic_avg((za_0), (za_p))
+              rc_0 = harmonic_avg((ra_0), (ra_p))
+              rc_0 = rc_0 - qp1(i, j, k) * zc_0 * (1.0_rp + 2.0_rp * qp2 * z_r(i, j, k))
+              rv(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j) * ( &
+                            P(i, j - 1, k) - P(i, j, k) - HalfGRho * dens_jacobian( &
+                            rho(i, j, k), rho(i, j - 1, k), &
+                            z_r(i, j, k), z_r(i, j - 1, k), &
+                            (rc_0), (rc_m), (zc_0), (zc_m)))
+            endif
           enddo
         enddo
       enddo

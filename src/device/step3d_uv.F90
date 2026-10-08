@@ -35,7 +35,7 @@ contains
   subroutine step3d_uv1()
     integer(ip) :: i, j, k, nx, ny, nz, n_new, i_u0, i_u1, j_v0, lim
     real(rp) :: cff, dt_loc
-    real(rp) :: fck, wck, cfk, fcm, wcm, cfm
+    real(rp) :: fck, wck, cfk, fcm, wcm, cfm, dc0, dck, rf
     logical :: keep
 
     nx = decomp%nx
@@ -73,21 +73,26 @@ contains
     lim = dry_lim(G_MOM)
 
     ! Column Thomas has a k-recurrence: one thread per column, k serial.
+    ! col_dc(0), the back-substituted col_dc and rufrc/rvfrc stay in
+    ! registers (stored on probe steps, keep, for dump_thom_b); the forward
+    ! col_dc/col_cf are stored for the back-substitution. Same operations.
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = i_u0, i_u1
         if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
-        col_dc(i, j, 0) = dt_loc * 0.25_rp * (pm(i, j) + pm(i - 1, j)) * (pn(i, j) + pn(i - 1, j))
+        dc0 = dt_loc * 0.25_rp * (pm(i, j) + pm(i - 1, j)) * (pn(i, j) + pn(i - 1, j))
+        if (keep) col_dc(i, j, 0) = dc0
         fck = 2.0_rp * dt_loc * (Akv(i, j, nz - 1) + Akv(i - 1, j, nz - 1)) / &
              (Hz(i, j, nz) + Hz(i - 1, j, nz) + Hz(i, j, nz - 1) + Hz(i - 1, j, nz - 1))
-        wck = col_dc(i, j, 0) * 0.5_rp * (Wi(i, j, nz - 1) + Wi(i - 1, j, nz - 1))
+        wck = dc0 * 0.5_rp * (Wi(i, j, nz - 1) + Wi(i - 1, j, nz - 1))
         cff = 1.0_rp / (0.5_rp * (Hz(i, j, nz) + Hz(i - 1, j, nz)) + &
              fck - min(wck, 0.0_rp))
         cfk = cff * (fck + max(wck, 0.0_rp))
         col_cf(i, j, nz - 1) = cfk
-        col_dc(i, j, nz) = cff * (u(i, j, nz, n_new) + col_dc(i, j, 0) * ru(i, j, nz) + dt_loc * sustr(i, j))
+        dck = cff * (u(i, j, nz, n_new) + dc0 * ru(i, j, nz) + dt_loc * sustr(i, j))
+        col_dc(i, j, nz) = dck
         if (keep) then
           col_fc(i, j, nz - 1) = fck
           col_wc(i, j, nz - 1) = wck
@@ -95,35 +100,39 @@ contains
         do k = nz - 1, 2, -1
           fcm = 2.0_rp * dt_loc * (Akv(i, j, k - 1) + Akv(i - 1, j, k - 1)) / &
                (Hz(i, j, k) + Hz(i - 1, j, k) + Hz(i, j, k - 1) + Hz(i - 1, j, k - 1))
-          wcm = col_dc(i, j, 0) * 0.5_rp * (Wi(i, j, k - 1) + Wi(i - 1, j, k - 1))
+          wcm = dc0 * 0.5_rp * (Wi(i, j, k - 1) + Wi(i - 1, j, k - 1))
           cff = 1.0_rp / (0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) + &
                           fcm - min(wcm, 0.0_rp) + &
                           fck + max(wck, 0.0_rp) - &
                           cfk * (fck - min(wck, 0.0_rp)))
           cfm = cff * (fcm + max(wcm, 0.0_rp))
           col_cf(i, j, k - 1) = cfm
-          col_dc(i, j, k) = cff * (u(i, j, k, n_new) + col_dc(i, j, 0) * ru(i, j, k) + &
-                            col_dc(i, j, k + 1) * (fck - min(wck, 0.0_rp)))
+          dck = cff * (u(i, j, k, n_new) + dc0 * ru(i, j, k) + &
+                            dck * (fck - min(wck, 0.0_rp)))
+          col_dc(i, j, k) = dck
           if (keep) then
             col_fc(i, j, k - 1) = fcm
             col_wc(i, j, k - 1) = wcm
           endif
           fck = fcm; wck = wcm; cfk = cfm
         enddo
-        col_dc(i, j, 1) = (u(i, j, 1, n_new) + col_dc(i, j, 0) * ru(i, j, 1) + &
-                    col_dc(i, j, 2) * (fck - min(wck, 0.0_rp))) / &
+        dck = (u(i, j, 1, n_new) + dc0 * ru(i, j, 1) + &
+                    dck * (fck - min(wck, 0.0_rp))) / &
              (0.5_rp * (Hz(i, j, 1) + Hz(i - 1, j, 1)) + 0.5_rp * dt_loc * (r_D(i, j) + r_D(i - 1, j)) + &
               fck + max(wck, 0.0_rp) - &
               cfk * (fck - min(wck, 0.0_rp)))
+        if (keep) col_dc(i, j, 1) = dck
         ! CPU step3d_uv1 writes u_new unmasked; umask is applied in set_HUV1.
-        u(i, j, 1, n_new) = col_dc(i, j, 1) * 0.5_rp * (Hz(i, j, 1) + Hz(i - 1, j, 1))
-        rufrc(i, j) = apply_mask(ru(i, j, 1) + dm_u(i, j) * dn_u(i, j) * (sustr(i, j) - &
-                      0.5_rp * (r_D(i - 1, j) + r_D(i, j)) * col_dc(i, j, 1)), umask(i, j))
+        u(i, j, 1, n_new) = dck * 0.5_rp * (Hz(i, j, 1) + Hz(i - 1, j, 1))
+        rf = apply_mask(ru(i, j, 1) + dm_u(i, j) * dn_u(i, j) * (sustr(i, j) - &
+                      0.5_rp * (r_D(i - 1, j) + r_D(i, j)) * dck), umask(i, j))
         do k = 2, nz
-          col_dc(i, j, k) = col_dc(i, j, k) + col_cf(i, j, k - 1) * col_dc(i, j, k - 1)
-          u(i, j, k, n_new) = col_dc(i, j, k) * 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
-          rufrc(i, j) = apply_mask(rufrc(i, j) + ru(i, j, k), umask(i, j))
+          dck = col_dc(i, j, k) + col_cf(i, j, k - 1) * dck
+          if (keep) col_dc(i, j, k) = dck
+          u(i, j, k, n_new) = dck * 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
+          rf = apply_mask(rf + ru(i, j, k), umask(i, j))
         enddo
+        rufrc(i, j) = rf
       enddo
     enddo
     call dump_thom_b('u')
@@ -482,7 +491,7 @@ contains
   subroutine step3d_uv2()
     integer(ip) :: i, j, k, nx, ny, nz, n_new, n_stp, kn
     integer(ip) :: i_u0, i_u1, j_v0, i_ur1, j_vr1, j_ur0, j_ur1, i_vr0, i_vr1
-    real(rp) :: cff, Dcol, uint, mis, mis_u, mis_f, flx_int, flx_k, hz_dn
+    real(rp) :: cff, Dcol, uint, mis, mis_u, mis_f, flx_int, flx_k, hz_dn, u_k
     integer(ip) :: ip4, jp4, icu_i, icu_j, icu_k, lim
     logical :: probe_c, ic_on
 
@@ -525,6 +534,46 @@ contains
     endif
     call dump_uv2_b('before couple1')
     lim = dry_lim(G_MOM)
+    if (.not. probe_c) then
+    ! One pass fewer: the vertical sums first, then u/cff - mis per level
+    ! (the same two roundings as storing u/cff and subtracting mis). The
+    ! IC-jet value u/cff at icu_k is the same expression. Probe steps keep
+    ! the stored-quotient form below (the couple1 probe prints it).
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, ny
+      do i = i_u0, i_u1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
+        if (umask(i, j) > 0.5_rp) then
+          Dcol = 0.0_rp
+          uint = 0.0_rp
+          do k = 1, nz
+            cff = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
+            Dcol = Dcol + cff
+            uint = uint + u(i, j, k, n_new)
+          enddo
+          mis = (uint * dn_u(i, j) - DU_avg1(i, j)) / (Dcol * dn_u(i, j))
+          if (ic_on .and. i == icu_i .and. j == icu_j) then
+            cpl_prb(15) = 0.5_rp * (Hz(i, j, icu_k) + Hz(i - 1, j, icu_k))
+            cpl_prb(16) = u(i, j, icu_k, n_new) / (0.5_rp * (Hz(i, j, icu_k) + Hz(i - 1, j, icu_k)))
+            cpl_prb(17) = uint / max(Dcol, 1.0e-30_rp)
+            cpl_prb(18) = DU_avg1(i, j) / max(Dcol * dn_u(i, j), 1.0e-30_rp)
+            cpl_prb(19) = mis
+            cpl_prb(32) = 1.0_rp
+          endif
+          do k = 1, nz
+            cff = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
+            u(i, j, k, n_new) = u(i, j, k, n_new) / cff - mis
+          enddo
+        else
+          do k = 1, nz
+            u(i, j, k, n_new) = 0.0_rp
+          enddo
+        endif
+      enddo
+    enddo
+    else
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -565,6 +614,7 @@ contains
         endif
       enddo
     enddo
+    endif
     if (probe_c .or. ic_on) then
       call sync_arch()
       if (cpl_prb(30) == 1.0_rp) call dump_cpl1_u(ip4, jp4, cpl_prb(1), cpl_prb(2), &
@@ -576,6 +626,34 @@ contains
              cpl_prb(17), cpl_prb(18), cpl_prb(19)
       endif
     endif
+    if (.not. probe_c) then
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = j_v0, ny
+      do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
+        if (vmask(i, j) > 0.5_rp) then
+          Dcol = 0.0_rp
+          uint = 0.0_rp
+          do k = 1, nz
+            cff = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k))
+            Dcol = Dcol + cff
+            uint = uint + v(i, j, k, n_new)
+          enddo
+          mis = (uint * dm_v(i, j) - DV_avg1(i, j)) / (Dcol * dm_v(i, j))
+          do k = 1, nz
+            cff = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k))
+            v(i, j, k, n_new) = v(i, j, k, n_new) / cff - mis
+          enddo
+        else
+          do k = 1, nz
+            v(i, j, k, n_new) = 0.0_rp
+          enddo
+        endif
+      enddo
+    enddo
+    else
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -614,6 +692,7 @@ contains
         endif
       enddo
     enddo
+    endif
     if (probe_c) then
       call sync_arch()
       if (cpl_prb(31) == 1.0_rp) call dump_cpl1(ip4, jp4, cpl_prb(8), cpl_prb(9), &
@@ -642,19 +721,19 @@ contains
           uint = 0.0_rp
           do k = 1, nz
             hz_dn = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j)
-            col_dc(i, j, k) = hz_dn
             Dcol = Dcol + hz_dn
             uint = uint + hz_dn * u(i, j, k, n_new)
           enddo
           ubar(i, j, kn) = DU_avg1(i, j) / Dcol
           mis_u = (uint - DU_avg1(i, j)) / Dcol
-          do k = 1, nz
-            u(i, j, k, n_new) = u(i, j, k, n_new) - mis_u
-          enddo
+          ! shift and flux in one pass (hz_dn recomputed, same expression)
           flx_int = 0.0_rp
           do k = 1, nz
-            flx_k = FLUX_DELTA * FlxU(i, j, k) + FLUX_EPSIL * col_dc(i, j, k) * &
-                    (u(i, j, k, n_stp) + u(i, j, k, n_new))
+            hz_dn = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j)
+            u_k = u(i, j, k, n_new) - mis_u
+            u(i, j, k, n_new) = u_k
+            flx_k = FLUX_DELTA * FlxU(i, j, k) + FLUX_EPSIL * hz_dn * &
+                    (u(i, j, k, n_stp) + u_k)
             col_dc(i, j, k) = flx_k
             flx_int = flx_int + flx_k
           enddo
@@ -687,19 +766,19 @@ contains
           uint = 0.0_rp
           do k = 1, nz
             hz_dn = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j)
-            col_dc(i, j, k) = hz_dn
             Dcol = Dcol + hz_dn
             uint = uint + hz_dn * v(i, j, k, n_new)
           enddo
           vbar(i, j, kn) = DV_avg1(i, j) / Dcol
           mis_u = (uint - DV_avg1(i, j)) / Dcol
-          do k = 1, nz
-            v(i, j, k, n_new) = v(i, j, k, n_new) - mis_u
-          enddo
+          ! shift and flux in one pass (hz_dn recomputed, same expression)
           flx_int = 0.0_rp
           do k = 1, nz
-            flx_k = FLUX_DELTA * FlxV(i, j, k) + FLUX_EPSIL * col_dc(i, j, k) * &
-                    (v(i, j, k, n_stp) + v(i, j, k, n_new))
+            hz_dn = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j)
+            u_k = v(i, j, k, n_new) - mis_u
+            v(i, j, k, n_new) = u_k
+            flx_k = FLUX_DELTA * FlxV(i, j, k) + FLUX_EPSIL * hz_dn * &
+                    (v(i, j, k, n_stp) + u_k)
             col_dc(i, j, k) = flx_k
             flx_int = flx_int + flx_k
           enddo

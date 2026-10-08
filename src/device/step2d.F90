@@ -17,7 +17,7 @@ module step2d_mod
        dump_zeta_obc, dump_vbar_obc, dump_fast_zeta_inc, dump_rvS
   use halo_mod
   use formulas
-  use obc, only: zetabc, u2dbc, v2dbc, uv2dbc_corners
+  use obc, only: zetabc, uv2dbc, uv2dbc_corners
   use comm_mod, only: comm_size
   use arch_mod, only: sync_arch, on_gpu, graph_is_ready, graph_begin, &
                       graph_end, graph_launch
@@ -169,8 +169,11 @@ contains
     call dump_fast_zeta_inc()
     call run_device_section(2)
     call dump_zeta_obc()
-    call host_uv_obc()
+    call host_uv_obc(.false.)
     call dump_vbar_obc()
+    ! (apply_volume_sources is empty; if it ever writes ubar/vbar it must
+    ! stay before accumulate_boundary_avg1, which step2d_tail now queues
+    ! behind the exchange pack.)
     call apply_volume_sources()
     call run_device_section(3)
     if (fast_is_last_h) call set_depth()
@@ -183,7 +186,7 @@ contains
     call step2d_pre()
     call host_zeta_obc()
     call step2d_mid()                        ! exchanges zeta(knew) before its halo PGF terms
-    call host_uv_obc()
+    call host_uv_obc(.true.)
     call halo_fill_uv_n(ubar, vbar)          ! every fast step, as the CPU step2d exchange
     if (fast_is_last_h) then
       call step2d_last_zeta()
@@ -540,12 +543,19 @@ contains
     enddo
   end subroutine host_subtract_barotropic_from_rufrc
 
-  subroutine host_uv_obc()
-    call u2dbc()
-    call v2dbc()
+  subroutine host_uv_obc(with_avg)
+    ! with_avg = .false.: step2d_tail runs accumulate_boundary_avg1 behind
+    ! the exchange pack (it reads only physical-edge cells, which no
+    ! exchange writes), so it overlaps the MPI transfer.
+    logical, intent(in) :: with_avg
+    call uv2dbc()
     call uv2dbc_corners()
-    call accumulate_boundary_avg1(fast_half_w1_h)
+    if (with_avg) call accumulate_boundary_avg1(fast_half_w1_h)
   end subroutine host_uv_obc
+
+  subroutine boundary_avg1_now()
+    call accumulate_boundary_avg1(fast_half_w1_h)
+  end subroutine boundary_avg1_now
 
   subroutine rho_bounds_r(ir0, ir1, jr0, jr1)
     integer(ip), intent(out) :: ir0, ir1, jr0, jr1
@@ -574,7 +584,7 @@ contains
     ! only the last fast step rewrites it (zt_avg1). ubar and vbar go in one
     ! exchange per direction.
     if (fast_is_last_h) call step2d_last_zeta()
-    call halo_fill_zuv_n(zeta, ubar, vbar)
+    call halo_fill_zuv_n(zeta, ubar, vbar, boundary_avg1_now)
   end subroutine step2d_tail
 
   subroutine seam_ring(iz_lo, iz_hi, jz_lo, jz_hi)
