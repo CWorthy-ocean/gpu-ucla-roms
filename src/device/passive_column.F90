@@ -32,15 +32,17 @@ contains
     ! implicit_tracer_columns. Shared by all passive tracers.
     real(rp), intent(in) :: dtau
     logical, intent(in) :: use_fwd
-    integer(ip) :: i, j, k, nx, ny, nz, iAkt
+    integer(ip) :: i, j, k, nx, ny, nz, iAkt, lim
     real(rp) :: cff, dc0, hz_k, hz_kp, fck, wck, cfk, fcm, wcm, cfm
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     iAkt = min(2_ip, int(size(Akt, 4), ip))
+    lim = dry_lim(G_TRC)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         dc0 = dtau * pm(i, j) * pn(i, j)
         if (use_fwd) then
           hz_k = Hz_fwd(i, j, 1); hz_kp = Hz_fwd(i, j, 2)
@@ -86,21 +88,22 @@ contains
   ! --------------------------------------- horizontal face divergences
   DEVICE_ATTR
   subroutine c4_div(itr, i, j, k, ts, ntr, is, ie, js, je, nz, nslot, t0, wedge, eedge, sedge, nedge, &
-                    um0, um1, um2, um3, vm0, vm1, vm2, vm3, fu1, fu2, fv1, fv2, tp_, hdiv)
+                    um0, um1, um2, um3, vm0, vm1, vm2, vm3, fu1, fu2, fv1, fv2, tp_, nb8, ncl, hdiv)
     ! fxe - fxw + fen - fes with the C4 faces of pc4_fx/pc4_fe (same expressions).
     integer(ip), intent(in) :: itr, i, j, k, ts, ntr, is, ie, js, je, nz, nslot
     real(rp), intent(in) :: t0, um0, um1, um2, um3, vm0, vm1, vm2, vm3, fu1, fu2, fv1, fv2
     logical, intent(in) :: wedge, eedge, sedge, nedge
-    real(pp), intent(in) :: tp_(ntr, is:ie, js:je, nz, nslot)
+    integer(ip), intent(in) :: ncl, nb8(8)
+    real(pp), intent(in) :: tp_(ntr, 0:ncl, nz, nslot)
     real(rp), intent(out) :: hdiv
     real(rp) :: tm2, tm1, tp1, tp2, dcw, dlw, drw, dre, fxw, fxe, fes, fen
-    tm1 = real(tp_(itr, i - 1, j, k, ts), rp)
-    tp1 = real(tp_(itr, i + 1, j, k, ts), rp)
+    tm1 = real(tp_(itr, nb8(2), k, ts), rp)
+    tp1 = real(tp_(itr, nb8(3), k, ts), rp)
     dcw = apply_mask(t0 - tm1, um1)
     if (wedge) then
       dlw = dcw
     else
-      tm2 = real(tp_(itr, i - 2, j, k, ts), rp)
+      tm2 = real(tp_(itr, nb8(1), k, ts), rp)
       dlw = apply_mask(tm1 - tm2, um0)
     endif
     drw = apply_mask(tp1 - t0, um2)
@@ -108,17 +111,17 @@ contains
     if (eedge) then
       dre = drw
     else
-      tp2 = real(tp_(itr, i + 2, j, k, ts), rp)
+      tp2 = real(tp_(itr, nb8(4), k, ts), rp)
       dre = apply_mask(tp2 - tp1, um3)
     endif
     fxe = apply_mask(0.5_rp * (tp1 + t0 - (dre - dcw) / 6.0_rp) * fu2, um2)
-    tm1 = real(tp_(itr, i, j - 1, k, ts), rp)
-    tp1 = real(tp_(itr, i, j + 1, k, ts), rp)
+    tm1 = real(tp_(itr, nb8(6), k, ts), rp)
+    tp1 = real(tp_(itr, nb8(7), k, ts), rp)
     dcw = apply_mask(t0 - tm1, vm1)
     if (sedge) then
       dlw = dcw
     else
-      tm2 = real(tp_(itr, i, j - 2, k, ts), rp)
+      tm2 = real(tp_(itr, nb8(5), k, ts), rp)
       dlw = apply_mask(tm1 - tm2, vm0)
     endif
     drw = apply_mask(tp1 - t0, vm2)
@@ -126,7 +129,7 @@ contains
     if (nedge) then
       dre = drw
     else
-      tp2 = real(tp_(itr, i, j + 2, k, ts), rp)
+      tp2 = real(tp_(itr, nb8(8), k, ts), rp)
       dre = apply_mask(tp2 - tp1, vm3)
     endif
     fen = apply_mask(0.5_rp * (tp1 + t0 - (dre - dcw) / 6.0_rp) * fv2, vm2)
@@ -135,21 +138,22 @@ contains
 
   DEVICE_ATTR
   subroutine up3_div(itr, i, j, k, ts, ntr, is, ie, js, je, nz, nslot, t0, wedge, eedge, sedge, nedge, &
-                     um0, um1, um2, um3, vm0, vm1, vm2, vm3, rmw, rmc, rme, rms, rmn, fu1, fu2, fv1, fv2, tp_, hdiv)
+                     um0, um1, um2, um3, vm0, vm1, vm2, vm3, rmw, rmc, rme, rms, rmn, fu1, fu2, fv1, fv2, tp_, nb8, ncl, hdiv)
     ! fxe - fxw + fen - fes with the UP3 faces of pup3_fx/pup3_fe (same expressions).
     integer(ip), intent(in) :: itr, i, j, k, ts, ntr, is, ie, js, je, nz, nslot
     real(rp), intent(in) :: t0, um0, um1, um2, um3, vm0, vm1, vm2, vm3, rmw, rmc, rme, rms, rmn, fu1, fu2, fv1, fv2
     logical, intent(in) :: wedge, eedge, sedge, nedge
-    real(pp), intent(in) :: tp_(ntr, is:ie, js:je, nz, nslot)
+    integer(ip), intent(in) :: ncl, nb8(8)
+    real(pp), intent(in) :: tp_(ntr, 0:ncl, nz, nslot)
     real(rp), intent(out) :: hdiv
     real(rp) :: tm2, tm1, tp1, tp2, dcw, dlw, drw, dre, fxw, fxe, fes, fen, face_t
-    tm1 = real(tp_(itr, i - 1, j, k, ts), rp)
-    tp1 = real(tp_(itr, i + 1, j, k, ts), rp)
+    tm1 = real(tp_(itr, nb8(2), k, ts), rp)
+    tp1 = real(tp_(itr, nb8(3), k, ts), rp)
     dcw = apply_mask(t0 - tm1, um1)
     if (wedge) then
       dlw = dcw
     else
-      tm2 = real(tp_(itr, i - 2, j, k, ts), rp)
+      tm2 = real(tp_(itr, nb8(1), k, ts), rp)
       dlw = apply_mask(tm1 - tm2, um0)
     endif
     drw = apply_mask(tp1 - t0, um2)
@@ -167,7 +171,7 @@ contains
     if (eedge) then
       dre = drw
     else
-      tp2 = real(tp_(itr, i + 2, j, k, ts), rp)
+      tp2 = real(tp_(itr, nb8(4), k, ts), rp)
       dre = apply_mask(tp2 - tp1, um3)
     endif
     if (rmc > 0.5_rp .and. rme > 0.5_rp) then
@@ -181,13 +185,13 @@ contains
     endif
     fxe = apply_mask(face_t * fu2 - coef_up3 * ( &
           (drw - dcw) * um1 * um2 * max(fu2, 0.0_rp) + (dre - drw) * um2 * um3 * min(fu2, 0.0_rp)), um2)
-    tm1 = real(tp_(itr, i, j - 1, k, ts), rp)
-    tp1 = real(tp_(itr, i, j + 1, k, ts), rp)
+    tm1 = real(tp_(itr, nb8(6), k, ts), rp)
+    tp1 = real(tp_(itr, nb8(7), k, ts), rp)
     dcw = apply_mask(t0 - tm1, vm1)
     if (sedge) then
       dlw = dcw
     else
-      tm2 = real(tp_(itr, i, j - 2, k, ts), rp)
+      tm2 = real(tp_(itr, nb8(5), k, ts), rp)
       dlw = apply_mask(tm1 - tm2, vm0)
     endif
     drw = apply_mask(tp1 - t0, vm2)
@@ -205,7 +209,7 @@ contains
     if (nedge) then
       dre = drw
     else
-      tp2 = real(tp_(itr, i, j + 2, k, ts), rp)
+      tp2 = real(tp_(itr, nb8(8), k, ts), rp)
       dre = apply_mask(tp2 - tp1, vm3)
     endif
     if (rmc > 0.5_rp .and. rmn > 0.5_rp) then
@@ -224,20 +228,48 @@ contains
 
   ! ----------------------------------- horizontal step, one thread per (tracer, cell)
   DEVICE_ATTR
-  subroutine horiz_point(itr, i, j, k, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, is, ie, js, je, nz, nslot, &
-                         west, east, south, north, tp_, Hz_, Hzb_, pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_)
+  subroutine horiz_point(itr, ci, i, j, k, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, is, ie, js, je, nz, nslot, &
+                         west, east, south, north, tp_, nbt_, ncl, nwet, Hz_, Hzb_, pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_)
     ! mode 1: LF-AM3 predictor with C4 faces from slot ts, old field in slot
     ! ns, saved Hz-weighted into slot nb, result into slot nn.
     ! mode 2: corrector, UP3 faces from slot ts applied to slot nn.
-    integer(ip), intent(in) :: itr, i, j, k, mode, ts, ns, nn, nb, ntr, nx, ny, is, ie, js, je, nz, nslot
+    integer(ip), intent(in) :: itr, ci, i, j, k, mode, ts, ns, nn, nb, ntr, nx, ny, is, ie, js, je, nz, nslot
     integer(ip), intent(in) :: west, east, south, north
     real(rp), intent(in) :: cs, cb, dtp
-    real(pp), intent(inout) :: tp_(ntr, is:ie, js:je, nz, nslot)
+    integer(ip), intent(in) :: ncl, nwet, nbt_(8, nwet)
+    real(pp), intent(inout) :: tp_(ntr, 0:ncl, nz, nslot)
     real(rp), intent(in) :: Hz_(is:ie, js:je, nz), Hzb_(is:ie, js:je, nz), FlxU_(is:ie, js:je, nz), FlxV_(is:ie, js:je, nz)
     real(rp), intent(in) :: pm_(is:ie, js:je), pn_(is:ie, js:je), umask_(is:ie, js:je), vmask_(is:ie, js:je), rmask_(is:ie, js:je)
     real(rp) :: dtpp, t0, hdiv, told, hb, hzc
     real(rp) :: um0, um1, um2, um3, vm0, vm1, vm2, vm3, fu1, fu2, fv1, fv2
     logical :: wedge, eedge, sedge, nedge
+    integer(ip) :: nb8(8)
+    ! x neighbours: wet cells of a row are consecutive columns, and a
+    ! neighbour's value is used only when the cells up to it are wet (the
+    ! faces are masked with apply_mask otherwise), so ci -/+ d is exact
+    ! whenever it matters and a finite tracer value when it does not. Halo
+    ! neighbours (outside 1:nx) and the y neighbours come from the table.
+    if (i - 2 >= 1) then
+      nb8(1) = max(ci - 2, 0_ip)
+    else
+      nb8(1) = nbt_(1, ci)
+    endif
+    if (i - 1 >= 1) then
+      nb8(2) = ci - 1
+    else
+      nb8(2) = nbt_(2, ci)
+    endif
+    if (i + 1 <= nx) then
+      nb8(3) = min(ci + 1, ncl)
+    else
+      nb8(3) = nbt_(3, ci)
+    endif
+    if (i + 2 <= nx) then
+      nb8(4) = min(ci + 2, ncl)
+    else
+      nb8(4) = nbt_(4, ci)
+    endif
+    nb8(5) = nbt_(5, ci); nb8(6) = nbt_(6, ci); nb8(7) = nbt_(7, ci); nb8(8) = nbt_(8, ci)
     dtpp = dtp * pm_(i, j) * pn_(i, j)
     um0 = umask_(i - 1, j); um1 = umask_(i, j); um2 = umask_(i + 1, j); um3 = umask_(i + 2, j)
     vm0 = vmask_(i, j - 1); vm1 = vmask_(i, j); vm2 = vmask_(i, j + 1); vm3 = vmask_(i, j + 2)
@@ -247,64 +279,66 @@ contains
     eedge = (east == 1 .and. i == nx)
     sedge = (south == 1 .and. j == 1)
     nedge = (north == 1 .and. j == ny)
-    t0 = real(tp_(itr, i, j, k, ts), rp)
+    t0 = real(tp_(itr, ci, k, ts), rp)
     if (mode == 1) then
       call c4_div(itr, i, j, k, ts, ntr, is, ie, js, je, nz, nslot, t0, wedge, eedge, sedge, nedge, &
-                  um0, um1, um2, um3, vm0, vm1, vm2, vm3, fu1, fu2, fv1, fv2, tp_, hdiv)
+                  um0, um1, um2, um3, vm0, vm1, vm2, vm3, fu1, fu2, fv1, fv2, tp_, nb8, ncl, hdiv)
       hb = Hzb_(i, j, k); hzc = Hz_(i, j, k)
-      told = real(tp_(itr, i, j, k, ns), rp)
-      tp_(itr, i, j, k, nn) = real(hb * (cs * told + cb * real(tp_(itr, i, j, k, nb), rp)) - dtpp * hdiv, pp)
-      tp_(itr, i, j, k, nb) = real(hzc * told, pp)
+      told = real(tp_(itr, ci, k, ns), rp)
+      tp_(itr, ci, k, nn) = real(hb * (cs * told + cb * real(tp_(itr, ci, k, nb), rp)) - dtpp * hdiv, pp)
+      tp_(itr, ci, k, nb) = real(hzc * told, pp)
     else
       call up3_div(itr, i, j, k, ts, ntr, is, ie, js, je, nz, nslot, t0, wedge, eedge, sedge, nedge, &
                    um0, um1, um2, um3, vm0, vm1, vm2, vm3, rmask_(i - 1, j), rmask_(i, j), rmask_(i + 1, j), &
-                   rmask_(i, j - 1), rmask_(i, j + 1), fu1, fu2, fv1, fv2, tp_, hdiv)
-      tp_(itr, i, j, k, nn) = real(real(tp_(itr, i, j, k, nn), rp) - dtpp * hdiv, pp)
+                   rmask_(i, j - 1), rmask_(i, j + 1), fu1, fu2, fv1, fv2, tp_, nb8, ncl, hdiv)
+      tp_(itr, ci, k, nn) = real(real(tp_(itr, ci, k, nn), rp) - dtpp * hdiv, pp)
     endif
   end subroutine horiz_point
 
   ! ------------------------------ lateral diffusion, one thread per (tracer, cell)
   DEVICE_ATTR
-  subroutine t3dmix_point(itr, i, j, k, nr, nn, dtl, isl, ntr, is, ie, js, je, nz, nslot, nd, &
-                          tp_, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
+  subroutine t3dmix_point(itr, ci, i, j, k, nr, nn, dtl, isl, ntr, nx, is, ie, js, je, nz, nslot, nd, &
+                          tp_, nbt_, ncl, nwet, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
     ! Harmonic diffusion along s-surfaces with the salinity diffusivity,
     ! faces computed inline (same expressions as the former passive_t3dmix).
-    integer(ip), intent(in) :: itr, i, j, k, nr, nn, isl, ntr, is, ie, js, je, nz, nslot, nd
+    integer(ip), intent(in) :: itr, ci, i, j, k, nr, nn, isl, ntr, nx, is, ie, js, je, nz, nslot, nd
     real(rp), intent(in) :: dtl
-    real(pp), intent(inout) :: tp_(ntr, is:ie, js:je, nz, nslot)
+    integer(ip), intent(in) :: ncl, nwet, nbt_(8, nwet)
+    real(pp), intent(inout) :: tp_(ntr, 0:ncl, nz, nslot)
     real(rp), intent(in) :: Hz_(is:ie, js:je, nz), pm_(is:ie, js:je), pn_(is:ie, js:je)
     real(rp), intent(in) :: pmon_u_(is:ie, js:je), pnom_v_(is:ie, js:je), umask_(is:ie, js:je), vmask_(is:ie, js:je)
     real(rp), intent(in) :: diff2_(is:ie, js:je, nd)
     real(rp) :: fxw, fxe, fes, fen
     fxw = apply_mask(0.25_rp * (diff2_(i, j, isl) + diff2_(i - 1, j, isl)) * &
          pmon_u_(i, j) * (Hz_(i, j, k) + Hz_(i - 1, j, k)) * &
-         (real(tp_(itr, i, j, k, nr), rp) - real(tp_(itr, i - 1, j, k, nr), rp)), umask_(i, j))
+         (real(tp_(itr, ci, k, nr), rp) - real(tp_(itr, nbt_(2, ci), k, nr), rp)), umask_(i, j))
     fxe = apply_mask(0.25_rp * (diff2_(i + 1, j, isl) + diff2_(i, j, isl)) * &
          pmon_u_(i + 1, j) * (Hz_(i + 1, j, k) + Hz_(i, j, k)) * &
-         (real(tp_(itr, i + 1, j, k, nr), rp) - real(tp_(itr, i, j, k, nr), rp)), umask_(i + 1, j))
+         (real(tp_(itr, nbt_(3, ci), k, nr), rp) - real(tp_(itr, ci, k, nr), rp)), umask_(i + 1, j))
     fes = apply_mask(0.25_rp * (diff2_(i, j, isl) + diff2_(i, j - 1, isl)) * &
          pnom_v_(i, j) * (Hz_(i, j, k) + Hz_(i, j - 1, k)) * &
-         (real(tp_(itr, i, j, k, nr), rp) - real(tp_(itr, i, j - 1, k, nr), rp)), vmask_(i, j))
+         (real(tp_(itr, ci, k, nr), rp) - real(tp_(itr, nbt_(6, ci), k, nr), rp)), vmask_(i, j))
     fen = apply_mask(0.25_rp * (diff2_(i, j + 1, isl) + diff2_(i, j, isl)) * &
          pnom_v_(i, j + 1) * (Hz_(i, j + 1, k) + Hz_(i, j, k)) * &
-         (real(tp_(itr, i, j + 1, k, nr), rp) - real(tp_(itr, i, j, k, nr), rp)), vmask_(i, j + 1))
-    tp_(itr, i, j, k, nn) = real(real(tp_(itr, i, j, k, nn), rp) + dtl * pm_(i, j) * pn_(i, j) * &
+         (real(tp_(itr, nbt_(7, ci), k, nr), rp) - real(tp_(itr, ci, k, nr), rp)), vmask_(i, j + 1))
+    tp_(itr, ci, k, nn) = real(real(tp_(itr, ci, k, nn), rp) + dtl * pm_(i, j) * pn_(i, j) * &
          (fxe - fxw + fen - fes) / max(Hz_(i, j, k), 1.0e-30_rp), pp)
   end subroutine t3dmix_point
 
   ! ------------------- vertical advection + implicit solve, one thread per (tracer, column)
   DEVICE_ATTR
-  subroutine column_point(itr, i, j, ts, nn, ctr, dtp, ntr, is, ie, js, je, nz, nslot, nts, isl, mir, &
-                          tp_, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
+  subroutine column_point(itr, ci, i, j, ts, nn, ctr, dtp, ntr, is, ie, js, je, nz, nslot, nts, isl, mir, &
+                          tp_, nbt_, ncl, nwet, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
     ! The vertical flux divergence (vert_column_fused arithmetic, sliding
     ! window over k) feeds the Thomas forward sweep level by level, with
     ! the intermediate dc kept in place in tp(nn); then the back
     ! substitution. ctr = 1: centred (predictor), 0: upwind-weighted
     ! (corrector). mir = 1: tracer 1 receives salinity's surface flux and
     ! the KPP nonlocal term between the vertical advection and the solve.
-    integer(ip), intent(in) :: itr, i, j, ts, nn, ctr, ntr, is, ie, js, je, nz, nslot, nts, isl, mir
+    integer(ip), intent(in) :: itr, ci, i, j, ts, nn, ctr, ntr, is, ie, js, je, nz, nslot, nts, isl, mir
     real(rp), intent(in) :: dtp
-    real(pp), intent(inout) :: tp_(ntr, is:ie, js:je, nz, nslot)
+    integer(ip), intent(in) :: ncl, nwet, nbt_(8, nwet)
+    real(pp), intent(inout) :: tp_(ntr, 0:ncl, nz, nslot)
     real(rp), intent(in) :: Hz_(is:ie, js:je, nz), We_(is:ie, js:je, 0:nz)
     real(rp), intent(in) :: pm_(is:ie, js:je), pn_(is:ie, js:je), rmask_(is:ie, js:je)
     real(rp), intent(in) :: stflx_(is:ie, js:je, nts), ghat_(is:ie, js:je, 0:nz)
@@ -324,8 +358,8 @@ contains
     Hz_km1 = Hz_k
     Hz_kp2 = Hz_kp1
     w = 0.0_rp
-    t_k = real(tp_(itr, i, j, 1, ts), rp)
-    t_kp1 = real(tp_(itr, i, j, 2, ts), rp)
+    t_k = real(tp_(itr, ci, 1, ts), rp)
+    t_kp1 = real(tp_(itr, ci, 2, ts), rp)
     t_km1 = t_k
     t_kp2 = t_kp1
     fz_lo = 0.0_rp
@@ -348,7 +382,7 @@ contains
         if (at_surface) then
           t_kp2 = t_kp1
         else
-          t_kp2 = real(tp_(itr, i, j, k + 2, ts), rp)
+          t_kp2 = real(tp_(itr, ci, k + 2, ts), rp)
         endif
         tplus = thickness_tplus(t_km1, t_k, t_kp1, Hz_km1, Hz_k, Hz_kp1, at_bottom)
         tminus = thickness_tminus(t_km1, t_k, t_kp1, t_kp2, Hz_km1, Hz_k, Hz_kp1, Hz_kp2, at_bottom, at_surface)
@@ -361,7 +395,7 @@ contains
       else
         fz_k = 0.0_rp
       endif
-      rhs = real(real(tp_(itr, i, j, k, nn), rp) - dtpp * (fz_k - fz_lo), pp)
+      rhs = real(real(tp_(itr, ci, k, nn), rp) - dtpp * (fz_k - fz_lo), pp)
       fz_lo = fz_k
       t_km1 = t_k; t_k = t_kp1; t_kp1 = t_kp2
       if (mir == 1 .and. itr == 1) then
@@ -378,13 +412,13 @@ contains
       endif
       if (k == 1) then
         dck = fck * rhs
-        tp_(itr, i, j, k, nn) = real(dck, pp)
+        tp_(itr, ci, k, nn) = real(dck, pp)
       else if (k < nz) then
         dck = fck * (rhs + dck * wcm)
-        tp_(itr, i, j, k, nn) = real(dck, pp)
+        tp_(itr, ci, k, nn) = real(dck, pp)
       else
         tt = apply_mask((rhs + dck * wcm) * fck, rm)
-        tp_(itr, i, j, k, nn) = real(tt, pp)
+        tp_(itr, ci, k, nn) = real(tt, pp)
         dck = tt
       endif
       if (k < nz) then
@@ -395,21 +429,23 @@ contains
     ! ---- surface to bottom: back substitution (dck holds the level above)
     do k = nz - 1, 1, -1
       cfk = cf_(i, j, k)
-      tt = apply_mask(real(tp_(itr, i, j, k, nn), rp) + cfk * dck, rm)
-      tp_(itr, i, j, k, nn) = real(tt, pp)
+      tt = apply_mask(real(tp_(itr, ci, k, nn), rp) + cfk * dck, rm)
+      tp_(itr, ci, k, nn) = real(tt, pp)
       dck = tt
     enddo
   end subroutine column_point
 
 #ifdef USE_CUDA
   attributes(global) subroutine horiz_kernel(nel, nwet, wet_i, wet_j, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, nz, is, ie, js, je, nslot, &
-                                             west, east, south, north, tp_, Hz_, Hzb_, pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_)
+                                             west, east, south, north, tp_, nbt_, ncl, Hz_, Hzb_, pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_)
     integer(ip), value :: nel, mode, ts, ns, nn, nb, ntr, nx, ny, nz, is, ie, js, je, nslot, west, east, south, north
     integer(ip), value :: nwet
     integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
     integer(ip) :: cc
     real(rp), value :: cs, cb, dtp
-    real(pp), device, intent(inout) :: tp_(ntr, is:ie, js:je, nz, nslot)
+    integer(ip), value :: ncl
+    integer(ip), device, intent(in) :: nbt_(8, nwet)
+    real(pp), device, intent(inout) :: tp_(ntr, 0:ncl, nz, nslot)
     real(rp), device, intent(in) :: Hz_(is:ie, js:je, nz), Hzb_(is:ie, js:je, nz), FlxU_(is:ie, js:je, nz), FlxV_(is:ie, js:je, nz)
     real(rp), device, intent(in) :: pm_(is:ie, js:je), pn_(is:ie, js:je), umask_(is:ie, js:je), vmask_(is:ie, js:je), rmask_(is:ie, js:je)
     integer(ip) :: tid, c, itr, i, j, k
@@ -418,18 +454,20 @@ contains
     itr = mod(tid - 1, ntr) + 1; c = (tid - 1) / ntr
     cc = mod(c, nwet) + 1; k = c / nwet + 1
     i = wet_i(cc); j = wet_j(cc)
-    call horiz_point(itr, i, j, k, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, is, ie, js, je, nz, nslot, &
-                     west, east, south, north, tp_, Hz_, Hzb_, pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_)
+    call horiz_point(itr, cc, i, j, k, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, is, ie, js, je, nz, nslot, &
+                     west, east, south, north, tp_, nbt_, ncl, nwet, Hz_, Hzb_, pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_)
   end subroutine horiz_kernel
 
   attributes(global) subroutine t3dmix_kernel(nel, nwet, wet_i, wet_j, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, nslot, nd, &
-                                              tp_, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
+                                              tp_, nbt_, ncl, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
     integer(ip), value :: nel, nr, nn, isl, ntr, nx, ny, nz, is, ie, js, je, nslot, nd
     integer(ip), value :: nwet
     integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
     integer(ip) :: cc
     real(rp), value :: dtl
-    real(pp), device, intent(inout) :: tp_(ntr, is:ie, js:je, nz, nslot)
+    integer(ip), value :: ncl
+    integer(ip), device, intent(in) :: nbt_(8, nwet)
+    real(pp), device, intent(inout) :: tp_(ntr, 0:ncl, nz, nslot)
     real(rp), device, intent(in) :: Hz_(is:ie, js:je, nz), pm_(is:ie, js:je), pn_(is:ie, js:je)
     real(rp), device, intent(in) :: pmon_u_(is:ie, js:je), pnom_v_(is:ie, js:je), umask_(is:ie, js:je), vmask_(is:ie, js:je)
     real(rp), device, intent(in) :: diff2_(is:ie, js:je, nd)
@@ -439,18 +477,20 @@ contains
     itr = mod(tid - 1, ntr) + 1; c = (tid - 1) / ntr
     cc = mod(c, nwet) + 1; k = c / nwet + 1
     i = wet_i(cc); j = wet_j(cc)
-    call t3dmix_point(itr, i, j, k, nr, nn, dtl, isl, ntr, is, ie, js, je, nz, nslot, nd, &
-                      tp_, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
+    call t3dmix_point(itr, cc, i, j, k, nr, nn, dtl, isl, ntr, nx, is, ie, js, je, nz, nslot, nd, &
+                      tp_, nbt_, ncl, nwet, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
   end subroutine t3dmix_kernel
 
   attributes(global) subroutine column_kernel(nel, nwet, wet_i, wet_j, ts, nn, ctr, dtp, ntr, nx, ny, nz, is, ie, js, je, nslot, nts, isl, mir, &
-                                              tp_, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
+                                              tp_, nbt_, ncl, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
     integer(ip), value :: nel, ts, nn, ctr, ntr, nx, ny, nz, is, ie, js, je, nslot, nts, isl, mir
     integer(ip), value :: nwet
     integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
     integer(ip) :: cc
     real(rp), value :: dtp
-    real(pp), device, intent(inout) :: tp_(ntr, is:ie, js:je, nz, nslot)
+    integer(ip), value :: ncl
+    integer(ip), device, intent(in) :: nbt_(8, nwet)
+    real(pp), device, intent(inout) :: tp_(ntr, 0:ncl, nz, nslot)
     real(rp), device, intent(in) :: Hz_(is:ie, js:je, nz), We_(is:ie, js:je, 0:nz)
     real(rp), device, intent(in) :: pm_(is:ie, js:je), pn_(is:ie, js:je), rmask_(is:ie, js:je)
     real(rp), device, intent(in) :: stflx_(is:ie, js:je, nts), ghat_(is:ie, js:je, 0:nz)
@@ -460,15 +500,15 @@ contains
     if (tid > nel) return
     itr = mod(tid - 1, ntr) + 1; c = (tid - 1) / ntr
     i = wet_i(c + 1); j = wet_j(c + 1)
-    call column_point(itr, i, j, ts, nn, ctr, dtp, ntr, is, ie, js, je, nz, nslot, nts, isl, mir, &
-                      tp_, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
+    call column_point(itr, c + 1, i, j, ts, nn, ctr, dtp, ntr, is, ie, js, je, nz, nslot, nts, isl, mir, &
+                      tp_, nbt_, ncl, nwet, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
   end subroutine column_kernel
 #endif
 
   ! ------------------------------------------------------------ launchers
   subroutine passive_horiz_run(tp, ntr, mode, ts, ns, nn, nb, cs, cb, dtp)
     integer(ip), intent(in) :: ntr, mode, ts, ns, nn, nb
-    real(pp), WORK_ATTR intent(inout) :: tp(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: tp(ntr, 0:ntpcol, decomp%nz, 3)
     real(rp), intent(in) :: cs, cb, dtp
     integer(ip) :: nx, ny, nz, is, ie, js, je, nel, west, east, south, north
 #ifndef USE_CUDA
@@ -483,18 +523,19 @@ contains
     nel = ntr * nwet * nz
 #ifdef USE_CUDA
     call horiz_kernel<<<(nel + 127) / 128, 128>>>(nel, nwet, wet_i, wet_j, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, nz, is, ie, js, je, 3_ip, &
-         west, east, south, north, tp, Hz, Hz_bak, pm, pn, FlxU, FlxV, umask, vmask, rmask)
+         west, east, south, north, tp, tpnb, ntpcol, Hz, Hz_bak, pm, pn, FlxU, FlxV, umask, vmask, rmask)
 #else
     do k = 1, nz; do j = 1, ny; do i = 1, nx; do itr = 1, ntr
-      call horiz_point(itr, i, j, k, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, is, ie, js, je, nz, 3_ip, &
-                       west, east, south, north, tp, Hz, Hz_bak, pm, pn, FlxU, FlxV, umask, vmask, rmask)
+      if (tpcol(i, j) == 0) cycle
+      call horiz_point(itr, tpcol(i, j), i, j, k, mode, ts, ns, nn, nb, cs, cb, dtp, ntr, nx, ny, is, ie, js, je, nz, 3_ip, &
+                       west, east, south, north, tp, tpnb, ntpcol, Hz, Hz_bak, pm, pn, FlxU, FlxV, umask, vmask, rmask)
     enddo; enddo; enddo; enddo
 #endif
   end subroutine passive_horiz_run
 
   subroutine passive_t3dmix_run(tp, ntr, nr, nn, dtl)
     integer(ip), intent(in) :: ntr, nr, nn
-    real(pp), WORK_ATTR intent(inout) :: tp(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: tp(ntr, 0:ntpcol, decomp%nz, 3)
     real(rp), intent(in) :: dtl
     integer(ip) :: nx, ny, nz, is, ie, js, je, nel, isl, nd
 #ifndef USE_CUDA
@@ -506,11 +547,12 @@ contains
     nel = ntr * nwet * nz
 #ifdef USE_CUDA
     call t3dmix_kernel<<<(nel + 127) / 128, 128>>>(nel, nwet, wet_i, wet_j, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, 3_ip, nd, &
-         tp, Hz, pm, pn, pmon_u, pnom_v, umask, vmask, diff2)
+         tp, tpnb, ntpcol, Hz, pm, pn, pmon_u, pnom_v, umask, vmask, diff2)
 #else
     do k = 1, nz; do j = 1, ny; do i = 1, nx; do itr = 1, ntr
-      call t3dmix_point(itr, i, j, k, nr, nn, dtl, isl, ntr, is, ie, js, je, nz, 3_ip, nd, &
-                        tp, Hz, pm, pn, pmon_u, pnom_v, umask, vmask, diff2)
+      if (tpcol(i, j) == 0) cycle
+      call t3dmix_point(itr, tpcol(i, j), i, j, k, nr, nn, dtl, isl, ntr, nx, is, ie, js, je, nz, 3_ip, nd, &
+                        tp, tpnb, ntpcol, Hz, pm, pn, pmon_u, pnom_v, umask, vmask, diff2)
     enddo; enddo; enddo; enddo
 #endif
   end subroutine passive_t3dmix_run
@@ -518,7 +560,7 @@ contains
   subroutine passive_column_run(tp, ntr, ts, nn, dtp, ctr, use_fwd, mirror)
     ! Factorization, then one thread per (tracer, column).
     integer(ip), intent(in) :: ntr, ts, nn, ctr
-    real(pp), WORK_ATTR intent(inout) :: tp(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: tp(ntr, 0:ntpcol, decomp%nz, 3)
     real(rp), intent(in) :: dtp
     logical, intent(in) :: use_fwd, mirror
     integer(ip) :: nx, ny, nz, mir, is, ie, js, je, nts, isl, nel
@@ -533,11 +575,12 @@ contains
     call passive_factor(dtp, use_fwd)
 #ifdef USE_CUDA
     call column_kernel<<<(nel + 127) / 128, 128>>>(nel, nwet, wet_i, wet_j, ts, nn, ctr, dtp, ntr, nx, ny, nz, is, ie, js, je, 3_ip, nts, isl, mir, &
-         tp, Hz, We, pm, pn, rmask, stflx, ghat, col_fc, col_cf, col_wc)
+         tp, tpnb, ntpcol, Hz, We, pm, pn, rmask, stflx, ghat, col_fc, col_cf, col_wc)
 #else
     do j = 1, ny; do i = 1, nx; do itr = 1, ntr
-      call column_point(itr, i, j, ts, nn, ctr, dtp, ntr, is, ie, js, je, nz, 3_ip, nts, isl, mir, &
-                        tp, Hz, We, pm, pn, rmask, stflx, ghat, col_fc, col_cf, col_wc)
+      if (tpcol(i, j) == 0) cycle
+      call column_point(itr, tpcol(i, j), i, j, ts, nn, ctr, dtp, ntr, is, ie, js, je, nz, 3_ip, nts, isl, mir, &
+                        tp, tpnb, ntpcol, Hz, We, pm, pn, rmask, stflx, ghat, col_fc, col_cf, col_wc)
     enddo; enddo; enddo
 #endif
   end subroutine passive_column_run

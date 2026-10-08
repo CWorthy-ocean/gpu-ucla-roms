@@ -18,7 +18,7 @@ contains
   subroutine rho_eos(tidx)
     integer(ip), intent(in) :: tidx
     integer(ip) :: i, j, k, nx, ny, nz, tid
-    integer(ip) :: i0, i1, j0, j1
+    integer(ip) :: i0, i1, j0, j1, lim
     real(rp) :: Tt, Ts, r1, q1, dpth, cff, cff1, cffg, rm
     real(rp) :: r1u, q1u, zru, r1m, q1m, zrk, bv, rS, rA
     logical :: has_salt, edge_w, edge_e, edge_s, edge_n
@@ -48,9 +48,9 @@ contains
     call hg_add(F_ZR)
     call hg_add(F_ZW)
     call hg_end()
-    write(*,'(a)') 'step: rho_eos prehalo'
-    flush(6)
-    call sync_arch()
+    ! (The kernel runs on the legacy default stream, which orders it after
+    ! the exchange's work_stream kernels; no host sync needed.)
+    lim = dry_lim(G_EOS)
 
     cffg = g / rho0
     cff1 = 1.0_rp / rho0
@@ -64,6 +64,7 @@ contains
 #endif
     do j = j0, j1
       do i = i0, i1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         rm = rmask(i, j)
         ! Level nz: EOS, start of the vertical sums.
         Tt = t(i, j, nz, tid, itemp)
@@ -117,9 +118,6 @@ contains
         rhoS(i, j) = apply_mask(2.0_rp * cff * cff * cff1 * rS, (rm))
       enddo
     enddo
-    call sync_arch()
-    write(*,'(a)') 'step: rho_eos kernel'
-    flush(6)
 
     call dump_eos(tid)
 

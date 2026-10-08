@@ -21,6 +21,7 @@ module par_read
   use nc_io, only: nc_check
   use comm_mod, only: comm_rank, comm_size, comm_compute
   use decomp_mod, only: decomp
+  use gpu_state, only: tpcol, ntpcol
 #ifdef USE_CUDA
   use cudafor
 #endif
@@ -463,12 +464,14 @@ contains
   end subroutine pr_store_3d
 
   subroutine pr_store_3d_pt(ncid, name, a, ntr, itr, i0, j0, n1, n2, n3, rec, i0f, j0f)
-    ! Tracer itr of a (ntr, is:ie, js:je, n3) passive array.
+    ! Tracer itr of one slot of the compressed passive array (ntr,
+    ! 0:ntpcol, n3): the window is scattered through tpcol; unstored
+    ! (land) points are left out, their column stays zero.
     integer,          intent(in) :: ncid, ntr, itr, i0, j0, n1, n2, n3
     character(len=*), intent(in) :: name
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, n3)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, n3)
     integer,          intent(in), optional :: rec, i0f, j0f
-    integer :: r, fi, fj, k, i, j, kk, ia, ja, it
+    integer :: r, fi, fj, k, i, j, kk, ia, ja, it, cc
     r = 0; fi = 1; fj = 1
     if (present(rec)) r = rec
     if (present(i0f)) fi = i0f
@@ -485,7 +488,8 @@ contains
       do kk = 1, n3
         do j = 1, n2
           do i = 1, n1
-            a(it, ia + i - 1, ja + j - 1, kk) = real(dstage(((kk - 1) * n2 + (j - 1)) * n1 + i), pp)
+            cc = tpcol(ia + i - 1, ja + j - 1)
+            if (cc > 0) a(it, cc, kk) = real(dstage(((kk - 1) * n2 + (j - 1)) * n1 + i), pp)
           enddo
         enddo
       enddo

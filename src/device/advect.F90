@@ -587,7 +587,7 @@ contains
     ! pre_step3d horizontal C4 predictor for all tracers (see above).
     integer(ip), intent(in) :: tidx, n_stp, n_new, indx
     real(rp), intent(in) :: dtau, cf_stp, cf_bak
-    integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, ns, nn, nb
+    integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, ns, nn, nb, lim
     integer(ip) :: west, east, south, north
     real(rp) :: dtp, cs, cb, dtpp, hb, hzc
 
@@ -599,12 +599,14 @@ contains
     south = merge(1_ip, 0_ip, decomp%edge_s)
     north = merge(1_ip, 0_ip, decomp%edge_n)
     call tracer_halos(tidx, .true., .false.)
+    lim = dry_lim(G_TRC)
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*>>>
 #endif
     do k = 1, nz
       do j = 1, ny
         do i = 1, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           dtpp = dtp * pm(i, j) * pn(i, j)
           hb = Hz_bak(i, j, k)
           hzc = Hz(i, j, k)
@@ -639,18 +641,20 @@ contains
     ! 0: upstream-biased (corrector).
     integer(ip), intent(in) :: tidx, n_new, ctr
     real(rp), intent(in) :: dtp
-    integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, nn, ctr_l
+    integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, nn, ctr_l, lim
     real(rp) :: dtpp, fz_lo, fz_k, tplus, tminus, rm, w
     real(rp) :: t_km1, t_k, t_kp1, t_kp2, Hz_km1, Hz_k, Hz_kp1, Hz_kp2
     logical :: at_bottom, at_surface
 
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = nt
     ts = tidx; nn = n_new; ctr_l = ctr
+    lim = dry_lim(G_TRC)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         dtpp = dtp * pm(i, j) * pn(i, j)
         rm = rmask(i, j)
         do itr = 1, ntr
@@ -699,7 +703,7 @@ contains
     ! for all tracers.
     integer(ip), intent(in) :: tidx, n_new
     real(rp), intent(in) :: dt_in
-    integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, nn
+    integer(ip) :: i, j, k, itr, nx, ny, nz, ntr, ts, nn, lim
     integer(ip) :: west, east, south, north
     real(rp) :: dtl, dtpp
 
@@ -710,12 +714,14 @@ contains
     south = merge(1_ip, 0_ip, decomp%edge_s)
     north = merge(1_ip, 0_ip, decomp%edge_n)
     call tracer_halos(tidx, .true., .true.)
+    lim = dry_lim(G_TRC)
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*>>>
 #endif
     do k = 1, nz
       do j = 1, ny
         do i = 1, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           dtpp = dtl * pm(i, j) * pn(i, j)
           do itr = 1, ntr
             t(i, j, k, nn, itr) = t(i, j, k, nn, itr) - dtpp * &

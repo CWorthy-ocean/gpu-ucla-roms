@@ -12,7 +12,7 @@ module case_io
   use bry_io, only: init_bry, set_bry_all
   use tide_io, only: read_tide_namelist, init_tides, set_tides
   use his_io, only: read_output_namelist, set_output_root, init_output
-  use comm_mod, only: comm_rank, comm_size
+  use comm_mod, only: comm_rank, comm_size, comm_min_real
   use tile_balance, only: balance_cuts, uniform_cuts
   use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
   use formulas, only: rho0_eos => rho0
@@ -42,10 +42,18 @@ module case_io
   ! case_tile_land_weight per land cell), 'uniform' uses equal widths,
   ! 'explicit' takes case_tile_xcut / case_tile_ycut from the namelist.
   character(len=16), public :: case_tile_balance = 'wet'
-  real(rp), public :: case_tile_land_weight = 0.25_rp
+  real(rp), public :: case_tile_land_weight = 0.10_rp   ! measured best on Pac with dry skip (2026-10-08)
   ! Largest tile area allowed, as a multiple of the mean (memory scales with
   ! cells, not wet cells): the land weight is raised until the cuts comply.
-  real(rp), public :: case_tile_max_cells = 1.2_rp
+  real(rp), public :: case_tile_max_cells = 0.0_rp   ! area cap (x mean), 0 = off
+  ! Memory cap of the 'wet' balance (2026-10-08): estimated tile memory
+  ! cells * mem_cell + wet * mem_wet must stay below max_mem (GB). 0 = auto:
+  ! 92% of the smallest device memory; 0.532*nz kB per cell (the fields of
+  ! the full tile, measured on Pac); 3*ntp*nz*bytes per wet column (the
+  ! passive tracers, stored over wet columns only).
+  real(rp), public :: case_tile_max_mem_gb = 0.0_rp
+  real(rp), public :: case_tile_mem_cell_kb = 0.0_rp, case_tile_mem_wet_kb = 0.0_rp
+  integer(ip), public :: case_ntp_est = 0
   integer(ip), public :: case_tile_xcut(64) = 0, case_tile_ycut(64) = 0
   integer(ip), public :: case_record = 1
   integer(ip), public :: case_nrrec = -1
@@ -137,6 +145,7 @@ contains
     call read_output_namelist(unit)
     call read_passive_namelist(unit, nt_passive)
     call read_marbl_namelist(unit, nml_dir, nt_bgc)
+    case_ntp_est = max(ntp, nt_bgc)
 
     rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios)
     call read_tile_settings(unit)   ! optional group; before the unit is closed
@@ -180,18 +189,24 @@ contains
     integer, intent(in) :: unit
     integer :: ios
     character(len=16) :: tile_balance
-    real(rp) :: tile_land_weight, tile_max_cells_ratio
+    real(rp) :: tile_land_weight, tile_max_cells_ratio, tile_max_mem_gb, tile_mem_cell_kb, tile_mem_wet_kb
     integer(ip) :: tile_xcut(64), tile_ycut(64)
-    namelist /tile_settings/ tile_balance, tile_land_weight, tile_xcut, tile_ycut, tile_max_cells_ratio
+    namelist /tile_settings/ tile_balance, tile_land_weight, tile_xcut, tile_ycut, tile_max_cells_ratio, &
+         tile_max_mem_gb, tile_mem_cell_kb, tile_mem_wet_kb
     tile_balance = case_tile_balance; tile_land_weight = case_tile_land_weight
     tile_max_cells_ratio = case_tile_max_cells
+    tile_max_mem_gb = case_tile_max_mem_gb
+    tile_mem_cell_kb = case_tile_mem_cell_kb; tile_mem_wet_kb = case_tile_mem_wet_kb
     tile_xcut = 0; tile_ycut = 0
     rewind(unit)
     read(unit, nml=tile_settings, iostat=ios)
     if (ios == 0) then
       case_tile_balance = tile_balance
       case_tile_land_weight = tile_land_weight
-      case_tile_max_cells = max(tile_max_cells_ratio, 1.0_rp)
+      case_tile_max_cells = tile_max_cells_ratio
+      if (case_tile_max_cells > 0.0_rp) case_tile_max_cells = max(case_tile_max_cells, 1.0_rp)
+      case_tile_max_mem_gb = tile_max_mem_gb
+      case_tile_mem_cell_kb = tile_mem_cell_kb; case_tile_mem_wet_kb = tile_mem_wet_kb
       case_tile_xcut = tile_xcut; case_tile_ycut = tile_ycut
     endif
   end subroutine read_tile_settings
@@ -273,7 +288,7 @@ contains
     integer :: ncid
     real(rp), allocatable :: mask(:,:), cost(:,:)
     real(rp) :: wland, tcost, cmax, cmean
-    real(rp) :: ratio
+    real(rp) :: ratio, memlim, mcell, mwet, memmax, mem
     integer :: cellmax
     character(len=16) :: mode
     gnx = case_llm; gny = case_mmm
@@ -304,8 +319,11 @@ contains
       call uniform_cuts(gnx, npx, xcut(0:npx))
       call uniform_cuts(gny, npy, ycut(0:npy))
     case default   ! 'wet'
-      ! Balance the wet-weighted cost, but keep every tile's area within
-      ! case_tile_max_cells of the mean: raise the land weight until it is.
+      ! Balance the wet-weighted cost, but keep every tile's estimated GPU
+      ! memory below the limit (and, when case_tile_max_cells is set, its
+      ! area within that multiple of the mean): raise the land weight
+      ! until both hold.
+      call tile_mem_model(memlim, mcell, mwet)
       do
         do j = 1, gny
           do i = 1, gnx
@@ -318,18 +336,36 @@ contains
         enddo
         call balance_cuts(cost, gnx, gny, npx, npy, minw, xcut(0:npx), ycut(0:npy))
         cellmax = 0
+        memmax = 0.0_rp
         do l = 1, npy
           do k = 1, npx
-            cellmax = max(cellmax, int(xcut(k) - xcut(k - 1)) * int(ycut(l) - ycut(l - 1)))
+            ncells = (xcut(k) - xcut(k - 1)) * (ycut(l) - ycut(l - 1))
+            cellmax = max(cellmax, int(ncells))
+            nwet = 0
+            do j = ycut(l - 1) + 1, ycut(l)
+              do i = xcut(k - 1) + 1, xcut(k)
+                if (mask(i + 1, j + 1) > 0.5_rp) nwet = nwet + 1
+              enddo
+            enddo
+            mem = (mcell * real(ncells, rp) + mwet * real(nwet, rp)) * 1.0e-6_rp   ! GB
+            memmax = max(memmax, mem)
           enddo
         enddo
         ratio = real(cellmax, rp) * real(npx * npy, rp) / real(gnx * gny, rp)
-        if (ratio <= case_tile_max_cells .or. wland >= 1.0_rp) exit
+        if ((case_tile_max_cells <= 0.0_rp .or. ratio <= case_tile_max_cells) .and. &
+            (memlim <= 0.0_rp .or. memmax <= memlim)) exit
+        if (wland >= 1.0_rp) exit
         wland = min(1.0_rp, wland * 1.5_rp)
       enddo
-      if (comm_rank() == 0 .and. wland /= case_tile_land_weight) &
-           write(*,'(a,f6.3,a,f6.3,a,f6.3,a)') 'tiles: land weight raised to ', wland, &
-           ' so the largest tile area is ', ratio, ' x mean (limit ', case_tile_max_cells, ')'
+      if (comm_rank() == 0) then
+        write(*,'(a,f7.2,a,f7.2,a,f7.2,a,f7.2,a)') 'tiles: memory model ', mcell, ' kB per cell + ', mwet, &
+             ' kB per wet cell; largest tile ', memmax, ' GB (limit ', memlim, ' GB)'
+        if (wland /= case_tile_land_weight) &
+             write(*,'(a,f6.3,a,f6.3,a)') 'tiles: land weight raised to ', wland, &
+             ' to fit the memory / area limits (largest tile area ', ratio, ' x mean)'
+        if (memlim > 0.0_rp .and. memmax > memlim) &
+             write(*,'(a)') 'tiles: WARNING the estimated memory of the largest tile exceeds the limit'
+      endif
     end select
     if (comm_rank() == 0) then
       write(*,'(a,a,a,f6.3)') 'tiles: balance = ', trim(mode), '  land weight = ', wland
@@ -356,6 +392,34 @@ contains
     endif
     deallocate(mask, cost)
   end subroutine tile_cuts
+
+  subroutine tile_mem_model(memlim, mcell, mwet)
+    ! Memory limit (GB) and model (kB per tile cell, kB per wet cell) of the
+    ! 'wet' balance; namelist values when set, otherwise the defaults above.
+    ! The limit is the same on every rank (minimum over the ranks).
+#ifdef USE_CUDA
+    use cudafor
+    integer(kind=cuda_count_kind) :: freeb, totalb
+    integer :: ierr
+#endif
+    real(rp), intent(out) :: memlim, mcell, mwet
+    real(rp) :: dev
+    mcell = case_tile_mem_cell_kb
+    if (mcell <= 0.0_rp) mcell = 0.532_rp * real(case_nz, rp)
+    mwet = case_tile_mem_wet_kb
+    if (mwet <= 0.0_rp) mwet = 3.0_rp * real(case_ntp_est, rp) * real(case_nz, rp) * &
+         real(storage_size(1.0_pp) / 8, rp) / 1000.0_rp
+    memlim = case_tile_max_mem_gb
+    if (memlim <= 0.0_rp) then
+      dev = 0.0_rp
+#ifdef USE_CUDA
+      ierr = cudaMemGetInfo(freeb, totalb)
+      if (ierr == 0) dev = real(totalb, rp) * 1.0e-9_rp
+#endif
+      memlim = 0.92_rp * dev
+    endif
+    memlim = comm_min_real(memlim)
+  end subroutine tile_mem_model
 
   subroutine read_s_coord(unit, theta_s_in, theta_b_in, hc_in)
     integer, intent(in) :: unit
@@ -430,7 +494,6 @@ contains
     call read_namelist(nml_path)
     call alloc_state(nt)
     if (marbl_on) call marbl_gpu_setup_tracers()
-    call alloc_passive()
 
     call nc_open_read(case_grdname, ncid)
     xi_rho = nc_dim_len(ncid, 'xi_rho')
@@ -486,6 +549,15 @@ contains
     call fill_static_halos()
     call setup_metrics()
     call build_wet_list()
+    call build_dry_map()
+    ! The passives are stored over wet columns (and the boundary rows) only,
+    ! so they are allocated once the mask is final.
+    call build_tp_columns()
+    call alloc_passive()
+    if (ntp > 0) write(*,'(a,i0,a,i0,a,i0,a)') 'passive storage: rank ', comm_rank(), '  columns ', ntpcol, &
+         ' of ', (decomp%ie - decomp%is + 1) * (decomp%je - decomp%js + 1), ' (wet + boundary rows)'
+    write(*,'(a,i0,a,i0,a,i0,a,i0)') 'dry skip: rank ', comm_rank(), '  wet ', nwet, &
+         '  deep-land ', ndeep, '  radius ', dry_radius
     visc2_r = visc2
     visc2_p = visc2
     diff2 = 0.0_rp
@@ -716,7 +788,7 @@ contains
         ! walk every page ntp times.
         do itp = 1, ntp
           if (.not. nc_has_var(ncid, trim(passive_name(itp)))) exit
-          call pr_store_3d_pt(ncid, trim(passive_name(itp)), tp(1, decomp%is, decomp%js, 1, tindx), ntp, itp, &
+          call pr_store_3d_pt(ncid, trim(passive_name(itp)), tp(1, 0, 1, tindx), ntp, itp, &
                               i0, j0, nxi, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
         enddo
         if (pr_taking()) passive_loaded = .true.

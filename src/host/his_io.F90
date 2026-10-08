@@ -217,7 +217,7 @@ contains
     if (wrt_salt) call io_stage_3d('salt', t(is, js, 1, n3, isalt), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
     if (wrt_passive) then
       do itp = 1, ntp
-        call io_stage_3d_pt(trim(passive_name(itp)), tp(1, is, js, 1, n3), ntp, itp, 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+        call io_stage_3d_pt(trim(passive_name(itp)), tp(1, 0, 1, n3), ntp, itp, 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
       enddo
     endif
     if (wrt_R)    call io_stage_3d('rho', rho1(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
@@ -273,7 +273,7 @@ contains
       call io_stage8_3d('temp', t(is, js, 1, n3, itemp), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
       call io_stage8_3d('salt', t(is, js, 1, n3, isalt), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
       do itp = 1, ntp
-        call io_stage8_3d_pt(trim(passive_name(itp)), tp(1, is, js, 1, n3), ntp, itp, 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
+        call io_stage8_3d_pt(trim(passive_name(itp)), tp(1, 0, 1, n3), ntp, itp, 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
       enddo
       call io_stage8_2d('hbls', hbls(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
       call io_stage8_2d('hbbl', hbbl(is, js), ir0, ir1, jr0, jr1, ir0, jr0)
@@ -305,7 +305,7 @@ contains
     call put_r3(ncid, 'temp', t(:,:,:,n3,itemp), rec_rst)
     call put_r3(ncid, 'salt', t(:,:,:,n3,isalt), rec_rst)
     do itp = 1, ntp
-      call put_r3_p(ncid, trim(passive_name(itp)), tp(itp,:,:,:,n3), rec_rst)
+      call put_r3_p(ncid, trim(passive_name(itp)), tp(itp,:,:,n3), rec_rst)
     enddo
     call put_r2(ncid, 'hbls', hbls, rec_rst)
     call put_r2(ncid, 'hbbl', hbbl, rec_rst)
@@ -501,20 +501,31 @@ contains
     ! float32 build, double when the passives are FP64 (MARBL runs).
     integer,          intent(in) :: ncid, rec
     character(len=*), intent(in) :: name
-    real(pp),         intent(in) :: src(decomp%is:, decomp%js:, :)
+    ! src(0:ntpcol, nz): one tracer of the compressed passive layout,
+    ! gathered to the (i, j) window through tpcol_h (unstored points: 0).
+    real(pp),         intent(in) :: src(0:, :)
     real(4), allocatable :: tmp(:,:,:)
     real(rp), allocatable :: tmp8(:,:,:)
+    real(pp), allocatable :: full(:,:,:)
+    integer(ip) :: i, j
+    allocate(full(ir0:ir1, jr0:jr1, decomp%nz))
+    do j = jr0, jr1
+      do i = ir0, ir1
+        full(i, j, :) = src(tpcol_h(i, j), 1:decomp%nz)
+      enddo
+    enddo
     if (pp == rp) then
       allocate(tmp8(nxi, neta, decomp%nz))
-      tmp8 = real(src(ir0:ir1, jr0:jr1, 1:decomp%nz), rp)
+      tmp8 = real(full(ir0:ir1, jr0:jr1, 1:decomp%nz), rp)
       call nc_put_3d_rec(ncid, name, tmp8, rec, int(decomp%i0) + ir0, int(decomp%j0) + jr0)
       deallocate(tmp8)
     else
       allocate(tmp(nxi, neta, decomp%nz))
-      tmp = real(src(ir0:ir1, jr0:jr1, 1:decomp%nz), 4)
+      tmp = real(full(ir0:ir1, jr0:jr1, 1:decomp%nz), 4)
       call nc_put_3d_rec_f(ncid, name, tmp, nxi, neta, decomp%nz, rec, int(decomp%i0) + ir0, int(decomp%j0) + jr0)
       deallocate(tmp)
     endif
+    deallocate(full)
   end subroutine put_r3_p
 
   subroutine put_u3(ncid, name, src, rec)

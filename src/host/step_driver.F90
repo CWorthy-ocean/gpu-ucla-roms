@@ -63,6 +63,7 @@ contains
     logical :: info_step
 
     if (iic < ntstart) iic = ntstart
+    call dry_skip_update(iic - ntstart)
     call update_clock()
     call set_probe_windows()
     probe_on = (iic - ntstart < probe_steps)

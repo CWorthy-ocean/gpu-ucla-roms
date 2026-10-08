@@ -20,7 +20,7 @@ module step3d_t_mod
 contains
 
   subroutine step3d_t()
-    integer(ip) :: i, j, k, itrc, iAkt, nx, ny, nz, n_new
+    integer(ip) :: i, j, k, itrc, iAkt, nx, ny, nz, n_new, lim
     real(rp) :: cff, dt_loc
     logical :: fused
 
@@ -38,6 +38,7 @@ contains
     ! Advection of all tracers in one launch when it is safe (see
     ! fuse_tracers); forcing, the implicit solve and the OBC stay per tracer.
     fused = fuse_tracers(nrhs, n_new, n_new)
+    lim = dry_lim(G_TRC)
     if (fused) call cor_tracers_fused(nrhs, n_new, dt_loc)
     do itrc = 1, nt
       if (.not. fused) then
@@ -79,6 +80,7 @@ contains
 #endif
           do j = 1, ny
             do i = 1, nx
+              if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
               t(i, j, nz, n_new, itemp) = t(i, j, nz, n_new, itemp) + &
                    dt_loc * swflx(i, j) * tair(i, j)
             enddo
@@ -89,6 +91,7 @@ contains
 #endif
           do j = 1, ny
             do i = 1, nx
+              if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
               t(i, j, nz, n_new, itemp) = t(i, j, nz, n_new, itemp) + dt_loc * swflx(i, j) * &
                    t(i, j, nz, n_new, itemp) / Hz(i, j, nz)
             enddo
@@ -100,6 +103,7 @@ contains
 #endif
       do j = 1, ny
         do i = 1, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           t(i, j, nz, n_new, itrc) = t(i, j, nz, n_new, itrc) + dt_loc * stflx(i, j, itrc)
 
           if (itrc == itemp) then

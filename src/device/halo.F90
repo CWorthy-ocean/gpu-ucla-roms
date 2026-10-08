@@ -11,7 +11,8 @@ module halo_mod
                       comm_post_dev, comm_wait_dev, comm_rank
   use gpu_state, only: Hz, z_r, z_w, FlxU, FlxV, We, Wi, u, v, t, rho1, qp1, rho, bvf, rhoA, rhoS, ru, rv, &
                        umask, vmask, rmask, sustr, svstr, stflx, srflx, f, hbls, hbbl, Akv, Akt, ghat, &
-                       rufrc, rvfrc, wrk3a, wrk3b, ubar, vbar, zeta
+                       rufrc, rvfrc, wrk3a, wrk3b, ubar, vbar, zeta, &
+                       tpcol, ntpcol
 #ifdef USE_CUDA
   use cudafor
   use iso_c_binding, only: c_f_pointer
@@ -84,15 +85,16 @@ module halo_mod
   logical :: tp_ew_posted = .false., tp_ns_posted = .false.
   integer :: tp_req_ew(4) = 0, tp_req_ns(4) = 0
 #ifdef USE_CUDA
-  real(pp), device, allocatable :: tp_chk(:,:,:,:)   ! ROMS_GPU_TP_CHECK scratch copy of one slot
+  real(pp), device, allocatable :: tp_chk(:,:,:)     ! ROMS_GPU_TP_CHECK scratch copy of one slot
 #else
-  real(pp), allocatable :: tp_chk(:,:,:,:)
+  real(pp), allocatable :: tp_chk(:,:,:)
 #endif
   logical :: tp_devsync = .false.   ! ROMS_GPU_TP_DEVSYNC=1: cudaDeviceSynchronize after each wait (test)
 
   public :: halo_fill_2d
   public :: halo_fill_2d_n
   public :: halo_fill_uv_n
+  public :: halo_fill_zuv_n
   public :: hg_begin, hg_add, hg_end
   ! Field ids for the group exchange (hg_*): several fields in one
   ! east-west and one north-south round. All fields use the rho-cell
@@ -261,6 +263,97 @@ contains
       endif
     endif
   end subroutine halo_fill_uv_n
+
+  subroutine halo_fill_zuv_n(z2, u2, v2)
+    ! zeta, ubar and vbar at slot fast%knew in ONE exchange per direction
+    ! (levels 2, 0 and 1 of the 3-D buffers; the rho-cell exchange bounds
+    ! are the same for every stagger, as halo_fill_2d_n uses for zeta).
+    real(rp), WORK_ATTR intent(inout) :: z2(decomp%is:decomp%ie, decomp%js:decomp%je, 4)
+    real(rp), WORK_ATTR intent(inout) :: u2(decomp%is:decomp%ie, decomp%js:decomp%je, 4)
+    real(rp), WORK_ATTR intent(inout) :: v2(decomp%is:decomp%ie, decomp%js:decomp%je, 4)
+    integer(ip) :: i1, i2, j1, j2, h, i, j, m, n, ilo, ihi
+    if (no_neighbors()) return
+    call ensure_bufs()
+    call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
+    h = decomp%halo
+    if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
+      CUF_DO2
+      do j = j1, j2
+        do m = 1, h
+          n = fast%knew
+          ew_slo(m, j, 0) = u2(i1 + m - 1, j, n)
+          ew_shi(m, j, 0) = u2(i2 - h + m, j, n)
+          ew_slo(m, j, 1) = v2(i1 + m - 1, j, n)
+          ew_shi(m, j, 1) = v2(i2 - h + m, j, n)
+          ew_slo(m, j, 2) = z2(i1 + m - 1, j, n)
+          ew_shi(m, j, 2) = z2(i2 - h + m, j, n)
+        enddo
+      enddo
+      call deliver3(decomp%nbr_w, decomp%nbr_e, ew_slo(:, :, 0:2), ew_shi(:, :, 0:2), &
+                    ew_rlo(:, :, 0:2), ew_rhi(:, :, 0:2))
+      if (decomp%nbr_w /= NBR_NONE) then
+        CUF_DO2
+        do j = j1, j2
+          do m = 1, h
+            n = fast%knew
+            u2(i1 - h + m - 1, j, n) = ew_rlo(m, j, 0)
+            v2(i1 - h + m - 1, j, n) = ew_rlo(m, j, 1)
+            z2(i1 - h + m - 1, j, n) = ew_rlo(m, j, 2)
+          enddo
+        enddo
+      endif
+      if (decomp%nbr_e /= NBR_NONE) then
+        CUF_DO2
+        do j = j1, j2
+          do m = 1, h
+            n = fast%knew
+            u2(i2 + m, j, n) = ew_rhi(m, j, 0)
+            v2(i2 + m, j, n) = ew_rhi(m, j, 1)
+            z2(i2 + m, j, n) = ew_rhi(m, j, 2)
+          enddo
+        enddo
+      endif
+    endif
+    if (decomp%nbr_s /= NBR_NONE .or. decomp%nbr_n /= NBR_NONE) then
+      ilo = i1 - h; ihi = i2 + h
+      CUF_DO2
+      do m = 1, h
+        do i = ilo, ihi
+          n = fast%knew
+          ns_slo(i, m, 0) = u2(i, j1 + m - 1, n)
+          ns_shi(i, m, 0) = u2(i, j2 - h + m, n)
+          ns_slo(i, m, 1) = v2(i, j1 + m - 1, n)
+          ns_shi(i, m, 1) = v2(i, j2 - h + m, n)
+          ns_slo(i, m, 2) = z2(i, j1 + m - 1, n)
+          ns_shi(i, m, 2) = z2(i, j2 - h + m, n)
+        enddo
+      enddo
+      call deliver3(decomp%nbr_s, decomp%nbr_n, ns_slo(:, :, 0:2), ns_shi(:, :, 0:2), &
+                    ns_rlo(:, :, 0:2), ns_rhi(:, :, 0:2))
+      if (decomp%nbr_s /= NBR_NONE) then
+        CUF_DO2
+        do m = 1, h
+          do i = ilo, ihi
+            n = fast%knew
+            u2(i, j1 - h + m - 1, n) = ns_rlo(i, m, 0)
+            v2(i, j1 - h + m - 1, n) = ns_rlo(i, m, 1)
+            z2(i, j1 - h + m - 1, n) = ns_rlo(i, m, 2)
+          enddo
+        enddo
+      endif
+      if (decomp%nbr_n /= NBR_NONE) then
+        CUF_DO2
+        do m = 1, h
+          do i = ilo, ihi
+            n = fast%knew
+            u2(i, j2 + m, n) = ns_rhi(i, m, 0)
+            v2(i, j2 + m, n) = ns_rhi(i, m, 1)
+            z2(i, j2 + m, n) = ns_rhi(i, m, 2)
+          enddo
+        enddo
+      endif
+    endif
+  end subroutine halo_fill_zuv_n
 
   ! ------------------------------------------------------------ group exchange
   subroutine hg_begin()
@@ -897,7 +990,7 @@ contains
   end subroutine tp_ensure_bufs
 
   subroutine tp_pack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, n, nk, h, i1, i2, j1, j2
     integer(ip) :: kk, j, m, k, itr
     CUF_DO3
@@ -906,15 +999,15 @@ contains
         do m = 1, h
           k = (kk - 1) / ntr + 1
           itr = kk - (k - 1) * ntr
-          tew_slo(m, j, kk) = real(a(itr, i1 + m - 1, j, k, n), rp)
-          tew_shi(m, j, kk) = real(a(itr, i2 - h + m, j, k, n), rp)
+          tew_slo(m, j, kk) = real(a(itr, tpcol(i1 + m - 1, j), k, n), rp)
+          tew_shi(m, j, kk) = real(a(itr, tpcol(i2 - h + m, j), k, n), rp)
         enddo
       enddo
     enddo
   end subroutine tp_pack_ew
 
   subroutine tp_unpack_ew(a, ntr, n, nk, h, i1, i2, j1, j2)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, n, nk, h, i1, i2, j1, j2
     integer(ip) :: kk, j, m, k, itr
     if (decomp%nbr_w /= NBR_NONE) then
@@ -924,7 +1017,7 @@ contains
           do m = 1, h
             k = (kk - 1) / ntr + 1
             itr = kk - (k - 1) * ntr
-            a(itr, i1 - h + m - 1, j, k, n) = real(tew_rlo(m, j, kk), pp)
+            if (tpcol(i1 - h + m - 1, j) > 0) a(itr, tpcol(i1 - h + m - 1, j), k, n) = real(tew_rlo(m, j, kk), pp)
           enddo
         enddo
       enddo
@@ -936,7 +1029,7 @@ contains
           do m = 1, h
             k = (kk - 1) / ntr + 1
             itr = kk - (k - 1) * ntr
-            a(itr, i2 + m, j, k, n) = real(tew_rhi(m, j, kk), pp)
+            if (tpcol(i2 + m, j) > 0) a(itr, tpcol(i2 + m, j), k, n) = real(tew_rhi(m, j, kk), pp)
           enddo
         enddo
       enddo
@@ -944,7 +1037,7 @@ contains
   end subroutine tp_unpack_ew
 
   subroutine tp_pack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, n, nk, h, ilo, ihi, j1, j2
     integer(ip) :: kk, i, m, k, itr
     CUF_DO3
@@ -953,15 +1046,15 @@ contains
         do i = ilo, ihi
           k = (kk - 1) / ntr + 1
           itr = kk - (k - 1) * ntr
-          tns_slo(i, m, kk) = real(a(itr, i, j1 + m - 1, k, n), rp)
-          tns_shi(i, m, kk) = real(a(itr, i, j2 - h + m, k, n), rp)
+          tns_slo(i, m, kk) = real(a(itr, tpcol(i, j1 + m - 1), k, n), rp)
+          tns_shi(i, m, kk) = real(a(itr, tpcol(i, j2 - h + m), k, n), rp)
         enddo
       enddo
     enddo
   end subroutine tp_pack_ns
 
   subroutine tp_unpack_ns(a, ntr, n, nk, h, ilo, ihi, j1, j2)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, n, nk, h, ilo, ihi, j1, j2
     integer(ip) :: kk, i, m, k, itr
     if (decomp%nbr_s /= NBR_NONE) then
@@ -971,7 +1064,7 @@ contains
           do i = ilo, ihi
             k = (kk - 1) / ntr + 1
             itr = kk - (k - 1) * ntr
-            a(itr, i, j1 - h + m - 1, k, n) = real(tns_rlo(i, m, kk), pp)
+            if (tpcol(i, j1 - h + m - 1) > 0) a(itr, tpcol(i, j1 - h + m - 1), k, n) = real(tns_rlo(i, m, kk), pp)
           enddo
         enddo
       enddo
@@ -983,7 +1076,7 @@ contains
           do i = ilo, ihi
             k = (kk - 1) / ntr + 1
             itr = kk - (k - 1) * ntr
-            a(itr, i, j2 + m, k, n) = real(tns_rhi(i, m, kk), pp)
+            if (tpcol(i, j2 + m) > 0) a(itr, tpcol(i, j2 + m), k, n) = real(tns_rhi(i, m, kk), pp)
           enddo
         enddo
       enddo
@@ -1004,7 +1097,7 @@ contains
     ! so a tiled run reproduces the single-tile interior bit for bit. The
     ! combined buffer index is kk = (k-1)*ntr + itr; east-west first, then
     ! north-south including the east-west halo columns (as halo_fill_3d).
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, slot
     integer(ip) :: n, h, nk, i1, i2, j1, j2, ilo, ihi
     if (no_neighbors()) return
@@ -1034,7 +1127,7 @@ contains
   ! not change and its halo must not be read. The same call sequence runs
   ! on every rank. Without GPU-direct MPI, start does the blocking exchange.
   subroutine halo_tp_start(a, ntr, slot)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, slot
     integer(ip) :: n, h, nk, i1, i2, j1, j2
     if (no_neighbors()) return
@@ -1061,7 +1154,7 @@ contains
   end subroutine halo_tp_start
 
   subroutine halo_tp_mid(a, ntr)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr
     integer(ip) :: n, h, nk, i1, i2, j1, j2, ilo, ihi
     if (tp_pending /= 1) return
@@ -1087,7 +1180,7 @@ contains
   end subroutine halo_tp_mid
 
   subroutine halo_tp_finish(a, ntr)
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr
     integer(ip) :: n, h, nk, i1, i2, j1, j2, ilo, ihi
     if (tp_pending == 1) call halo_tp_mid(a, ntr)
@@ -1146,20 +1239,18 @@ contains
 
   subroutine tp_check(a, ntr, n)
     ! Exact check: keep a device copy of slot n, redo the exchange
-    ! blockingly, count halo cells that differ (integer reduction).
-    real(pp), WORK_ATTR intent(inout) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz, 3)
+    ! blockingly, count halo values that differ (integer reduction).
+    real(pp), WORK_ATTR intent(inout) :: a(ntr, 0:ntpcol, decomp%nz, 3)
     integer(ip), intent(in) :: ntr, n
-    integer(ip) :: i1, i2, j1, j2, i, j, k, itr, nz, is, ie, js, je, nbad
+    integer(ip) :: i1, i2, j1, j2, i, j, k, itr, nz, is, ie, js, je, nbad, c
     call interior_bounds(STAGGER_RHO, i1, i2, j1, j2)
     nz = decomp%nz; is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
-    if (.not. allocated(tp_chk)) allocate(tp_chk(ntr, is:ie, js:je, nz))
+    if (.not. allocated(tp_chk)) allocate(tp_chk(ntr, 0:ntpcol, nz))
     CUF_DO3
     do k = 1, nz
-      do j = js, je
-        do i = is, ie
-          do itr = 1, ntr
-            tp_chk(itr, i, j, k) = a(itr, i, j, k, n)
-          enddo
+      do c = 0, ntpcol
+        do itr = 1, ntr
+          tp_chk(itr, c, k) = a(itr, c, k, n)
         enddo
       enddo
     enddo
@@ -1171,8 +1262,9 @@ contains
       do j = js, je
         do i = is, ie
           if (i < i1 .or. i > i2 .or. j < j1 .or. j > j2) then
+            c = tpcol(i, j)
             do itr = 1, ntr
-              if (tp_chk(itr, i, j, k) /= a(itr, i, j, k, n)) nbad = nbad + 1
+              if (tp_chk(itr, c, k) /= a(itr, c, k, n)) nbad = nbad + 1
             enddo
           endif
         enddo

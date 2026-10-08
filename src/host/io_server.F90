@@ -262,12 +262,13 @@ contains
   end subroutine io_stage_3d
 
   subroutine io_stage_3d_pt(name, a, ntr, itr, k0, k1, i0, i1, j0, j1, di, dj)
-    ! Tracer itr of a tracer-innermost (ntr, is:ie, js:je, k0:k1) slab;
-    ! a is its first element (sequence association).
+    ! Tracer itr of the passive array slot (ntr, 0:ntpcol, k0:k1), gathered
+    ! to the (i, j, k) window through tpcol.
     character(len=*), intent(in) :: name
     integer, intent(in) :: ntr, itr, k0, k1, i0, i1, j0, j1
     integer, intent(in), optional :: di, dj
-    real(pp), WORK_ATTR intent(in) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, k0:k1)
+    ! Compressed passive layout (gpu_state tpcol): unstored points read column 0 (zero).
+    real(pp), WORK_ATTR intent(in) :: a(ntr, 0:ntpcol, k0:k1)
     integer :: i, j, k, ni, nj, nk, off
     ni = i1 - i0 + 1
     nj = j1 - j0 + 1
@@ -279,7 +280,7 @@ contains
     do k = k0, k1
       do j = j0, j1
         do i = i0, i1
-          dstage((k - k0) * ni * nj + (j - j0) * ni + (i - i0) + 1) = real(a(itr, i, j, k), 4)
+          dstage((k - k0) * ni * nj + (j - j0) * ni + (i - i0) + 1) = real(a(itr, tpcol(i, j), k), 4)
         enddo
       enddo
     enddo
@@ -738,7 +739,8 @@ contains
     character(len=*), intent(in) :: name
     integer, intent(in) :: ntr, itr, k0, k1, i0, i1, j0, j1
     integer, intent(in), optional :: di, dj
-    real(pp), WORK_ATTR intent(in) :: a(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, k0:k1)
+    ! Compressed passive layout (gpu_state tpcol): unstored points read column 0 (zero).
+    real(pp), WORK_ATTR intent(in) :: a(ntr, 0:ntpcol, k0:k1)
     integer :: i, j, k, ni, nj, nk, off
     ni = i1 - i0 + 1
     nj = j1 - j0 + 1
@@ -750,7 +752,7 @@ contains
     do k = k0, k1
       do j = j0, j1
         do i = i0, i1
-          dstage8((k - k0) * ni * nj + (j - j0) * ni + (i - i0) + 1) = real(a(itr, i, j, k), 8)
+          dstage8((k - k0) * ni * nj + (j - j0) * ni + (i - i0) + 1) = real(a(itr, tpcol(i, j), k), 8)
         enddo
       enddo
     enddo

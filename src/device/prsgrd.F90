@@ -35,7 +35,7 @@ contains
   end subroutine ensure_scratch
 
   subroutine prsgrd()
-    integer(ip) :: i, j, k, nx, ny, nz
+    integer(ip) :: i, j, k, nx, ny, nz, lim
     integer(ip) :: i_fc_lo, i_fc_hi, j_fc_lo, j_fc_hi
     integer(ip) :: i_ru_lo, i_ru_hi, j_rv_lo, j_rv_hi
     real(rp) :: HalfGRho, dpth, cff, dzk
@@ -61,6 +61,10 @@ contains
     call hg_add(F_QP1)
     call hg_end()
     call ensure_scratch()
+    ! Deep land: ru/rv there are unmasked but every consumer masks them
+    ! (rufrc, DU_avg*, u, v are zero on all land faces), so the columns
+    ! are left alone once dry skipping is on.
+    lim = dry_lim(G_PGF)
 
     ! Zero ru, rv on the device (not a host memset of managed memory).
 #ifdef USE_CUDA
@@ -69,6 +73,7 @@ contains
     do k = 1, nz
       do j = decomp%js, decomp%je
         do i = decomp%is, decomp%ie
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           ru(i, j, k) = 0.0_rp
           rv(i, j, k) = 0.0_rp
         enddo
@@ -82,6 +87,7 @@ contains
 #endif
     do j = 0, ny
       do i = 0, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         do k = 1, nz - 1
           col_cf(i, j, k) = z_r(i, j, k + 1) - z_r(i, j, k)
           col_fc(i, j, k) = adiabatic_diff(rho1(i, j, k + 1), rho1(i, j, k), &
@@ -271,6 +277,7 @@ contains
       do k = 1, nz
         do j = 1, ny
           do i = i_ru_lo, i_ru_hi
+            if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
             ! faces i-1, i, i+1 (clamped to the computed range at the open edges)
             ii = max(i - 1, im_lo)
             za_m = apply_mask(z_r(ii, j, k) - z_r(ii - 1, j, k), umask(ii, j))
@@ -304,6 +311,7 @@ contains
       do k = 1, nz
         do j = j_rv_lo, j_rv_hi
           do i = 1, nx
+            if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
             ii = max(j - 1, im_lo)
             za_m = apply_mask(z_r(i, ii, k) - z_r(i, ii - 1, k), vmask(i, ii))
             ra_m = apply_mask(adiabatic_diff(rho1(i, ii, k), rho1(i, ii - 1, k), qp1(i, ii, k), qp1(i, ii - 1, k), &

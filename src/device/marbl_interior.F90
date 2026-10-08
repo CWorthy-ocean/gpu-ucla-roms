@@ -18,7 +18,7 @@ module marbl_interior_mod
   ! Lig_cnt = 1, one PAR subcolumn, no restoring, no scale-factor forcings,
   ! ciso/abio off.
   use kinds
-  use gpu_state, only: nwet, wet_i, wet_j
+  use gpu_state, only: nwet, wet_i, wet_j, ntpcol
   use decomp_mod, only: decomp
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
@@ -1084,12 +1084,13 @@ contains
   !===========================================================================
 #ifdef USE_CUDA
   attributes(global) &
-  subroutine carb_kernel(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, nwet, wet_i, wet_j, tr, ts, z_r, mask)
+  subroutine carb_kernel(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, nwet, wet_i, wet_j, tr, ncl, ts, z_r, mask)
     integer(ip), value :: ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny
     integer(ip), value :: nwet
     integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
     integer(ip) :: c
-    real(pp), device, intent(in) :: tr(ntr, is:ie, js:je, nz, nslot)
+    integer(ip), value :: ncl
+    real(pp), device, intent(in) :: tr(ntr, 0:ncl, nz, nslot)
     real(rp), device, intent(in) :: ts(is:ie, js:je, nz, nslot, nts)
     real(rp), device, intent(in) :: z_r(is:ie, js:je, nz)
     real(rp), device, intent(in) :: mask(is:ie, js:je)
@@ -1109,9 +1110,9 @@ contains
     press = -z_r(i, j, kk) * 0.1_rp
     call potemp_s(salt, potemp, c0, press, tins)
     it_temp(i, j, kk) = tins
-    t_dic = real(tr(PR%dic, i, j, kk, slot), rp); t_alk = real(tr(PR%alk, i, j, kk, slot), rp)
-    t_po4 = real(tr(PR%po4, i, j, kk, slot), rp); t_sio3 = real(tr(PR%sio3, i, j, kk, slot), rp)
-    t_dica = real(tr(PR%dica, i, j, kk, slot), rp); t_alka = real(tr(PR%alka, i, j, kk, slot), rp)
+    t_dic = real(tr(PR%dic, c, kk, slot), rp); t_alk = real(tr(PR%alk, c, kk, slot), rp)
+    t_po4 = real(tr(PR%po4, c, kk, slot), rp); t_sio3 = real(tr(PR%sio3, c, kk, slot), rp)
+    t_dica = real(tr(PR%dica, c, kk, slot), rp); t_alka = real(tr(PR%alka, c, kk, slot), rp)
     ! max(0,.) as in setup_local_tracers
     t_dic = max(c0, t_dic); t_alk = max(c0, t_alk); t_po4 = max(c0, t_po4); t_sio3 = max(c0, t_sio3)
     t_dica = max(c0, t_dica); t_alka = max(c0, t_alka)
@@ -1158,13 +1159,14 @@ contains
   !===========================================================================
   attributes(global) &
   subroutine interior_kernel(ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, nwet, wet_i, wet_j, dtm, ldg, &
-                             tr, ts, z_r, z_w, Hz, mask, dust)
+                             tr, ncl, ts, z_r, z_w, Hz, mask, dust)
     integer(ip), value :: ntr, nz, slot, nslot, nts, is, ie, js, je, nx, ny, ldg
     integer(ip), value :: nwet
     integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
     integer(ip) :: c
     real(rp), value :: dtm
-    real(pp), device, intent(inout) :: tr(ntr, is:ie, js:je, nz, nslot)
+    integer(ip), value :: ncl
+    real(pp), device, intent(inout) :: tr(ntr, 0:ncl, nz, nslot)
     real(rp), device, intent(in) :: ts(is:ie, js:je, nz, nslot, nts)
     real(rp), device, intent(in) :: z_r(is:ie, js:je, nz), z_w(is:ie, js:je, 0:nz), Hz(is:ie, js:je, nz)
     real(rp), device, intent(in) :: mask(is:ie, js:je), dust(is:ie, js:je)
@@ -1199,12 +1201,12 @@ contains
       tins = it_temp(i, j, kk)
       h2co3 = it_h2co3(i, j, kk); co3 = it_co3(i, j, kk); co3a = it_co3a(i, j, kk); co3sat = it_co3sat(i, j, kk)
       do m = 1, ntr
-        trk(m) = real(tr(m, i, j, kk, slot), rp)
+        trk(m) = real(tr(m, c, kk, slot), rp)
       enddo
       call level_step(k, nz, dz, dz1, zw, zt, tins, h2co3, co3, co3a, co3sat, dust_flux, &
                       trk, st, tend, dg, ldg)
       do m = 1, ntr
-        tr(m, i, j, kk, slot) = real(trk(m) + tend(m) * dtm, pp)
+        tr(m, c, kk, slot) = real(trk(m) + tend(m) * dtm, pp)
       enddo
       if (ldg /= 0) then
         do m = 1, ntr
@@ -1291,7 +1293,7 @@ contains
   ! Host launchers. tr: MARBL tracers (level kk, slot); ts: T/S array.
   subroutine marbl_carbonate_compute(ntr, nz, slot, nslot, tr, nts, ts, z_r, mask)
     integer(ip), intent(in) :: ntr, nz, slot, nslot, nts
-    real(pp), WORK_ATTR intent(in) :: tr(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, nz, nslot)
+    real(pp), WORK_ATTR intent(in) :: tr(ntr, 0:ntpcol, nz, nslot)
     real(rp), WORK_ATTR intent(in) :: ts(decomp%is:decomp%ie, decomp%js:decomp%je, nz, nslot, nts)
     real(rp), WORK_ATTR intent(in) :: z_r(decomp%is:decomp%ie, decomp%js:decomp%je, nz)
     real(rp), WORK_ATTR intent(in) :: mask(decomp%is:decomp%ie, decomp%js:decomp%je)
@@ -1303,7 +1305,7 @@ contains
     block = dim3(128, 1, 1)
     grid = dim3((nwet + 127) / 128, 1, nz)
     call carb_kernel<<<grid, block, 0, work_stream>>>(ntr, nz, slot, nslot, nts, &
-         decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, nwet, wet_i, wet_j, tr, ts, z_r, mask)
+         decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, nwet, wet_i, wet_j, tr, ntpcol, ts, z_r, mask)
 #else
     error stop 'marbl_carbonate_compute: CUDA build required'
 #endif
@@ -1311,7 +1313,7 @@ contains
 
   subroutine marbl_interior_compute(ntr, nz, slot, nslot, tr, nts, ts, z_r, z_w, Hz, mask, dust, dtm, keep)
     integer(ip), intent(in) :: ntr, nz, slot, nslot, nts
-    real(pp), WORK_ATTR intent(inout) :: tr(ntr, decomp%is:decomp%ie, decomp%js:decomp%je, nz, nslot)
+    real(pp), WORK_ATTR intent(inout) :: tr(ntr, 0:ntpcol, nz, nslot)
     real(rp), WORK_ATTR intent(in) :: ts(decomp%is:decomp%ie, decomp%js:decomp%je, nz, nslot, nts)
     real(rp), WORK_ATTR intent(in) :: z_r(decomp%is:decomp%ie, decomp%js:decomp%je, nz)
     real(rp), WORK_ATTR intent(in) :: z_w(decomp%is:decomp%ie, decomp%js:decomp%je, 0:nz)
@@ -1329,7 +1331,7 @@ contains
     grid = dim3((nwet + 127) / 128, 1, 1)
     call interior_kernel<<<grid, block, 0, work_stream>>>(ntr, nz, slot, nslot, nts, &
          decomp%is, decomp%ie, decomp%js, decomp%je, decomp%nx, decomp%ny, nwet, wet_i, wet_j, dtm, ldg, &
-         tr, ts, z_r, z_w, Hz, mask, dust)
+         tr, ntpcol, ts, z_r, z_w, Hz, mask, dust)
 #else
     error stop 'marbl_interior_compute: CUDA build required'
 #endif

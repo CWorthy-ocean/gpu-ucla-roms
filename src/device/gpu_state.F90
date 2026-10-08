@@ -128,12 +128,61 @@ module gpu_state
   ! column kernels run over these only. Land columns keep their (zero)
   ! values, which is what the full-tile kernels leave there too.
   integer(ip), public :: nwet = 0
+  integer(ip), allocatable :: colact_deep(:,:)
 #ifdef USE_CUDA
   integer(ip), device, allocatable, public :: wet_i(:), wet_j(:)
 #else
   integer(ip), allocatable, public :: wet_i(:), wet_j(:)
 #endif
   public :: build_wet_list
+
+  ! Dry-column skip (2026-10-07). colact(is:ie, js:je) is 0 on deep land
+  ! (land with no wet point within dry_radius cells, judged inside this
+  ! tile's arrays; columns whose neighbourhood leaves the arrays count as
+  ! active) and 1 elsewhere. On deep land every stored field is constant
+  ! (state masked to zero, geometry fixed), so a kernel may leave those
+  ! columns alone once their values are in place: the first DRY_WARMUP
+  ! steps of a run compute everything. Kernels test
+  !   if (colact(i, j) < lim) cycle,  lim = dry_lim(G_...)  (0 or 1)
+  ! ROMS_GPU_SKIP_DRY = bitmask of kernel groups that skip (default all
+  ! implemented groups; 0 = off); ROMS_GPU_DRY_RADIUS = radius (default 3).
+  integer, parameter, public :: G_GEOM = 1, G_EOS = 2, G_LMD = 4, G_PGF = 8, &
+                                G_UVRHS = 16, G_TRC = 32, G_MOM = 64, G_2D = 128
+  integer, parameter :: DRY_WARMUP = 2
+  integer, public :: dry_groups = 0, dry_radius = 3
+  integer(ip), public :: ndeep = 0
+  logical, public :: dry_skip_active = .false.
+#ifdef USE_CUDA
+  integer(ip), device, allocatable, public :: colact(:,:)
+#else
+  integer(ip), allocatable, public :: colact(:,:)
+#endif
+  public :: build_dry_map, dry_skip_update, dry_lim
+
+  ! Passive-tracer column storage (2026-10-08). The passives are stored as
+  ! tp(ntr, 0:ntpcol, nz, 3) over the stored columns only: the wet columns
+  ! of the interior first, in wet-list order (wet column c is column c),
+  ! then every other wet point of the arrays and the physical boundary
+  ! rows/columns (written by the open-boundary code). Column 0 is a shared
+  ! column of zeros: every other (i, j) maps to it and nothing writes it,
+  ! which is the value land points held in the full-tile layout. tpcol
+  ! (is:ie, js:je) is the map, tpcol_h its host copy.
+  integer(ip), public :: ntpcol = 0
+#ifdef USE_CUDA
+  integer(ip), device, allocatable, public :: tpcol(:,:)
+#else
+  integer(ip), allocatable, public :: tpcol(:,:)
+#endif
+  integer(ip), allocatable, public :: tpcol_h(:,:)
+  ! Stencil neighbours of the interior wet columns in the compressed layout:
+  ! tpnb(1:8, c) = column of (i-2,j), (i-1,j), (i+1,j), (i+2,j), (i,j-2),
+  ! (i,j-1), (i,j+1), (i,j+2) of wet column c (0 for unstored points).
+#ifdef USE_CUDA
+  integer(ip), device, allocatable, public :: tpnb(:,:)
+#else
+  integer(ip), allocatable, public :: tpnb(:,:)
+#endif
+  public :: build_tp_columns
 
 
 contains
@@ -163,6 +212,131 @@ contains
     wet_i = hi; wet_j = hj
     deallocate(hi, hj)
   end subroutine build_wet_list
+
+  subroutine build_dry_map()
+    ! Called after build_wet_list (mask final, halos filled). Host loop.
+    integer(ip) :: i, j, ii, jj, is, ie, js, je, r
+    integer(ip), allocatable :: deep(:,:)
+    character(len=16) :: val
+    integer :: stat, g
+    logical :: dp
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    g = G_GEOM + G_EOS + G_LMD + G_PGF + G_UVRHS + G_TRC + G_MOM + G_2D
+    call get_environment_variable('ROMS_GPU_SKIP_DRY', val, status=stat)
+    if (stat == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=stat) g
+      if (stat /= 0) g = 0
+    endif
+    dry_groups = max(g, 0)
+    call get_environment_variable('ROMS_GPU_DRY_RADIUS', val, status=stat)
+    if (stat == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=stat) dry_radius
+      if (stat /= 0) dry_radius = 3
+    endif
+    dry_radius = max(dry_radius, 1)
+    r = dry_radius
+    allocate(deep(is:ie, js:je))
+    deep = 0
+    ndeep = 0
+    do j = js, je
+      do i = is, ie
+        if (rmask(i, j) > 0.5_rp) cycle
+        if (i - r < is .or. i + r > ie .or. j - r < js .or. j + r > je) cycle
+        dp = .true.
+        do jj = j - r, j + r
+          do ii = i - r, i + r
+            if (rmask(ii, jj) > 0.5_rp) dp = .false.
+          enddo
+        enddo
+        if (dp) then
+          deep(i, j) = 1
+          if (i >= 1 .and. i <= decomp%nx .and. j >= 1 .and. j <= decomp%ny) ndeep = ndeep + 1
+        endif
+      enddo
+    enddo
+    if (allocated(colact_deep)) deallocate(colact_deep)
+    allocate(colact_deep(is:ie, js:je))
+    colact_deep = 1 - deep
+    if (allocated(colact)) deallocate(colact)
+    allocate(colact(is:ie, js:je))
+    colact = colact_deep
+    deallocate(deep)
+    dry_skip_active = .false.
+  end subroutine build_dry_map
+
+  subroutine build_tp_columns()
+    ! Called with the mask final (after build_wet_list), before the
+    ! passives are allocated. Host loop.
+    integer(ip) :: i, j, n, is, ie, js, je, nx, ny
+    integer(ip), allocatable :: nb(:,:)
+    logical :: st
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    nx = decomp%nx; ny = decomp%ny
+    if (allocated(tpcol_h)) deallocate(tpcol_h)
+    allocate(tpcol_h(is:ie, js:je))
+    tpcol_h = 0
+    n = 0
+    do j = 1, ny
+      do i = 1, nx
+        if (rmask(i, j) > 0.5_rp) then
+          n = n + 1; tpcol_h(i, j) = n
+        endif
+      enddo
+    enddo
+    if (n /= nwet) error stop 'build_tp_columns: wet count differs from the wet list'
+    do j = js, je
+      do i = is, ie
+        if (tpcol_h(i, j) /= 0) cycle
+        st = (rmask(i, j) > 0.5_rp)
+        if (decomp%edge_w .and. i == 0) st = .true.
+        if (decomp%edge_e .and. i == nx + 1) st = .true.
+        if (decomp%edge_s .and. j == 0) st = .true.
+        if (decomp%edge_n .and. j == ny + 1) st = .true.
+        if (st) then
+          n = n + 1; tpcol_h(i, j) = n
+        endif
+      enddo
+    enddo
+    ntpcol = n
+    if (allocated(tpcol)) deallocate(tpcol)
+    allocate(tpcol(is:ie, js:je))
+    tpcol = tpcol_h
+    allocate(nb(8, max(nwet, 1)))
+    nb = 0
+    n = 0
+    do j = 1, ny
+      do i = 1, nx
+        if (rmask(i, j) > 0.5_rp) then
+          n = n + 1
+          nb(1, n) = tpcol_h(i - 2, j); nb(2, n) = tpcol_h(i - 1, j)
+          nb(3, n) = tpcol_h(i + 1, j); nb(4, n) = tpcol_h(i + 2, j)
+          nb(5, n) = tpcol_h(i, j - 2); nb(6, n) = tpcol_h(i, j - 1)
+          nb(7, n) = tpcol_h(i, j + 1); nb(8, n) = tpcol_h(i, j + 2)
+        endif
+      enddo
+    enddo
+    if (allocated(tpnb)) deallocate(tpnb)
+    allocate(tpnb(8, max(nwet, 1)))
+    tpnb = nb
+    deallocate(nb)
+  end subroutine build_tp_columns
+
+  subroutine dry_skip_update(step_index)
+    ! Called at the start of every baroclinic step with iic - ntstart.
+    integer(ip), intent(in) :: step_index
+    logical :: was
+    was = dry_skip_active
+    dry_skip_active = (dry_groups /= 0 .and. step_index >= DRY_WARMUP .and. ndeep > 0)
+    if (dry_skip_active .and. .not. was) write(*,'(a,i0,a,i0,a,i0)') &
+         'dry skip: on from step ', step_index, '  groups ', dry_groups, '  deep-land columns ', ndeep
+  end subroutine dry_skip_update
+
+  integer(ip) function dry_lim(grp)
+    ! 1 when kernel group grp skips deep land now, else 0.
+    integer, intent(in) :: grp
+    dry_lim = 0
+    if (dry_skip_active .and. iand(dry_groups, grp) /= 0) dry_lim = 1
+  end function dry_lim
 
   subroutine alloc_state(nt)
     integer(ip), intent(in) :: nt

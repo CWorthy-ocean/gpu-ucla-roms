@@ -135,7 +135,7 @@ contains
   ! One MARBL call: at the end of the tracer step (after the passive
   ! corrector and its open boundaries), as the CPU driver.
   subroutine marbl_gpu_step()
-    integer(ip) :: i, j, m, nx, ny, nz, nn, islot
+    integer(ip) :: i, j, m, nx, ny, nz, nn, islot, c
     real(rp) :: dtm, rc, tfrc
     if (.not. marbl_on) return
     if (mod(iic, marbl_timestep_ratio) /= 0) return
@@ -162,17 +162,15 @@ contains
     enddo
     ! surface fluxes, applied to the top layer of slot nnew
     call marbl_sflux_compute(msf, ntp, nz, nz, nn, tp, nt, t, rmask)
+    ! wet columns c of the interior are tp columns c (gpu_state, tpcol)
 #ifdef USE_CUDA
-    !$cuf kernel do(3) <<<*,*>>>
+    !$cuf kernel do(2) <<<*,*>>>
 #endif
     do m = 1, ntp
-      do j = 1, ny
-        do i = 1, nx
-          if (rmask(i, j) /= 0.0_rp) then
-            tp(m, i, j, nz, nn) = real(real(tp(m, i, j, nz, nn), rp) + &
-                 sf_flux(i, j, m) * dtm / Hz(i, j, nz), pp)
-          endif
-        enddo
+      do c = 1, nwet
+        i = wet_i(c); j = wet_j(c)
+        tp(m, c, nz, nn) = real(real(tp(m, c, nz, nn), rp) + &
+             sf_flux(i, j, m) * dtm / Hz(i, j, nz), pp)
       enddo
     enddo
     ! interior: carbonate chemistry, then the column ecosystem/sinking sweep

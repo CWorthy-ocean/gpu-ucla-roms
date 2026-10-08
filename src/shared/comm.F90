@@ -35,6 +35,7 @@ module comm_mod
   public :: comm_sendrecv_raw
   public :: comm_sendrecv_dev
   public :: comm_post_dev, comm_wait_dev
+  public :: comm_min_real
   public :: comm_gpu_direct
   public :: comm_exchange3
   public :: have_io_server
@@ -320,6 +321,20 @@ contains
     if (nbr_lo >= 0 .or. nbr_hi >= 0) error stop 'comm_post_dev: MPI neighbor without USE_MPI'
 #endif
   end subroutine comm_post_dev
+
+  real(rp) function comm_min_real(x)
+    ! Minimum of x over the compute ranks (x itself without MPI).
+    real(rp), intent(in) :: x
+#ifdef USE_MPI
+    integer :: ierr
+    real(rp) :: y
+    if (.not. ready) call init_comm()
+    call MPI_Allreduce(x, y, 1, MPI_DOUBLE_PRECISION, MPI_MIN, compute_comm, ierr)
+    comm_min_real = y
+#else
+    comm_min_real = x
+#endif
+  end function comm_min_real
 
   subroutine comm_wait_dev(req)
     integer, intent(inout) :: req(4)

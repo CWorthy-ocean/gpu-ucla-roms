@@ -33,7 +33,7 @@ module step3d_uv_mod
 contains
 
   subroutine step3d_uv1()
-    integer(ip) :: i, j, k, nx, ny, nz, n_new, i_u0, i_u1, j_v0
+    integer(ip) :: i, j, k, nx, ny, nz, n_new, i_u0, i_u1, j_v0, lim
     real(rp) :: cff, dt_loc
     real(rp) :: fck, wck, cfk, fcm, wcm, cfm
     logical :: keep
@@ -73,6 +73,7 @@ contains
     call dump_rhs_b('after vert adv')
     call dump_uv1_b('before impl')
     keep = probe_on
+    lim = dry_lim(G_MOM)
 
     ! Column Thomas has a k-recurrence: one thread per column, k serial.
 #ifdef USE_CUDA
@@ -80,6 +81,7 @@ contains
 #endif
     do j = 1, ny
       do i = i_u0, i_u1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         col_dc(i, j, 0) = dt_loc * 0.25_rp * (pm(i, j) + pm(i - 1, j)) * (pn(i, j) + pn(i - 1, j))
         fck = 2.0_rp * dt_loc * (Akv(i, j, nz - 1) + Akv(i - 1, j, nz - 1)) / &
              (Hz(i, j, nz) + Hz(i - 1, j, nz) + Hz(i, j, nz - 1) + Hz(i - 1, j, nz - 1))
@@ -134,6 +136,7 @@ contains
 #endif
     do j = j_v0, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         col_dc(i, j, 0) = dt_loc * 0.25_rp * (pm(i, j) + pm(i, j - 1)) * (pn(i, j) + pn(i, j - 1))
         fck = 2.0_rp * dt_loc * (Akv(i, j, nz - 1) + Akv(i, j - 1, nz - 1)) / &
              (Hz(i, j, nz) + Hz(i, j - 1, nz) + Hz(i, j, nz - 1) + Hz(i, j - 1, nz - 1))
@@ -483,7 +486,7 @@ contains
     integer(ip) :: i, j, k, nx, ny, nz, n_new, n_stp, kn
     integer(ip) :: i_u0, i_u1, j_v0, i_ur1, j_vr1, j_ur0, j_ur1, i_vr0, i_vr1
     real(rp) :: cff, Dcol, uint, mis, mis_u, mis_f, flx_int, flx_k, hz_dn
-    integer(ip) :: ip4, jp4, icu_i, icu_j, icu_k
+    integer(ip) :: ip4, jp4, icu_i, icu_j, icu_k, lim
     logical :: probe_c, ic_on
 
     nx = decomp%nx
@@ -524,11 +527,13 @@ contains
       cpl_prb = 0.0_rp
     endif
     call dump_uv2_b('before couple1')
+    lim = dry_lim(G_MOM)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = i_u0, i_u1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         if (umask(i, j) > 0.5_rp) then
           Dcol = 0.0_rp
           uint = 0.0_rp
@@ -579,6 +584,7 @@ contains
 #endif
     do j = j_v0, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         if (vmask(i, j) > 0.5_rp) then
           Dcol = 0.0_rp
           uint = 0.0_rp
@@ -633,6 +639,7 @@ contains
 #endif
     do j = j_ur0, j_ur1
       do i = 1, i_ur1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         if (umask(i, j) > 0.5_rp) then
           Dcol = 0.0_rp
           uint = 0.0_rp
@@ -677,6 +684,7 @@ contains
 #endif
     do j = 1, j_vr1
       do i = i_vr0, i_vr1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         if (vmask(i, j) > 0.5_rp) then
           Dcol = 0.0_rp
           uint = 0.0_rp

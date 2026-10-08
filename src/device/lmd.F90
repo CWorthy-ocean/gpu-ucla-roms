@@ -39,7 +39,7 @@ contains
   end subroutine ensure_scratch
 
   subroutine lmd_swr_frac()
-    integer(ip) :: i, j, k, nx, ny, nz
+    integer(ip) :: i, j, k, nx, ny, nz, lim
     real(rp) :: attn1, attn2, swdk1, swdk2
 
     nx = decomp%nx
@@ -47,12 +47,14 @@ contains
     nz = decomp%nz
     attn1 = -1.0_rp / jwt1_mu1
     attn2 = -1.0_rp / jwt1_mu2
+    lim = dry_lim(G_LMD)
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         swdk1 = jwt1_r1
         swdk2 = 1.0_rp - jwt1_r1
         swr_frac(i, j, nz) = 1.0_rp
@@ -106,7 +108,7 @@ contains
 
   subroutine lmd_interior(tind)
     integer(ip), intent(in) :: tind
-    integer(ip) :: i, j, k, nx, ny, nz, tid
+    integer(ip) :: i, j, k, nx, ny, nz, tid, lim
     real(rp) :: cff, dudz, dvdz, nu, mult
     real(rp) :: akv_loc, akt_t, akt_s
 
@@ -127,12 +129,14 @@ contains
     ! levels 1:nz-1 receive the same values, levels 0 and nz are not read.
     call halo_fill_3d_w(col_dc, STAGGER_RHO)
     call smooth_iso_3d_s(col_dc, 1, nz - 1)
+    lim = dry_lim(G_LMD)
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         do k = 1, nz - 1
           nu = lmd_nu_sx(col_dc(i, j, k))
           col_wc(i, j, k) = lmd_nuwm + lmd_nu0m * nu
@@ -166,7 +170,7 @@ contains
 
   subroutine lmd_kpp(tind)
     integer(ip), intent(in) :: tind
-    integer(ip) :: i, j, k, nx, ny, nz, tid, n_stp, first, kbls, kbbl
+    integer(ip) :: i, j, k, nx, ny, nz, tid, n_stp, first, kbls, kbbl, lim
     logical :: bulk
     real(rp) :: Cg, Vtc, alpha, beta, Bfsfc, zscale, ws, wm, Kern, Vtsq
     real(rp) :: ssgm, z_bl, cff, cff1, cff_up, cff_dn, amp, wmb, wsb, sgmb, swdk
@@ -180,6 +184,7 @@ contains
     Cg = lmd_Cg()
     Vtc = lmd_Vtc()
     bulk = have_bulk
+    lim = dry_lim(G_LMD)
 
     ! --- per-column surface forcing, friction velocity, previous BL depths
 #ifdef USE_CUDA
@@ -187,6 +192,7 @@ contains
 #endif
     do j = 1, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         alpha = jackett_alpha(t(i, j, nz, n_stp, itemp), t(i, j, nz, n_stp, isalt))
         beta  = jackett_beta(t(i, j, nz, n_stp, itemp), t(i, j, nz, n_stp, isalt))
         Bo(i, j) = g * (alpha * (stflx(i, j, itemp) - srflx(i, j)) - &
@@ -211,6 +217,7 @@ contains
     do k = 1, nz
       do j = 1, ny
         do i = 1, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           swdk = sqrt(max(0.0_rp, swr_frac(i, j, k) * swr_frac(i, j, k - 1)))
           zscale = z_w(i, j, nz) - z_r(i, j, k)
           Bfsfc = Bo(i, j) + Bosol(i, j) * (1.0_rp - swdk)
@@ -226,6 +233,7 @@ contains
 #endif
     do j = 1, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         kbls = 0
         col_cf(i, j, nz) = 0.0_rp
         col_cf(i, j, 0) = 0.0_rp
@@ -312,6 +320,7 @@ contains
 #endif
     do j = 1, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         if (first == 0) then
           hbl(i, j) = 0.5_rp * (hbl(i, j) + hbls(i, j))
           bbl(i, j) = 0.5_rp * (bbl(i, j) + hbbl(i, j))
@@ -354,6 +363,7 @@ contains
     do k = 0, nz
       do j = 1, ny
         do i = 1, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           Bfsfc = wrk2a(i, j)
           zscale = z_w(i, j, nz) - z_w(i, j, k)
           wm = lmd_wm(zscale, Bfsfc, ustar(i, j), hbl(i, j), rmask(i, j))
@@ -778,18 +788,20 @@ contains
   subroutine lmd_rig_3d(tid)
     ! Gradient Richardson number at all interior w-levels (one launch).
     integer(ip), intent(in) :: tid
-    integer(ip) :: i, j, k, nx, ny, nz, td
+    integer(ip) :: i, j, k, nx, ny, nz, td, lim
     real(rp) :: cff, dudz, dvdz
     nx = decomp%nx
     ny = decomp%ny
     nz = decomp%nz
     td = tid
+    lim = dry_lim(G_LMD)
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*>>>
 #endif
     do k = 1, nz - 1
       do j = 1, ny
         do i = 1, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           cff = 0.5_rp / max(z_r(i, j, k + 1) - z_r(i, j, k), 1.0e-30_rp)
           dudz = cff * (u(i, j, k + 1, td) - u(i, j, k, td) + &
                         u(i + 1, j, k + 1, td) - u(i + 1, j, k, td))
@@ -869,15 +881,17 @@ contains
     ! smooth_iso_2d_s for levels k0:k1 on 3-D work arrays.
     real(rp), WORK_ATTR intent(inout) :: fld(decomp%is:decomp%ie, decomp%js:decomp%je, 0:decomp%nz)
     integer(ip), intent(in) :: k0, k1
-    integer(ip) :: i, j, nx, ny, n
+    integer(ip) :: i, j, nx, ny, n, lim
     nx = decomp%nx
     ny = decomp%ny
+    lim = dry_lim(G_LMD)
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*>>>
 #endif
     do n = k0, k1
       do j = 0, ny + 1
         do i = 1, nx + 1
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           wrk3a(i, j, n) = (fld(i, j, n) - fld(i - 1, j, n)) * umask(i, j)
         enddo
       enddo
@@ -888,6 +902,7 @@ contains
     do n = k0, k1
       do j = 1, ny + 1
         do i = 0, nx + 1
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           wrk3c(i, j, n) = (fld(i, j, n) - fld(i, j - 1, n)) * vmask(i, j)
         enddo
       enddo
@@ -898,6 +913,7 @@ contains
     do n = k0, k1
       do j = 1, ny + 1
         do i = 1, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           wrk3b(i, j, n) = wrk3c(i, j, n) + lmd_smooth_c * (wrk3a(i + 1, j, n) + wrk3a(i, j - 1, n) - &
                wrk3a(i, j, n) - wrk3a(i + 1, j - 1, n))
         enddo
@@ -909,6 +925,7 @@ contains
     do n = k0, k1
       do j = 1, ny
         do i = 1, nx + 1
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           wrk3a(i, j, n) = wrk3a(i, j, n) + lmd_smooth_c * (wrk3c(i, j + 1, n) + wrk3c(i - 1, j, n) - &
                wrk3c(i, j, n) - wrk3c(i - 1, j + 1, n))
         enddo
@@ -920,6 +937,7 @@ contains
     do n = k0, k1
       do j = 1, ny
         do i = 1, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           ! Match CPU SMOOTH_RIG: no final rmask. Land col_dc stays finite and
           ! enters wet-column cross terms. (SMOOTH_HBL uses smooth_iso_2d,
           ! which still applies rmask after the smooth.)

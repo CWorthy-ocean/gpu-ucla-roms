@@ -17,7 +17,7 @@ module visc3d_mod
 contains
 
   subroutine visc3d()
-    integer(ip) :: i, j, k, nx, ny, nz, i_u0, i_u1, j_v0
+    integer(ip) :: i, j, k, nx, ny, nz, i_u0, i_u1, j_v0, lim
     real(rp) :: cff
     integer(ip) :: n_stp, n_new
     real(rp) :: dt_loc, rvfrc_p1_0
@@ -111,12 +111,14 @@ contains
       ! Flux stages for all levels, then one thread per column adds them
       ! in k order (rufrc/rvfrc sums match the per-level path).
       call ensure_wrk3()
+      lim = dry_lim(G_MOM)
 #ifdef USE_CUDA
       !$cuf kernel do(3) <<<*,*>>>
 #endif
       do k = 1, nz
         do j = 0, ny
           do i = 0, nx
+            if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
             cff = 0.5_rp * Hz(i, j, k) * visc2_r(i, j) * ( &
                   dn_r(i, j) * pm(i, j) * ((pn(i, j) + pn(i + 1, j)) * u(i + 1, j, k, n_stp) - &
                                            (pn(i - 1, j) + pn(i, j)) * u(i, j, k, n_stp)) - &
@@ -133,6 +135,7 @@ contains
       do k = 1, nz
         do j = 1, ny + 1
           do i = 1, nx + 1
+            if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
             cff = 0.125_rp * (Hz(i - 1, j, k) + Hz(i, j, k) + Hz(i - 1, j - 1, k) + Hz(i, j - 1, k)) * &
                   visc2_p(i, j) * ( &
                   0.25_rp * (pm(i - 1, j) + pm(i, j) + pm(i - 1, j - 1) + pm(i, j - 1)) * dn_p(i, j) * &
@@ -151,6 +154,7 @@ contains
 #endif
       do j = 1, ny
         do i = i_u0, i_u1
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           do k = 1, nz
             cff = 0.125_rp * (pm(i - 1, j) + pm(i, j)) * (pn(i - 1, j) + pn(i, j)) * ( &
                   (pn(i - 1, j) + pn(i, j)) * (wrk3a(i, j, k) - wrk3a(i - 1, j, k)) + &
@@ -165,6 +169,7 @@ contains
 #endif
       do j = j_v0, ny
         do i = 1, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           do k = 1, nz
             cff = 0.125_rp * (pm(i, j) + pm(i, j - 1)) * (pn(i, j) + pn(i, j - 1)) * ( &
                   (pn(i, j - 1) + pn(i, j)) * (wrk3d(i + 1, j, k) - wrk3d(i, j, k)) + &

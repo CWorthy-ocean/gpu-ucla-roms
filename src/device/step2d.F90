@@ -195,17 +195,20 @@ contains
   subroutine step2d_pre()
     ! Three launches: Drhs; DUon and DVom together (both need Drhs of a
     ! neighbour); zeta_new (needs DUon/DVom of neighbours).
-    integer(ip) :: i, j, ks, kb, ko, nx, ny, is, ie, js, je, ju0, ju1, iv0, iv1
+    integer(ip) :: i, j, ks, kb, ko, nx, ny, is, ie, js, je, ju0, ju1, iv0, iv1, lim
+    integer(ip) :: iu_lo, iu_hi, jv_lo, jv_hi, iz_lo, iz_hi, jz_lo, jz_hi
     real(rp) :: fwd, fwd1, fwd2, dt_fast, urhs, vrhs
 
     nx = decomp%nx
     ny = decomp%ny
     is = decomp%is; ie = decomp%ie
     js = decomp%js; je = decomp%je
+    lim = dry_lim(G_2D)
 
     CUF_DO2
     do j = js, je
       do i = is, ie
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         ks = fast%kstp
         kb = fast%kbak
         ko = fast%kold
@@ -224,21 +227,30 @@ contains
     if (decomp%edge_n) ju1 = ny + 1
     if (decomp%edge_w) iv0 = 0
     if (decomp%edge_e) iv1 = nx + 1
+    ! zeta_new is also formed on the first halo ring of MPI seams (one
+    ! exchange per fast step, see step2d_tail): DUon/DVom are needed one
+    ! face further there. Physical edges keep the former ranges.
+    call seam_ring(iz_lo, iz_hi, jz_lo, jz_hi)
+    iu_lo = merge(1_ip, 0_ip, decomp%edge_w); iu_hi = merge(nx + 1, nx + 2, decomp%edge_e)
+    jv_lo = merge(1_ip, 0_ip, decomp%edge_s); jv_hi = merge(ny + 1, ny + 2, decomp%edge_n)
+    ju0 = min(ju0, jz_lo); ju1 = max(ju1, jz_hi)
+    iv0 = min(iv0, iz_lo); iv1 = max(iv1, iz_hi)
 
     CUF_DO2
-    do j = 0, ny + 1
-      do i = 0, nx + 1
+    do j = 0, ny + 2
+      do i = 0, nx + 2
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         ks = fast%kstp
         kb = fast%kbak
         ko = fast%kold
         fwd = fast%fwd
         fwd1 = fast%fwd1
         fwd2 = fast%fwd2
-        if (j >= ju0 .and. j <= ju1 .and. i >= 1) then
+        if (j >= ju0 .and. j <= ju1 .and. i >= iu_lo .and. i <= iu_hi) then
           urhs = fwd * ubar(i, j, ks) + fwd1 * ubar(i, j, kb) + fwd2 * ubar(i, j, ko)
           DUon(i, j) = 0.5_rp * (Drhs(i, j) + Drhs(i - 1, j)) * dn_u(i, j) * urhs
         endif
-        if (i >= iv0 .and. i <= iv1 .and. j >= 1) then
+        if (i >= iv0 .and. i <= iv1 .and. j >= jv_lo .and. j <= jv_hi) then
           vrhs = fwd * vbar(i, j, ks) + fwd1 * vbar(i, j, kb) + fwd2 * vbar(i, j, ko)
           DVom(i, j) = 0.5_rp * (Drhs(i, j) + Drhs(i, j - 1)) * dm_v(i, j) * vrhs
         endif
@@ -246,8 +258,9 @@ contains
     enddo
 
     CUF_DO2
-    do j = 1, ny
-      do i = 1, nx
+    do j = jz_lo, jz_hi
+      do i = iz_lo, iz_hi
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         ks = fast%kstp
         dt_fast = fast%dtfast
         zeta_new(i, j) = zeta(i, j, ks) + dt_fast * pm(i, j) * pn(i, j) * &
@@ -321,7 +334,8 @@ contains
     ! DUon = h + zeta(kstp); (3) the ubar/vbar update. Per-point
     ! arithmetic is unchanged; iif = 1 adds the rufrc corrector kernels.
     integer(ip) :: i, j, ks, kn, kb, ko, nx, ny, is, ie, js, je, ju0, ju1, iv0, iv1
-    integer(ip) :: i_u_lo, i_u_hi, j_v_lo, j_v_hi, ir0, ir1, jr0, jr1
+    integer(ip) :: i_u_lo, i_u_hi, j_v_lo, j_v_hi, ir0, ir1, jr0, jr1, lim
+    integer(ip) :: iz_lo, iz_hi, jz_lo, jz_hi
     real(rp) :: cff, cff1, DUnew, DVnew, zk, z_old, term
     logical :: first
 
@@ -340,15 +354,18 @@ contains
     if (decomp%edge_w) iv0 = 0
     if (decomp%edge_e) iv1 = nx + 1
     first = (iif == 1)
+    lim = dry_lim(G_2D)
+    call seam_ring(iz_lo, iz_hi, jz_lo, jz_hi)
 
     CUF_DO2
     do j = js, je
       do i = is, ie
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         kn = fast%knew
         ks = fast%kstp
         kb = fast%kbak
         ko = fast%kold
-        if (i >= 1 .and. i <= nx .and. j >= 1 .and. j <= ny) zeta(i, j, kn) = zeta_new(i, j)
+        if (i >= iz_lo .and. i <= iz_hi .and. j >= jz_lo .and. j <= jz_hi) zeta(i, j, kn) = zeta_new(i, j)
         zk = zeta(i, j, kn)
         if (first) then
           ! FIRST_2D_STEP: bak over istrR:iendR / jstrR:jendR (the north
@@ -374,14 +391,14 @@ contains
              DV_avg2(i, j) = DV_avg2(i, j) + fast%w2 * DVom(i, j)
       enddo
     enddo
-    ! The seam halo of zeta(knew) must be current before Dnew and the PGF
-    ! state are formed at the halo points (the east/north tile's u(1)/v(1)
-    ! update uses Dnew(0) and rzeta(0)). Same per-point arithmetic as the
-    ! former single launch; on one tile the exchange is a no-op.
-    call halo_fill_2d_n(zeta, STAGGER_RHO)
+    ! Dnew and the PGF state at the first seam halo ring (the east/north
+    ! tile's u(1)/v(1) update uses Dnew(0) and rzeta(0)) come from the
+    ! zeta(knew) formed there above with the neighbour's arithmetic, so no
+    ! exchange is needed here; step2d_tail exchanges zeta with ubar/vbar.
     CUF_DO2
     do j = js, je
       do i = is, ie
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         kn = fast%knew
         ks = fast%kstp
         kb = fast%kbak
@@ -402,6 +419,7 @@ contains
     CUF_DO2
     do j = js, je
       do i = is, ie
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         ks = fast%kstp
         if (i >= 1 .and. i <= nx + 1 .and. j >= 1 .and. j <= ny) then
           term = barotropic_pgf(h(i - 1, j), h(i, j), &
@@ -431,11 +449,14 @@ contains
       call dump_rvS('after subtract')
       call dump_rufrc_build('after subtract rubar')
     endif
-    call hg_begin()
-    call hg_add(F_RUFRC)
-    call hg_add(F_RVFRC)
-    call hg_end()
+    ! rufrc/rvfrc change only on the first fast step (the subtraction
+    ! above; visc3d's additions are exchanged here too); later fast steps
+    ! would copy the same halo values again.
     if (first) then
+      call hg_begin()
+      call hg_add(F_RUFRC)
+      call hg_add(F_RVFRC)
+      call hg_end()
       call fill_pgf_state(.true.)
       call apply_pgf(.true.)
     endif
@@ -443,6 +464,7 @@ contains
     CUF_DO2
     do j = 1, ny + 1
       do i = 1, nx + 1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         ks = fast%kstp
         kn = fast%knew
         cff = fast%half_dt
@@ -498,18 +520,21 @@ contains
   end subroutine host_begin_fast_averages
 
   subroutine host_subtract_barotropic_from_rufrc()
-    integer(ip) :: i, j, nx, ny
+    integer(ip) :: i, j, nx, ny, lim
     nx = decomp%nx
     ny = decomp%ny
+    lim = dry_lim(G_2D)
     CUF_DO2
     do j = 1, ny
       do i = 1, nx + 1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         rufrc(i, j) = rufrc(i, j) - rubar(i, j)
       enddo
     enddo
     CUF_DO2
     do j = 1, ny + 1
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         rvfrc(i, j) = rvfrc(i, j) - rvbar(i, j)
       enddo
     enddo
@@ -548,26 +573,33 @@ contains
     ! zeta(knew) was exchanged inside step2d_mid before its halo PGF terms;
     ! only the last fast step rewrites it (zt_avg1). ubar and vbar go in one
     ! exchange per direction.
-    if (fast_is_last_h) then
-      call step2d_last_zeta()
-      call halo_fill_2d_n(zeta, STAGGER_RHO)
-    endif
-    call halo_fill_uv_n(ubar, vbar)
+    if (fast_is_last_h) call step2d_last_zeta()
+    call halo_fill_zuv_n(zeta, ubar, vbar)
   end subroutine step2d_tail
+
+  subroutine seam_ring(iz_lo, iz_hi, jz_lo, jz_hi)
+    ! Range of zeta_new: the interior plus the first halo ring on MPI seams
+    ! (physical edges stay with the boundary conditions).
+    integer(ip), intent(out) :: iz_lo, iz_hi, jz_lo, jz_hi
+    iz_lo = merge(1_ip, 0_ip, decomp%edge_w); iz_hi = merge(decomp%nx, decomp%nx + 1, decomp%edge_e)
+    jz_lo = merge(1_ip, 0_ip, decomp%edge_s); jz_hi = merge(decomp%ny, decomp%ny + 1, decomp%edge_n)
+  end subroutine seam_ring
 
   subroutine fill_pgf_state(fb_correct)
     logical, intent(in) :: fb_correct
-    integer(ip) :: i, j, is, ie, js, je, kn, ks, kb, ko
+    integer(ip) :: i, j, is, ie, js, je, kn, ks, kb, ko, lim
     real(rp) :: z_new, z_old
     logical :: correct
 
     is = decomp%is; ie = decomp%ie
     js = decomp%js; je = decomp%je
     correct = fb_correct
+    lim = dry_lim(G_2D)
 
     CUF_DO2
     do j = js, je
       do i = is, ie
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         kn = fast%knew
         ks = fast%kstp
         kb = fast%kbak
@@ -593,17 +625,19 @@ contains
 
   subroutine apply_pgf(add)
     logical, intent(in) :: add
-    integer(ip) :: i, j, nx, ny
+    integer(ip) :: i, j, nx, ny, lim
     real(rp) :: term
     logical :: do_add
 
     nx = decomp%nx
     ny = decomp%ny
     do_add = add
+    lim = dry_lim(G_2D)
 
     CUF_DO2
     do j = 1, ny
       do i = 1, nx + 1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         term = barotropic_pgf(h(i - 1, j), h(i, j), &
                               rzeta(i - 1, j), rzeta(i, j), &
                               rzeta2(i - 1, j), rzeta2(i, j), &
@@ -620,6 +654,7 @@ contains
     CUF_DO2
     do j = 1, ny + 1
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         term = barotropic_pgf(h(i, j - 1), h(i, j), &
                               rzeta(i, j - 1), rzeta(i, j), &
                               rzeta2(i, j - 1), rzeta2(i, j), &

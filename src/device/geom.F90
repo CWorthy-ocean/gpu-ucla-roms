@@ -48,7 +48,7 @@ contains
 
   subroutine set_depth_interior()
     ! Parallel (i,j), sequential k. Halo is not called from here.
-    integer(ip) :: i, j, k, is, ie, js, je, nz, kn
+    integer(ip) :: i, j, k, is, ie, js, je, nz, kn, lim
     real(rp) :: ds, s_w, s_r, hc_loc
 
     is = decomp%is; ie = decomp%ie
@@ -57,12 +57,14 @@ contains
     kn = knew
     hc_loc = hc
     ds = 1.0_rp / real(nz, rp)
+    lim = dry_lim(G_GEOM)
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = js, je
       do i = is, ie
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         hinv(i, j) = 1.0_rp / (h(i, j) + hc_loc)
         z_w(i, j, 0) = -h(i, j)
         do k = 1, nz
@@ -81,7 +83,7 @@ contains
   end subroutine set_depth_interior
 
   subroutine set_HUV()
-    integer(ip) :: i, j, k, nx, ny, nz, n_rhs
+    integer(ip) :: i, j, k, nx, ny, nz, n_rhs, lim
     integer(ip) :: i_v0, i_v1, j_u0, j_u1
     nx = decomp%nx
     ny = decomp%ny
@@ -97,12 +99,14 @@ contains
     j_u1 = ny
     if (decomp%edge_s) j_u0 = 0
     if (decomp%edge_n) j_u1 = ny + 1
+    lim = dry_lim(G_GEOM)
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = j_u0, j_u1
       do i = 1, nx + 1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         do k = 1, nz
           Hz_u(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
           FlxU(i, j, k) = apply_mask(Hz_u(i, j, k) * dn_u(i, j) * u(i, j, k, n_rhs), umask(i, j))
@@ -114,6 +118,7 @@ contains
 #endif
     do j = 1, ny + 1
       do i = i_v0, i_v1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         do k = 1, nz
           Hz_v(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k))
           FlxV(i, j, k) = apply_mask(Hz_v(i, j, k) * dm_v(i, j) * v(i, j, k, n_rhs), vmask(i, j))
@@ -129,7 +134,7 @@ contains
   subroutine set_HUV1()
     ! Predictor coupling: remove barotropic mismatch vs extrapolated
     ! DU_avg target, then rebuild FlxU/FlxV. FIRST step uses DU_avg1 only.
-    integer(ip) :: i, j, k, nx, ny, nz, n_new
+    integer(ip) :: i, j, k, nx, ny, nz, n_new, lim
     integer(ip) :: i_v0, i_v1, j_u0, j_u1
     real(rp) :: D, intF, target, mis
     integer(ip) :: first
@@ -147,12 +152,14 @@ contains
     j_u1 = ny
     if (decomp%edge_s) j_u0 = 0
     if (decomp%edge_n) j_u1 = ny + 1
+    lim = dry_lim(G_GEOM)
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = j_u0, j_u1
       do i = 1, nx + 1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         D = 0.0_rp
         intF = 0.0_rp
         do k = 1, nz
@@ -179,6 +186,7 @@ contains
 #endif
     do j = 1, ny + 1
       do i = i_v0, i_v1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         D = 0.0_rp
         intF = 0.0_rp
         do k = 1, nz
@@ -209,7 +217,7 @@ contains
   end subroutine set_HUV1
 
   subroutine omega()
-    integer(ip) :: i, j, k, nx, ny, nz
+    integer(ip) :: i, j, k, nx, ny, nz, lim
     real(rp) :: dtau, wrk, c2d, dh, cw, cw_max, cw_max2, cw_min, cff, cx0, cxk, cxkp, wacc
     real(rp), parameter :: cmnx_ratio = cu_min / cu_max
     real(rp), parameter :: cutoff = 2.0_rp - cmnx_ratio
@@ -225,12 +233,14 @@ contains
     else
       dtau = 0.6_rp * dt
     endif
+    lim = dry_lim(G_GEOM)
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = decomp%js, decomp%je
       do i = decomp%is, decomp%ie
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         do k = 0, nz
           Wi(i, j, k) = 0.0_rp
           We(i, j, k) = 0.0_rp
@@ -243,6 +253,7 @@ contains
 #endif
     do j = 1, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         wacc = 0.0_rp
         do k = 1, nz
           wacc = wacc - FlxU(i + 1, j, k) + FlxU(i, j, k) &

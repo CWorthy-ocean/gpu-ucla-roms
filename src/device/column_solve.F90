@@ -19,15 +19,17 @@ contains
     integer(ip), intent(in) :: nx, ny, nz, n_new, itrc, iAkt
     real(rp), intent(in) :: dtau
     logical, intent(in) :: use_fwd
-    integer(ip) :: i, j, k
+    integer(ip) :: i, j, k, lim
     real(rp) :: cff, dc0, hz_k, hz_kp
     real(rp) :: fck, wck, cfk, dck, fcm, wcm, cfm, dcm
 
+    lim = dry_lim(G_TRC)
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = 1, ny
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         dc0 = dtau * pm(i, j) * pn(i, j)
         if (use_fwd) then
           hz_k = Hz_fwd(i, j, 1)

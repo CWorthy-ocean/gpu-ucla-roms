@@ -372,7 +372,7 @@ contains
     integer(ip) :: j_ue_lo, j_ue_hi, i_vx_lo, i_vx_hi, j_v0, j_v1
     logical :: edge_w, edge_e, edge_s, edge_n, up
     real(rp) :: cff, fomn
-    integer(ip) :: ii, jj
+    integer(ip) :: ii, jj, lim
     real(rp) :: c_0, c_m, rr, uxm, ux0, uxp, fxm, fx0, fxp, uem, ue0, uep, fvm_j, fv0_j, fvm_jp, fv0_jp
     real(rp) :: fa_m, fa_0, fb_0, fb_p
 
@@ -439,6 +439,7 @@ contains
     else
       i_vx_hi = nx + 1
     endif
+    lim = dry_lim(G_UVRHS)
     ! ---- ru: one kernel. Per point: the Coriolis/curvature term of the two
     ! neighbouring rho points, the u-by-FlxU faces i-1 and i, the u-by-FlxV
     ! faces j and j+1, each face the same expression as before (curvatures
@@ -450,6 +451,7 @@ contains
     do kk = 1, nz
       do j = 1, ny
         do i = i_u0, i_u1
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           ! Coriolis / curvature at rho points i and i-1
           fomn = f(i, j) / max(pm(i, j) * pn(i, j), 1.0e-30_rp)
           cff = 0.5_rp * Hz(i, j, kk) * (fomn + 0.5_rp * ( &
@@ -516,6 +518,7 @@ contains
     do kk = 1, nz
       do j = j_v0, j_v1
         do i = 1, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           fomn = f(i, j) / max(pm(i, j) * pn(i, j), 1.0e-30_rp)
           cff = 0.5_rp * Hz(i, j, kk) * (fomn + 0.5_rp * ( &
                (v(i, j, kk, n_rhs) + v(i, j + 1, kk, n_rhs)) * dndx(i, j) - &
@@ -943,7 +946,7 @@ contains
     ! u pass over all rows runs before the v pass, as the col_* scratch is
     ! reused per column. Was called once per row.
     integer(ip), intent(in) :: j0, j1
-    integer(ip) :: i, k, nx, nz, jj, n_rhs, i_u0, i_u1, j_v0, j_v1, jv0, jv1, jp
+    integer(ip) :: i, k, nx, nz, jj, n_rhs, i_u0, i_u1, j_v0, j_v1, jv0, jv1, jp, lim
     real(rp) :: cff
 
     nx = decomp%nx
@@ -953,12 +956,14 @@ contains
     if (decomp%edge_w) i_u0 = 2
     i_u1 = nx + 1
     if (decomp%edge_e) i_u1 = nx
+    lim = dry_lim(G_UVRHS)
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do jj = j0, j1
     do i = i_u0, i_u1
+      if (lim > 0) then; if (colact(i, jj) == 0) cycle; end if
       col_dc(i, jj, 1) = 0.5625_rp * (Hz(i, jj, 1) + Hz(i - 1, jj, 1)) - &
                          0.0625_rp * (Hz(i + 1, jj, 1) + Hz(i - 2, jj, 1))
       col_cf(i, jj, 1) = 1.0_rp
@@ -999,6 +1004,7 @@ contains
 #endif
       do jj = jv0, jv1
       do i = 1, nx
+        if (lim > 0) then; if (colact(i, jj) == 0) cycle; end if
         col_dc(i, jj, 1) = 0.5625_rp * (Hz(i, jj, 1) + Hz(i, jj - 1, 1)) - &
                            0.0625_rp * (Hz(i, jj + 1, 1) + Hz(i, jj - 2, 1))
         col_cf(i, jj, 1) = 1.0_rp

@@ -747,6 +747,85 @@ the first two rows is init/queue noise (init 86 vs 83-93 s).
   same node (deg0072); 20+ runs on other nodes were bit-identical. Check
   `exec_host` before chasing a race.
 
+## Wet-column dycore, compressed passive storage, memory-aware tiles, fast-loop exchange (2026-10-08)
+
+Starting point (all-rank Pac profile, 8 GPUs): the passive kernels cost
+nothing on land, every dycore kernel cost the same per land cell as per wet
+cell (~76 ms per 1e5 cells per step), and the memory cap forced near-equal
+tile areas, so the all-wet tile paced every phase.
+
+- **Dry-column skip** (`gpu_state`: `build_dry_map`, `colact`, `dry_lim`,
+  groups G_GEOM..G_2D). "Deep land" = land with no wet point within 3
+  cells (judged inside the tile arrays; columns whose neighbourhood leaves
+  the arrays count as active). Every stored field is constant there
+  (history and restart: all zero on deep land at every record, the
+  barotropic forcing and transports zero on every land face; hbls/hbbl
+  vary only on coastal land), so the ~55 dycore kernels (depths, transports,
+  omega, EOS, KPP, pressure gradient, momentum advection and viscosity,
+  T/S advection, implicit solves, the momentum predictor/corrector, the
+  fast loop) skip deep land after the first two steps of a run (which
+  establish the values in every time slot). Test in the kernels:
+  `if (lim > 0) then; if (colact(i, j) == 0) cycle; end if` (no mask load
+  on tiles without deep land). `ROMS_GPU_SKIP_DRY` = bitmask of groups
+  (default all), `ROMS_GPU_DRY_RADIUS` (default 3). Land cost 76 -> 40 ms
+  per 1e5 land cells (the rest: coastal band, exchanges).
+- **Compressed passive storage** (`tpcol`, `tpnb`, `ntpcol`): tp(ntr,
+  0:ntpcol, nz, 3) over stored columns only: the interior wet columns
+  first in wet-list order (so MARBL and the passive kernels use their wet
+  index directly), then the other wet points and the physical boundary
+  rows; column 0 is a shared zero column for every other point (what land
+  held before). Stencil neighbours: x neighbours arithmetically
+  (ci +- d inside the tile row: exact whenever the value is used, since the
+  faces are masked with apply_mask otherwise), y neighbours and halo
+  neighbours from a per-column table (tpnb, 8 ints). Exchange
+  pack/unpack, restart load, output gather and init go through tpcol.
+  Memory: rank 7 (12% wet) 27.2 -> 12.4 GB. Kernel cost: horiz kernel
+  82 -> 85 ms on the all-wet rank (a first version with map lookups was
+  107 ms, the table alone 95), t3dmix 24 -> 26.5 ms (table; arithmetic x
+  was slower there, 33.6).
+- **Memory-aware balance**: the 'wet' balance raises the land weight until
+  the estimated memory of every tile (0.532*nz kB per cell + 3*ntp*nz*8 B
+  per wet cell, fitted on Pac within ~2 GB) is below 92% of the smallest
+  device memory (`tile_max_mem_gb`, `tile_mem_cell_kb`, `tile_mem_wet_kb`;
+  `tile_max_cells_ratio` is now off by default). Default land weight 0.10
+  (measured best).
+- **Fast loop: one exchange per substep** instead of two: zeta_new is formed
+  on the first halo ring of MPI seams (DUon/DVom one face further there)
+  with the neighbour's arithmetic, so the mid-substep zeta exchange is gone
+  and zeta(knew) travels with ubar/vbar in one exchange
+  (`halo_fill_zuv_n`). The rufrc/rvfrc exchange of every substep is now
+  done on the first substep only (the only one that changes them).
+- **Layout**: tensor-product 4x2 cuts cannot balance Pac better than
+  max/mean cost ~1.08-1.14; 8x1 strips reach 1.002 and drop every
+  north-south (inter-node) exchange round. With strips the fast loop
+  spends 46 ms per step (14 ms kernels) instead of 111 ms.
+
+Pac 3-day, 8 GPUs + 4 writers, all bit-identical to the reference
+(history and restart; different cuts give identical results):
+
+| configuration | median step | mean step |
+|---|---|---|
+| start of this round (4x2, forced land weight 0.84) | 0.478 s | 0.462 s |
+| + dry skip (same cuts) | 0.475 s | 0.459 s |
+| + compressed storage, 4x2 rebalanced (0.40) | 0.448 s | 0.429 s |
+| + one exchange per substep, 4x2 (0.25) | 0.449 s | 0.428 s |
+| 8x1 strips, land weight 0.25 | 0.416 s | 0.418 s |
+| 8x1 strips, land weight 0.10 | 0.404 s | 0.404 s |
+
+Final verification with the rebuilt main binary (all bit-identical):
+MiniPac 1x1 4-step vs 4ref; 2x2 4-step vs 4r; 4x2 two-node 4-step vs 4r;
+2x2, 4x2 and 4x1 3-day vs 3dv3 (median step 0.133, 0.087, 0.137 s; 2x2
+was 0.144 before this round, so strips do not help MiniPac on one node);
+Pac 4x2 4-step vs pac8; Pac 8x1 3-day (default land weight 0.10) vs
+pac3d8w4m, median 0.404 s, peak GPU memory 27.3 GB.
+
+Not done: a 4-cell halo to exchange every second fast step. With a 2-cell
+halo one exchange per substep is the minimum (ubar(knew) at a face depends
+on fields 2 cells away within a substep); a 4-cell halo means widening every
+array while keeping the 3-D exchanges at width 2. Remaining fast-loop idle
+is ~32 ms per step, of which perhaps 10-15 ms is the exchange rounds this
+would halve (~2-3%).
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

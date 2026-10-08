@@ -29,7 +29,7 @@ module pre_step3d_mod
 contains
 
   subroutine pre_step3d()
-    integer(ip) :: i, j, k, itrc, indx, iAkt, nx, ny, nz
+    integer(ip) :: i, j, k, itrc, indx, iAkt, nx, ny, nz, lim, limm
     integer(ip) :: n_stp, n_new, i_u0, i_u1, j_v0, ip4, jp4
     real(rp) :: dtau, cf_stp, cf_bak, cff, FlxDiv
     real(rp) :: u_fwd(COL_KMAX)
@@ -61,6 +61,8 @@ contains
     call hg_add(F_WI)
     call hg_end()
     call set_bottom_drag()
+    lim = dry_lim(G_TRC)
+    limm = dry_lim(G_MOM)
 
 #ifdef USE_CUDA
     !$cuf kernel do(3) <<<*,*>>>
@@ -68,6 +70,7 @@ contains
     do k = 1, nz
       do j = 0, ny
         do i = 0, nx
+          if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
           FlxDiv = 0.5_rp * dtau * pm(i, j) * pn(i, j) * ( &
                    FlxU(i + 1, j, k) - FlxU(i, j, k) + &
                    FlxV(i, j + 1, k) - FlxV(i, j, k) + &
@@ -147,6 +150,7 @@ contains
 #endif
     do j = 1, ny
       do i = i_u0, i_u1
+        if (limm > 0) then; if (colact(i, j) == 0) cycle; end if
         col_dc(i, j, 0) = dtau * 0.25_rp * (pm(i, j) + pm(i - 1, j)) * (pn(i, j) + pn(i - 1, j))
         do k = 1, nz
           col_dc(i, j, k) = 0.5_rp * (Hz_bak(i, j, k) + Hz_bak(i - 1, j, k)) * ( &
@@ -173,6 +177,7 @@ contains
 #endif
     do j = 1, ny
       do i = i_u0, i_u1
+        if (limm > 0) then; if (colact(i, j) == 0) cycle; end if
         fck = 2.0_rp * dtau * (Akv(i, j, nz - 1) + Akv(i - 1, j, nz - 1)) / &
              (Hz_fwd(i, j, nz) + Hz_fwd(i - 1, j, nz) + Hz_fwd(i, j, nz - 1) + Hz_fwd(i - 1, j, nz - 1))
         wck = col_dc(i, j, 0) * 0.5_rp * (Wi(i, j, nz - 1) + Wi(i - 1, j, nz - 1))
@@ -225,6 +230,7 @@ contains
 #endif
     do j = j_v0, ny
       do i = 1, nx
+        if (limm > 0) then; if (colact(i, j) == 0) cycle; end if
         col_dc(i, j, 0) = dtau * 0.25_rp * (pm(i, j) + pm(i, j - 1)) * (pn(i, j) + pn(i, j - 1))
         do k = 1, nz
           col_dc(i, j, k) = 0.5_rp * (Hz_bak(i, j, k) + Hz_bak(i, j - 1, k)) * ( &
@@ -239,6 +245,7 @@ contains
 #endif
     do j = j_v0, ny
       do i = 1, nx
+        if (limm > 0) then; if (colact(i, j) == 0) cycle; end if
         fck = 2.0_rp * dtau * (Akv(i, j, nz - 1) + Akv(i, j - 1, nz - 1)) / &
              (Hz_fwd(i, j, nz) + Hz_fwd(i, j - 1, nz) + Hz_fwd(i, j, nz - 1) + Hz_fwd(i, j - 1, nz - 1))
         wck = col_dc(i, j, 0) * 0.5_rp * (Wi(i, j, nz - 1) + Wi(i, j - 1, nz - 1))

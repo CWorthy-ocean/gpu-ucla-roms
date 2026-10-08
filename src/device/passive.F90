@@ -24,7 +24,8 @@ module passive_mod
   private
 
   integer(ip), public :: ntp = 0
-  real(pp), WORK_ATTR public, allocatable :: tp(:, :, :, :, :)   ! (is:ie, js:je, nz, 3, ntp)
+  ! (ntp, 0:ntpcol, nz, 3): stored columns only, see gpu_state (tpcol).
+  real(pp), WORK_ATTR public, allocatable :: tp(:, :, :, :)
   character(len=16), public :: passive_init = 'zero'           ! zero | blob | mirror_salt
   logical, public :: passive_mirror = .false.
   logical, public :: wrt_passive = .true.
@@ -105,7 +106,8 @@ contains
     if (ntp <= 0) return
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je; nz = decomp%nz
     if (allocated(tp)) deallocate(tp)
-    allocate(tp(ntp, is:ie, js:je, nz, 3))
+    if (.not. allocated(tpcol_h)) error stop 'alloc_passive: build_tp_columns first'
+    allocate(tp(ntp, 0:ntpcol, nz, 3))
     tp = 0.0_pp
     if (passive_marbl) then
       if (allocated(tb_west)) deallocate(tb_west, tb_east, tb_south, tb_north)
@@ -132,8 +134,9 @@ contains
             do i = decomp%is, decomp%ie
               val = exp(-((real(i, rp) - ic)**2 + (real(j, rp) - jc)**2) / rad**2) * &
                     exp(-real(nz - k, rp) / 20.0_rp) * rmask(i, j)
+              if (tpcol_h(i, j) == 0) cycle
               do n = 1, 3
-                tp(itp, i, j, k, n) = real(val, pp)
+                tp(itp, tpcol_h(i, j), k, n) = real(val, pp)
               enddo
             enddo
           enddo
@@ -143,8 +146,9 @@ contains
       do k = 1, nz
         do j = decomp%js, decomp%je
           do i = decomp%is, decomp%ie
+            if (tpcol_h(i, j) == 0) cycle
             do n = 1, 3
-              tp(1, i, j, k, n) = real(t(i, j, k, n, isalt), pp)
+              tp(1, tpcol_h(i, j), k, n) = real(t(i, j, k, n, isalt), pp)
             enddo
           enddo
         enddo
@@ -232,8 +236,8 @@ contains
     logical :: sw, se, nw, ne, mir, mbry
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = ntp
     ns = nstp; nn = nnew; nr = nrhs
-    ilo = lbound(tp, 2); ihi = ubound(tp, 2)
-    jlo = lbound(tp, 3); jhi = ubound(tp, 3)
+    ilo = decomp%is; ihi = decomp%ie
+    jlo = decomp%js; jhi = decomp%je
     mir = passive_mirror
     mbry = passive_marbl
     if (nnew == 3) then
@@ -250,10 +254,10 @@ contains
         do j = 1, ny
           do k = 1, nz
             do itr = 1, ntr
-              g0c = (real(tp(itr, 0, j, k, ns), rp) - real(tp(itr, 0, j - 1, k, ns), rp)) * vmask(0, j)
-              g0p = (real(tp(itr, 0, j + 1, k, ns), rp) - real(tp(itr, 0, j, k, ns), rp)) * vmask(0, j + 1)
-              g1c = (real(tp(itr, 1, j, k, ns), rp) - real(tp(itr, 1, j - 1, k, ns), rp)) * vmask(1, j)
-              g1p = (real(tp(itr, 1, j + 1, k, ns), rp) - real(tp(itr, 1, j, k, ns), rp)) * vmask(1, j + 1)
+              g0c = (real(tp(itr, tpcol(0, j), k, ns), rp) - real(tp(itr, tpcol(0, j - 1), k, ns), rp)) * vmask(0, j)
+              g0p = (real(tp(itr, tpcol(0, j + 1), k, ns), rp) - real(tp(itr, tpcol(0, j), k, ns), rp)) * vmask(0, j + 1)
+              g1c = (real(tp(itr, tpcol(1, j), k, ns), rp) - real(tp(itr, tpcol(1, j - 1), k, ns), rp)) * vmask(1, j)
+              g1p = (real(tp(itr, tpcol(1, j + 1), k, ns), rp) - real(tp(itr, tpcol(1, j), k, ns), rp)) * vmask(1, j + 1)
               cx = -dtw * u(1, j, k, nr) * pm(0, j)
               cy = 0.5_rp * dtw * (v(0, j, k, nr) + v(0, j + 1, k, nr)) * pn(0, j)
               if (cx > 0.0_rp) then
@@ -261,13 +265,13 @@ contains
               else
                 cext = -cx; cx = 0.0_rp
               endif
-              tn = (1.0_rp - cx) * (real(tp(itr, 0, j, k, ns), rp) &
+              tn = (1.0_rp - cx) * (real(tp(itr, tpcol(0, j), k, ns), rp) &
                    - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p) &
-                   + cx * (real(tp(itr, 1, j, k, ns), rp) - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p)
+                   + cx * (real(tp(itr, tpcol(1, j), k, ns), rp) - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p)
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_west(j, k, isalt)
               if (mbry) text = tb_west(j, k, itr)
-              tp(itr, 0, j, k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(0, j), pp)
+              tp(itr, tpcol(0, j), k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(0, j), pp)
             enddo
           enddo
         enddo
@@ -278,7 +282,7 @@ contains
         do j = jlo, jhi
           do k = 1, nz
             do itr = 1, ntr
-              tp(itr, 0, j, k, nn) = tp(itr, 1, j, k, nn)
+              tp(itr, tpcol(0, j), k, nn) = tp(itr, tpcol(1, j), k, nn)
             enddo
           enddo
         enddo
@@ -293,10 +297,10 @@ contains
         do j = 1, ny
           do k = 1, nz
             do itr = 1, ntr
-              g0c = (real(tp(itr, nx, j, k, ns), rp) - real(tp(itr, nx, j - 1, k, ns), rp)) * vmask(nx, j)
-              g0p = (real(tp(itr, nx, j + 1, k, ns), rp) - real(tp(itr, nx, j, k, ns), rp)) * vmask(nx, j + 1)
-              g1c = (real(tp(itr, nx + 1, j, k, ns), rp) - real(tp(itr, nx + 1, j - 1, k, ns), rp)) * vmask(nx + 1, j)
-              g1p = (real(tp(itr, nx + 1, j + 1, k, ns), rp) - real(tp(itr, nx + 1, j, k, ns), rp)) * vmask(nx + 1, j + 1)
+              g0c = (real(tp(itr, tpcol(nx, j), k, ns), rp) - real(tp(itr, tpcol(nx, j - 1), k, ns), rp)) * vmask(nx, j)
+              g0p = (real(tp(itr, tpcol(nx, j + 1), k, ns), rp) - real(tp(itr, tpcol(nx, j), k, ns), rp)) * vmask(nx, j + 1)
+              g1c = (real(tp(itr, tpcol(nx + 1, j), k, ns), rp) - real(tp(itr, tpcol(nx + 1, j - 1), k, ns), rp)) * vmask(nx + 1, j)
+              g1p = (real(tp(itr, tpcol(nx + 1, j + 1), k, ns), rp) - real(tp(itr, tpcol(nx + 1, j), k, ns), rp)) * vmask(nx + 1, j + 1)
               cx = dtw * u(nx + 1, j, k, nr) * pm(nx + 1, j)
               cy = 0.5_rp * dtw * (v(nx + 1, j, k, nr) + v(nx + 1, j + 1, k, nr)) * pn(nx + 1, j)
               if (cx > 0.0_rp) then
@@ -304,13 +308,13 @@ contains
               else
                 cext = -cx; cx = 0.0_rp
               endif
-              tn = (1.0_rp - cx) * (real(tp(itr, nx + 1, j, k, ns), rp) &
+              tn = (1.0_rp - cx) * (real(tp(itr, tpcol(nx + 1, j), k, ns), rp) &
                    - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) &
-                   + cx * (real(tp(itr, nx, j, k, nn), rp) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
+                   + cx * (real(tp(itr, tpcol(nx, j), k, nn), rp) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_east(j, k, isalt)
               if (mbry) text = tb_east(j, k, itr)
-              tp(itr, nx + 1, j, k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(nx + 1, j), pp)
+              tp(itr, tpcol(nx + 1, j), k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(nx + 1, j), pp)
             enddo
           enddo
         enddo
@@ -321,7 +325,7 @@ contains
         do j = jlo, jhi
           do k = 1, nz
             do itr = 1, ntr
-              tp(itr, nx + 1, j, k, nn) = tp(itr, nx, j, k, nn)
+              tp(itr, tpcol(nx + 1, j), k, nn) = tp(itr, tpcol(nx, j), k, nn)
             enddo
           enddo
         enddo
@@ -336,10 +340,10 @@ contains
         do i = 1, nx
           do k = 1, nz
             do itr = 1, ntr
-              g0c = (real(tp(itr, i, 0, k, ns), rp) - real(tp(itr, i - 1, 0, k, ns), rp)) * umask(i, 0)
-              g0p = (real(tp(itr, i + 1, 0, k, ns), rp) - real(tp(itr, i, 0, k, ns), rp)) * umask(i + 1, 0)
-              g1c = (real(tp(itr, i, 1, k, ns), rp) - real(tp(itr, i - 1, 1, k, ns), rp)) * umask(i, 1)
-              g1p = (real(tp(itr, i + 1, 1, k, ns), rp) - real(tp(itr, i, 1, k, ns), rp)) * umask(i + 1, 1)
+              g0c = (real(tp(itr, tpcol(i, 0), k, ns), rp) - real(tp(itr, tpcol(i - 1, 0), k, ns), rp)) * umask(i, 0)
+              g0p = (real(tp(itr, tpcol(i + 1, 0), k, ns), rp) - real(tp(itr, tpcol(i, 0), k, ns), rp)) * umask(i + 1, 0)
+              g1c = (real(tp(itr, tpcol(i, 1), k, ns), rp) - real(tp(itr, tpcol(i - 1, 1), k, ns), rp)) * umask(i, 1)
+              g1p = (real(tp(itr, tpcol(i + 1, 1), k, ns), rp) - real(tp(itr, tpcol(i, 1), k, ns), rp)) * umask(i + 1, 1)
               cx = -dtw * v(i, 1, k, nr) * pn(i, 0)
               cy = 0.5_rp * dtw * (u(i, 0, k, nr) + u(i + 1, 0, k, nr)) * pm(i, 0)
               if (cx > 0.0_rp) then
@@ -347,13 +351,13 @@ contains
               else
                 cext = -cx; cx = 0.0_rp
               endif
-              tn = (1.0_rp - cx) * (real(tp(itr, i, 0, k, ns), rp) &
+              tn = (1.0_rp - cx) * (real(tp(itr, tpcol(i, 0), k, ns), rp) &
                    - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p) &
-                   + cx * (real(tp(itr, i, 1, k, ns), rp) - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p)
+                   + cx * (real(tp(itr, tpcol(i, 1), k, ns), rp) - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p)
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_south(i, k, isalt)
               if (mbry) text = tb_south(i, k, itr)
-              tp(itr, i, 0, k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(i, 0), pp)
+              tp(itr, tpcol(i, 0), k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(i, 0), pp)
             enddo
           enddo
         enddo
@@ -364,7 +368,7 @@ contains
         do i = ilo, ihi
           do k = 1, nz
             do itr = 1, ntr
-              tp(itr, i, 0, k, nn) = tp(itr, i, 1, k, nn)
+              tp(itr, tpcol(i, 0), k, nn) = tp(itr, tpcol(i, 1), k, nn)
             enddo
           enddo
         enddo
@@ -379,10 +383,10 @@ contains
         do i = 1, nx
           do k = 1, nz
             do itr = 1, ntr
-              g0c = (real(tp(itr, i, ny, k, ns), rp) - real(tp(itr, i - 1, ny, k, ns), rp)) * umask(i, ny)
-              g0p = (real(tp(itr, i + 1, ny, k, ns), rp) - real(tp(itr, i, ny, k, ns), rp)) * umask(i + 1, ny)
-              g1c = (real(tp(itr, i, ny + 1, k, ns), rp) - real(tp(itr, i - 1, ny + 1, k, ns), rp)) * umask(i, ny + 1)
-              g1p = (real(tp(itr, i + 1, ny + 1, k, ns), rp) - real(tp(itr, i, ny + 1, k, ns), rp)) * umask(i + 1, ny + 1)
+              g0c = (real(tp(itr, tpcol(i, ny), k, ns), rp) - real(tp(itr, tpcol(i - 1, ny), k, ns), rp)) * umask(i, ny)
+              g0p = (real(tp(itr, tpcol(i + 1, ny), k, ns), rp) - real(tp(itr, tpcol(i, ny), k, ns), rp)) * umask(i + 1, ny)
+              g1c = (real(tp(itr, tpcol(i, ny + 1), k, ns), rp) - real(tp(itr, tpcol(i - 1, ny + 1), k, ns), rp)) * umask(i, ny + 1)
+              g1p = (real(tp(itr, tpcol(i + 1, ny + 1), k, ns), rp) - real(tp(itr, tpcol(i, ny + 1), k, ns), rp)) * umask(i + 1, ny + 1)
               cx = dtw * v(i, ny + 1, k, nr) * pn(i, ny + 1)
               cy = 0.5_rp * dtw * (u(i, ny + 1, k, nr) + u(i + 1, ny + 1, k, nr)) * pm(i, ny + 1)
               if (cx > 0.0_rp) then
@@ -390,13 +394,13 @@ contains
               else
                 cext = -cx; cx = 0.0_rp
               endif
-              tn = (1.0_rp - cx) * (real(tp(itr, i, ny + 1, k, ns), rp) &
+              tn = (1.0_rp - cx) * (real(tp(itr, tpcol(i, ny + 1), k, ns), rp) &
                    - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) &
-                   + cx * (real(tp(itr, i, ny, k, nn), rp) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
+                   + cx * (real(tp(itr, tpcol(i, ny), k, nn), rp) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_north(i, k, isalt)
               if (mbry) text = tb_north(i, k, itr)
-              tp(itr, i, ny + 1, k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(i, ny + 1), pp)
+              tp(itr, tpcol(i, ny + 1), k, nn) = real(((1.0_rp - cext) * tn + cext * text) * rmask(i, ny + 1), pp)
             enddo
           enddo
         enddo
@@ -407,7 +411,7 @@ contains
         do i = ilo, ihi
           do k = 1, nz
             do itr = 1, ntr
-              tp(itr, i, ny + 1, k, nn) = tp(itr, i, ny, k, nn)
+              tp(itr, tpcol(i, ny + 1), k, nn) = tp(itr, tpcol(i, ny), k, nn)
             enddo
           enddo
         enddo
@@ -426,40 +430,40 @@ contains
           cff = rmask(1, 0) + rmask(0, 1)
           if (cff > 0.0_rp) then
             cff = 1.0_rp / cff
-            tp(itr, 0, 0, k, nn) = real(cff * (rmask(1, 0) * real(tp(itr, 1, 0, k, nn), rp) + &
-                 rmask(0, 1) * real(tp(itr, 0, 1, k, nn), rp)), pp)
+            tp(itr, tpcol(0, 0), k, nn) = real(cff * (rmask(1, 0) * real(tp(itr, tpcol(1, 0), k, nn), rp) + &
+                 rmask(0, 1) * real(tp(itr, tpcol(0, 1), k, nn), rp)), pp)
           else
-            tp(itr, 0, 0, k, nn) = 0.0_pp
+            tp(itr, tpcol(0, 0), k, nn) = 0.0_pp
           endif
         endif
         if (se) then
           cff = rmask(nx, 0) + rmask(nx + 1, 1)
           if (cff > 0.0_rp) then
             cff = 1.0_rp / cff
-            tp(itr, nx + 1, 0, k, nn) = real(cff * (rmask(nx, 0) * real(tp(itr, nx, 0, k, nn), rp) + &
-                 rmask(nx + 1, 1) * real(tp(itr, nx + 1, 1, k, nn), rp)), pp)
+            tp(itr, tpcol(nx + 1, 0), k, nn) = real(cff * (rmask(nx, 0) * real(tp(itr, tpcol(nx, 0), k, nn), rp) + &
+                 rmask(nx + 1, 1) * real(tp(itr, tpcol(nx + 1, 1), k, nn), rp)), pp)
           else
-            tp(itr, nx + 1, 0, k, nn) = 0.0_pp
+            tp(itr, tpcol(nx + 1, 0), k, nn) = 0.0_pp
           endif
         endif
         if (nw) then
           cff = rmask(1, ny + 1) + rmask(0, ny)
           if (cff > 0.0_rp) then
             cff = 1.0_rp / cff
-            tp(itr, 0, ny + 1, k, nn) = real(cff * (rmask(1, ny + 1) * real(tp(itr, 1, ny + 1, k, nn), rp) + &
-                 rmask(0, ny) * real(tp(itr, 0, ny, k, nn), rp)), pp)
+            tp(itr, tpcol(0, ny + 1), k, nn) = real(cff * (rmask(1, ny + 1) * real(tp(itr, tpcol(1, ny + 1), k, nn), rp) + &
+                 rmask(0, ny) * real(tp(itr, tpcol(0, ny), k, nn), rp)), pp)
           else
-            tp(itr, 0, ny + 1, k, nn) = 0.0_pp
+            tp(itr, tpcol(0, ny + 1), k, nn) = 0.0_pp
           endif
         endif
         if (ne) then
           cff = rmask(nx, ny + 1) + rmask(nx + 1, ny)
           if (cff > 0.0_rp) then
             cff = 1.0_rp / cff
-            tp(itr, nx + 1, ny + 1, k, nn) = real(cff * (rmask(nx, ny + 1) * real(tp(itr, nx, ny + 1, k, nn), rp) + &
-                 rmask(nx + 1, ny) * real(tp(itr, nx + 1, ny, k, nn), rp)), pp)
+            tp(itr, tpcol(nx + 1, ny + 1), k, nn) = real(cff * (rmask(nx, ny + 1) * real(tp(itr, tpcol(nx, ny + 1), k, nn), rp) + &
+                 rmask(nx + 1, ny) * real(tp(itr, tpcol(nx + 1, ny), k, nn), rp)), pp)
           else
-            tp(itr, nx + 1, ny + 1, k, nn) = 0.0_pp
+            tp(itr, tpcol(nx + 1, ny + 1), k, nn) = 0.0_pp
           endif
         endif
       enddo

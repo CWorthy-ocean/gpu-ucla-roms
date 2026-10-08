@@ -13,7 +13,7 @@ module t3dmix_mod
 contains
 
   subroutine t3dmix()
-    integer(ip) :: i, j, k, itrc, nx, ny, nz, n_rhs, n_new
+    integer(ip) :: i, j, k, itrc, nx, ny, nz, n_rhs, n_new, lim
     real(rp) :: dt_loc, fxw, fxe, fes, fen
 
     nx = decomp%nx
@@ -22,6 +22,7 @@ contains
     n_rhs = nrhs
     n_new = nnew
     dt_loc = dt
+    lim = dry_lim(G_TRC)
 
     do itrc = 1, nt
       ! slot nrhs (= 3) halos: exchanged by pre_step3d's group after t3dbc and
@@ -36,6 +37,7 @@ contains
       do k = 1, nz
         do j = 1, ny
           do i = 1, nx
+            if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
             fxw = apply_mask(0.25_rp * (diff2(i, j, itrc) + diff2(i - 1, j, itrc)) * &
                  pmon_u(i, j) * (Hz(i, j, k) + Hz(i - 1, j, k)) * &
                  (t(i, j, k, n_rhs, itrc) - t(i - 1, j, k, n_rhs, itrc)), umask(i, j))
