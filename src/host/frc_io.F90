@@ -12,7 +12,7 @@ module frc_io
   use bulk_coare, only: calc_bulk_coare
   use arch_mod, only: sync_arch
   use comm_mod, only: comm_rank, comm_size, comm_compute
-  use netcdf, only: nf90_inquire, nf90_inquire_variable, nf90_inquire_dimension, nf90_get_var, &
+  use netcdf, only: nf90_inquire, nf90_inq_varid, nf90_inquire_variable, nf90_inquire_dimension, nf90_get_var, &
                     nf90_double, nf90_float, nf90_max_var_dims
 #ifdef USE_CUDA
   use cudafor
@@ -46,6 +46,10 @@ module frc_io
   real(rp), parameter :: Cp = 3985.0_rp
   real(rp), parameter :: cmday2ms = 0.01_rp / 86400.0_rp
 
+  type :: fb_t
+    real(rp), allocatable :: b(:)
+  end type fb_t
+
   type :: series2d
     character(len=64)  :: vname = ''
     character(len=64)  :: tname = ''
@@ -60,13 +64,48 @@ module frc_io
     character(len=512), allocatable :: paths(:)
     real(rp), allocatable :: times(:)
     real(rp), WORK_ATTR allocatable :: buf(:,:,:)   ! spatial (n1,n2,2)
+    ! read-ahead (frc_prefetch): record pf_idx (0: none) arriving in pf_buf
+    integer :: pf_idx = 0, pf_rreq = 0
+    logical :: pf_own = .false.
+    real(rp), allocatable :: pf_buf(:)
+    integer, allocatable :: pf_sreq(:)
+    type(fb_t), allocatable :: pf_sbuf(:)
   end type series2d
 
-  type(series2d) :: s_sustr, s_svstr, s_shflx, s_swflx, s_swrad
-  type(series2d) :: s_uwnd, s_vwnd, s_tair, s_qair, s_prate, s_lwrad, s_bswrad
-  type(series2d) :: s_sss                      ! SFLX_CORR: sea-surface salinity restoring data
+  type(series2d), target :: s_sustr, s_svstr, s_shflx, s_swflx, s_swrad
+  type(series2d), target :: s_uwnd, s_vwnd, s_tair, s_qair, s_prate, s_lwrad, s_bswrad
+  type(series2d), target :: s_sss              ! SFLX_CORR: sea-surface salinity restoring data
   ! MARBL surface forcing (dust/iron/nox/nhy climatologies, atmospheric xCO2)
-  type(series2d) :: s_dust, s_iron, s_nox, s_nhy, s_xco2, s_xco2a
+  type(series2d), target :: s_dust, s_iron, s_nox, s_nhy, s_xco2, s_xco2a
+
+  ! Record reads while stepping (ROMS_GPU_FRC_BATCH bitmask, default 3):
+  ! bit 1: a series that moves on by one record copies its upper bracket
+  !   into the lower slot instead of reading that record again;
+  ! bit 2: set_forces / set_bgc_forces first advance every series with the
+  !   reads deferred (frc_batch_begin), then frc_batch_flush reads each new
+  !   record whole, once, on one rank (round-robin) and sends every tile its
+  !   window: one contiguous read per record instead of one strided window
+  !   read per tile. The bytes that land in a tile are the window read's.
+  ! bit 4 (with bit 2): frc_prefetch, called after step3d_t while the
+  !   passive corrector kernels run, reads the next record of
+  !   every series ahead (at most one record per rank per call, sent to
+  !   the tiles with non-blocking messages); the flush that needs it only
+  !   waits for the messages. A record that turns out not to be the one
+  !   needed is dropped and read as before. Default 7 (all three).
+  ! ROMS_GPU_FRC_TIMING=1 prints the time of every flush and prefetch.
+  integer, parameter :: MAXPEND = 64
+  type :: pend_t
+    type(series2d), pointer :: s => null()
+    integer :: idx = 0, slot = 0
+  end type pend_t
+  type(pend_t), save :: pend(MAXPEND)
+  integer :: npend = 0
+  logical :: batching = .false.
+  integer :: frc_mode = -1                ! ROMS_GPU_FRC_BATCH, read once
+  logical :: frc_timing = .false.
+  integer :: run_ncid(max_frc) = -1       ! read handles kept open while stepping
+  integer, parameter :: FRC_TAG0 = 6000, FRC_PF_TAG0 = 6100
+  public :: frc_prefetch, frc_prefetch_drain
   logical, public :: bgc_frc_on = .false.
   real(rp), WORK_ATTR allocatable :: uwnd(:,:), vwnd(:,:), qair(:,:), prate(:,:), lwrad_in(:,:)
   real(rp), WORK_ATTR allocatable :: sss(:,:)
@@ -189,6 +228,16 @@ contains
     logical, save :: logged_bulk = .false.
     if (have_bulk) then
       tneed = frc_modtime()
+      call frc_batch_begin()
+      call advance_series(s_uwnd, tneed)
+      call advance_series(s_vwnd, tneed)
+      call advance_series(s_tair, tneed)
+      call advance_series(s_qair, tneed)
+      call advance_series(s_prate, tneed)
+      call advance_series(s_lwrad, tneed)
+      call advance_series(s_bswrad, tneed)
+      if (sflx_corr) call advance_series(s_sss, tneed)
+      call frc_batch_flush()
       call fill_r(s_uwnd, tneed, uwnd)
       call fill_r(s_vwnd, tneed, vwnd)
       call fill_r(s_tair, tneed, tair)
@@ -216,6 +265,13 @@ contains
     endif
     if (.not. have_flux) return
     tneed = frc_modtime()
+    call frc_batch_begin()
+    call advance_series(s_sustr, tneed)
+    call advance_series(s_svstr, tneed)
+    call advance_series(s_shflx, tneed)
+    call advance_series(s_swflx, tneed)
+    call advance_series(s_swrad, tneed)
+    call frc_batch_flush()
     call fill_u(s_sustr, tneed, sustr)
     call fill_v(s_svstr, tneed, svstr)
     call fill_r(s_shflx, tneed, stflx(:,:,itemp))
@@ -461,28 +517,368 @@ contains
   end subroutine sort_catalog
 
   subroutine read_catalog_rec(s, idx, slot)
-    type(series2d), intent(inout) :: s
+    type(series2d), intent(inout), target :: s
     integer,        intent(in)    :: idx, slot
     integer :: ncid
     real(rp), allocatable :: tmp(:,:)
-#ifdef USE_CUDA
-    integer :: ierr
-#endif
     if (idx < 1 .or. idx > s%ntot) return
+    if (batching) then
+      if (npend >= MAXPEND) error stop 'read_catalog_rec: too many deferred reads (raise MAXPEND)'
+      npend = npend + 1
+      pend(npend)%s => s
+      pend(npend)%idx = idx
+      pend(npend)%slot = slot
+      return
+    endif
     ! Read into host memory, then one bulk copy into the managed buffer:
     ! netCDF writing straight into managed memory faults page by page.
     allocate(tmp(s%n1, s%n2))
-    call nc_open_read(s%paths(idx), ncid)
-    call nc_read_forcing_2d(ncid, s%vname, tmp, s%n1, s%n2, s%irec(idx), s%time_axis, s%fi0, s%fj0)
-    call nc_close(ncid)
+    if (s%ifile(idx) >= 1 .and. s%ifile(idx) <= max_frc .and. frc_mode > 0) then
+      ncid = frc_run_ncid(s%ifile(idx))
+      call nc_read_forcing_2d(ncid, s%vname, tmp, s%n1, s%n2, s%irec(idx), s%time_axis, s%fi0, s%fj0)
+    else
+      call nc_open_read(s%paths(idx), ncid)
+      call nc_read_forcing_2d(ncid, s%vname, tmp, s%n1, s%n2, s%irec(idx), s%time_axis, s%fi0, s%fj0)
+      call nc_close(ncid)
+    endif
+    call put_slot(s, slot, tmp)
+    deallocate(tmp)
+  end subroutine read_catalog_rec
+
+  subroutine put_slot(s, slot, tmp)
+    ! One bulk host-to-device copy of a record into buffer slot `slot`.
+    type(series2d), intent(inout) :: s
+    integer,        intent(in)    :: slot
+    real(rp),       intent(in)    :: tmp(s%n1, s%n2)
 #ifdef USE_CUDA
+    integer :: ierr
     ierr = cudaMemcpy(s%buf(:,:,slot), tmp, s%n1 * s%n2, cudaMemcpyHostToDevice)
     if (ierr /= 0) error stop 'read_catalog_rec: cudaMemcpy'
 #else
     s%buf(:,:,slot) = tmp
 #endif
-    deallocate(tmp)
-  end subroutine read_catalog_rec
+  end subroutine put_slot
+
+  subroutine copy_upper_to_lower(s)
+    ! The new lower bracket is the old upper one: slot 1 = slot 2 on the
+    ! device (stream-ordered before any later copy into slot 2).
+    type(series2d), intent(inout) :: s
+#ifdef USE_CUDA
+    integer :: ierr
+    ierr = cudaMemcpy(s%buf(:,:,1), s%buf(:,:,2), s%n1 * s%n2, cudaMemcpyDeviceToDevice)
+    if (ierr /= 0) error stop 'copy_upper_to_lower: cudaMemcpy'
+#else
+    s%buf(:,:,1) = s%buf(:,:,2)
+#endif
+  end subroutine copy_upper_to_lower
+
+  integer function frc_run_ncid(i) result(ncid)
+    ! Read handle for forcing file i, opened on first use and kept open.
+    integer, intent(in) :: i
+    if (run_ncid(i) < 0) call nc_open_read(case_frcfiles(i), run_ncid(i))
+    ncid = run_ncid(i)
+  end function frc_run_ncid
+
+  subroutine frc_check_mode()
+    character(len=16) :: val
+    integer :: stat
+    if (frc_mode >= 0) return
+    frc_mode = 7
+    call get_environment_variable('ROMS_GPU_FRC_BATCH', val, status=stat)
+    if (stat == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=stat) frc_mode
+      if (stat /= 0) frc_mode = 7
+    endif
+    call get_environment_variable('ROMS_GPU_FRC_TIMING', val, status=stat)
+    frc_timing = (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '1')
+    if (comm_rank() == 0) write(*,'(a,i0)') 'forcing: record-read mode (ROMS_GPU_FRC_BATCH) = ', frc_mode
+  end subroutine frc_check_mode
+
+  subroutine frc_batch_begin()
+    call frc_check_mode()
+    npend = 0
+    batching = (iand(frc_mode, 2) /= 0)
+  end subroutine frc_batch_begin
+
+  subroutine frc_batch_flush()
+    ! Collective over the compute ranks (every rank defers the same reads in
+    ! the same order: the record choice depends only on the model time).
+    ! A read whose record was prefetched takes the arrived window; each
+    ! remaining read r is read whole by rank mod(r-1, nranks) and its
+    ! windows sent to every rank; time_axis 1 files keep the window reads.
+    integer :: k, nc, me, n, nrem, r
+    integer :: rem(MAXPEND)
+    logical :: whole
+    integer(8) :: c0, c1, crate
+    type(series2d), pointer :: sp
+#ifdef USE_MPI
+    integer :: comm, ierr, t, gx, gy
+    integer, allocatable :: mine(:,:), win(:,:,:), rreq(:), sreq(:,:)
+    type(fb_t), allocatable :: rbuf(:), sbuf(:,:)
+    real(rp), allocatable :: fbuf(:,:)
+#endif
+    batching = .false.
+    if (npend == 0) return
+    call system_clock(c0, crate)
+    nc = comm_size(); me = comm_rank()
+    nrem = 0
+    do k = 1, npend
+      sp => pend(k)%s
+      if (sp%pf_idx > 0) then
+        call pf_complete(sp)
+        if (sp%pf_idx == pend(k)%idx) then
+          call put_slot(sp, pend(k)%slot, sp%pf_buf)
+          deallocate(sp%pf_buf)
+          sp%pf_idx = 0
+          cycle
+        endif
+        deallocate(sp%pf_buf)
+        sp%pf_idx = 0
+      endif
+      nrem = nrem + 1
+      rem(nrem) = k
+    enddo
+    whole = (nc > 1)
+    do r = 1, nrem
+      if (pend(rem(r))%s%time_axis == 1) whole = .false.
+    enddo
+#ifdef USE_MPI
+    if (whole .and. nrem > 0) then
+      comm = comm_compute()
+      allocate(mine(4, nrem), win(4, nrem, 0:nc - 1))
+      do r = 1, nrem
+        sp => pend(rem(r))%s
+        mine(:, r) = (/sp%n1, sp%n2, sp%fi0, sp%fj0/)
+      enddo
+      call MPI_Allgather(mine, 4 * nrem, MPI_INTEGER, win, 4 * nrem, MPI_INTEGER, comm, ierr)
+      allocate(rbuf(nrem), rreq(nrem), sbuf(0:nc - 1, nrem), sreq(0:nc - 1, nrem))
+      sreq = MPI_REQUEST_NULL
+      do r = 1, nrem
+        sp => pend(rem(r))%s
+        n = sp%n1 * sp%n2
+        allocate(rbuf(r)%b(n))
+        call MPI_Irecv(rbuf(r)%b, n, MPI_REAL8, mod(r - 1, nc), FRC_TAG0 + r, comm, rreq(r), ierr)
+      enddo
+      do r = 1, nrem
+        if (mod(r - 1, nc) /= me) cycle
+        sp => pend(rem(r))%s
+        call read_whole_record(sp, pend(rem(r))%idx, fbuf, gx, gy)
+        do t = 0, nc - 1
+          n = win(1, r, t) * win(2, r, t)
+          allocate(sbuf(t, r)%b(n))
+          call pack_frc_window(fbuf, gx, gy, win(3, r, t), win(4, r, t), win(1, r, t), win(2, r, t), sbuf(t, r)%b)
+          call MPI_Isend(sbuf(t, r)%b, n, MPI_REAL8, t, FRC_TAG0 + r, comm, sreq(t, r), ierr)
+        enddo
+        deallocate(fbuf)
+      enddo
+      call MPI_Waitall(nrem, rreq, MPI_STATUSES_IGNORE, ierr)
+      call MPI_Waitall(nc * nrem, sreq, MPI_STATUSES_IGNORE, ierr)
+      do r = 1, nrem
+        call put_slot(pend(rem(r))%s, pend(rem(r))%slot, rbuf(r)%b)
+        deallocate(rbuf(r)%b)
+        do t = 0, nc - 1
+          if (allocated(sbuf(t, r)%b)) deallocate(sbuf(t, r)%b)
+        enddo
+      enddo
+      deallocate(mine, win, rbuf, rreq, sbuf, sreq)
+    endif
+#else
+    whole = .false.
+#endif
+    if (.not. whole) then
+      do r = 1, nrem
+        call read_catalog_rec(pend(rem(r))%s, pend(rem(r))%idx, pend(rem(r))%slot)
+      enddo
+    endif
+    call system_clock(c1, crate)
+    if (frc_timing) write(*,'(a,i0,a,i0,a,i0,a,l1,a,f8.4,a)') 'forcing: rank ', me, '  records ', npend, &
+         '  prefetched ', npend - nrem, '  whole ', whole, '  ', real(c1 - c0, 8) / real(crate, 8), ' s'
+    do k = 1, npend
+      pend(k)%s => null()
+    enddo
+    npend = 0
+  end subroutine frc_batch_flush
+
+  subroutine read_whole_record(s, idx, fbuf, gx, gy)
+    ! Record idx of series s over the whole file extent (gx x gy), through
+    ! the kept-open handle; the same bytes as any window read of it.
+    type(series2d), intent(in) :: s
+    integer, intent(in) :: idx
+    real(rp), allocatable, intent(out) :: fbuf(:,:)
+    integer, intent(out) :: gx, gy
+    integer :: ncid, varid, ndims, dimids(nf90_max_var_dims)
+    ncid = frc_run_ncid(s%ifile(idx))
+    call nc_check(nf90_inq_varid(ncid, trim(s%vname), varid), 'var '//trim(s%vname))
+    call nc_check(nf90_inquire_variable(ncid, varid, ndims=ndims, dimids=dimids), 'ndims '//trim(s%vname))
+    call nc_check(nf90_inquire_dimension(ncid, dimids(1), len=gx), 'dim '//trim(s%vname))
+    gy = 1
+    if (ndims >= 2) call nc_check(nf90_inquire_dimension(ncid, dimids(2), len=gy), 'dim '//trim(s%vname))
+    allocate(fbuf(gx, gy))
+    if (ndims >= 3) then
+      call nc_check(nf90_get_var(ncid, varid, fbuf, start=(/1, 1, s%irec(idx)/), count=(/gx, gy, 1/)), &
+                    'get frc '//trim(s%vname))
+    else
+      call nc_check(nf90_get_var(ncid, varid, fbuf, start=(/1, 1/), count=(/gx, gy/)), 'get frc '//trim(s%vname))
+    endif
+  end subroutine read_whole_record
+
+  subroutine pf_complete(s)
+    ! Wait for the prefetch messages of s (receive; the owner's sends).
+    type(series2d), intent(inout) :: s
+    integer :: t
+#ifdef USE_MPI
+    integer :: ierr
+    if (comm_size() > 1) then
+      call MPI_Wait(s%pf_rreq, MPI_STATUS_IGNORE, ierr)
+      if (s%pf_own) then
+        call MPI_Waitall(size(s%pf_sreq), s%pf_sreq, MPI_STATUSES_IGNORE, ierr)
+        do t = lbound(s%pf_sbuf, 1), ubound(s%pf_sbuf, 1)
+          if (allocated(s%pf_sbuf(t)%b)) deallocate(s%pf_sbuf(t)%b)
+        enddo
+        deallocate(s%pf_sbuf, s%pf_sreq)
+      endif
+    endif
+#endif
+    s%pf_own = .false.
+  end subroutine pf_complete
+
+  subroutine pf_add(s, id, cand, n)
+    ! Candidate for read-ahead: the record after the upper bracket. id is
+    ! the series' fixed number (message tag; one prefetch per series).
+    type(series2d), intent(inout), target :: s
+    integer,        intent(in)    :: id
+    type(pend_t),   intent(inout) :: cand(:)
+    integer,        intent(inout) :: n
+    integer :: nxt
+    if (.not. s%ready .or. s%ntot < 2 .or. s%time_axis == 1 .or. s%pf_idx /= 0) return
+    if (s%cycle > 0.0_rp) then
+      nxt = mod(s%it2, s%ntot) + 1
+    else
+      nxt = s%it2 + 1
+      if (nxt > s%ntot) return
+    endif
+    if (n >= size(cand)) return
+    n = n + 1
+    cand(n)%s => s
+    cand(n)%idx = nxt
+    cand(n)%slot = id
+  end subroutine pf_add
+
+  subroutine frc_prefetch()
+    ! Collective over the compute ranks (the candidates depend only on the
+    ! model time). Candidate k (k <= nranks) is read by rank k-1.
+    type(pend_t) :: cand(32)
+    integer :: n, k, nc, me, nb
+    integer(8) :: c0, c1, crate
+    type(series2d), pointer :: sp
+    real(rp), allocatable :: fbuf(:,:)
+    integer :: gx, gy
+#ifdef USE_MPI
+    integer :: comm, ierr, t, m
+    integer, allocatable :: mine(:,:), win(:,:,:)
+#endif
+    call frc_check_mode()
+    if (iand(frc_mode, 6) /= 6) return
+    n = 0
+    call pf_add(s_uwnd, 1, cand, n)
+    call pf_add(s_vwnd, 2, cand, n)
+    call pf_add(s_tair, 3, cand, n)
+    call pf_add(s_qair, 4, cand, n)
+    call pf_add(s_prate, 5, cand, n)
+    call pf_add(s_lwrad, 6, cand, n)
+    call pf_add(s_bswrad, 7, cand, n)
+    call pf_add(s_sss, 8, cand, n)
+    call pf_add(s_sustr, 9, cand, n)
+    call pf_add(s_svstr, 10, cand, n)
+    call pf_add(s_shflx, 11, cand, n)
+    call pf_add(s_swflx, 12, cand, n)
+    call pf_add(s_swrad, 13, cand, n)
+    call pf_add(s_dust, 14, cand, n)
+    call pf_add(s_iron, 15, cand, n)
+    call pf_add(s_nox, 16, cand, n)
+    call pf_add(s_nhy, 17, cand, n)
+    call pf_add(s_xco2, 18, cand, n)
+    call pf_add(s_xco2a, 19, cand, n)
+    if (n == 0) return
+    call system_clock(c0, crate)
+    nc = comm_size(); me = comm_rank()
+    nb = min(n, int(nc))
+#ifdef USE_MPI
+    if (nc > 1) then
+      comm = comm_compute()
+      allocate(mine(4, nb), win(4, nb, 0:nc - 1))
+      do k = 1, nb
+        sp => cand(k)%s
+        mine(:, k) = (/sp%n1, sp%n2, sp%fi0, sp%fj0/)
+      enddo
+      call MPI_Allgather(mine, 4 * nb, MPI_INTEGER, win, 4 * nb, MPI_INTEGER, comm, ierr)
+      do k = 1, nb
+        sp => cand(k)%s
+        allocate(sp%pf_buf(sp%n1 * sp%n2))
+        call MPI_Irecv(sp%pf_buf, sp%n1 * sp%n2, MPI_REAL8, k - 1, FRC_PF_TAG0 + cand(k)%slot, comm, &
+                       sp%pf_rreq, ierr)
+        sp%pf_idx = cand(k)%idx
+      enddo
+      if (me < nb) then
+        k = me + 1
+        sp => cand(k)%s
+        call read_whole_record(sp, cand(k)%idx, fbuf, gx, gy)
+        allocate(sp%pf_sbuf(0:nc - 1), sp%pf_sreq(0:nc - 1))
+        do t = 0, nc - 1
+          m = win(1, k, t) * win(2, k, t)
+          if (win(3, k, t) + win(1, k, t) - 1 > gx .or. win(4, k, t) + win(2, k, t) - 1 > gy) &
+               error stop 'frc_prefetch: window outside the file extent'
+          allocate(sp%pf_sbuf(t)%b(m))
+          call pack_frc_window(fbuf, gx, gy, win(3, k, t), win(4, k, t), win(1, k, t), win(2, k, t), sp%pf_sbuf(t)%b)
+          call MPI_Isend(sp%pf_sbuf(t)%b, m, MPI_REAL8, t, FRC_PF_TAG0 + cand(k)%slot, comm, sp%pf_sreq(t), ierr)
+        enddo
+        sp%pf_own = .true.
+        deallocate(fbuf)
+      endif
+      deallocate(mine, win)
+    else
+#endif
+      do k = 1, nb
+        sp => cand(k)%s
+        call read_whole_record(sp, cand(k)%idx, fbuf, gx, gy)
+        allocate(sp%pf_buf(sp%n1 * sp%n2))
+        call pack_frc_window(fbuf, gx, gy, sp%fi0, sp%fj0, sp%n1, sp%n2, sp%pf_buf)
+        deallocate(fbuf)
+        sp%pf_idx = cand(k)%idx
+      enddo
+#ifdef USE_MPI
+    endif
+#endif
+    call system_clock(c1, crate)
+    if (frc_timing) write(*,'(a,i0,a,i0,a,f8.4,a)') 'forcing: rank ', me, '  prefetch ', nb, &
+         ' records  ', real(c1 - c0, 8) / real(crate, 8), ' s'
+  end subroutine frc_prefetch
+
+  subroutine frc_prefetch_drain()
+    ! End of run: complete and drop every prefetch in flight.
+    call pf_drain(s_uwnd);  call pf_drain(s_vwnd);  call pf_drain(s_tair)
+    call pf_drain(s_qair);  call pf_drain(s_prate); call pf_drain(s_lwrad)
+    call pf_drain(s_bswrad); call pf_drain(s_sss);  call pf_drain(s_sustr)
+    call pf_drain(s_svstr); call pf_drain(s_shflx); call pf_drain(s_swflx)
+    call pf_drain(s_swrad); call pf_drain(s_dust);  call pf_drain(s_iron)
+    call pf_drain(s_nox);   call pf_drain(s_nhy);   call pf_drain(s_xco2)
+    call pf_drain(s_xco2a)
+  end subroutine frc_prefetch_drain
+
+  subroutine pf_drain(s)
+    type(series2d), intent(inout) :: s
+    if (s%pf_idx == 0) return
+    call pf_complete(s)
+    if (allocated(s%pf_buf)) deallocate(s%pf_buf)
+    s%pf_idx = 0
+  end subroutine pf_drain
+
+  subroutine pack_frc_window(fbuf, gx, gy, i0f, j0f, n1, n2, out)
+    integer,  intent(in)  :: gx, gy, i0f, j0f, n1, n2
+    real(rp), intent(in)  :: fbuf(gx, gy)
+    real(rp), intent(out) :: out(n1, n2)
+    out = fbuf(i0f:i0f + n1 - 1, j0f:j0f + n2 - 1)
+  end subroutine pack_frc_window
 
   ! Climatology bracket, as the CPU model (find_new_record_cycle): the
   ! record times are shifted by whole cycles so that the first shifted time
@@ -517,15 +913,21 @@ contains
   end subroutine cyc_bracket
 
   subroutine advance_series(s, tneed)
-    type(series2d), intent(inout) :: s
+    type(series2d), intent(inout), target :: s
     real(rp),       intent(in)    :: tneed
     integer :: rec, i, old1, old2, i1, i2
     if (.not. s%ready .or. s%ntot < 2) return
+    call frc_check_mode()
     if (s%cycle > 0.0_rp) then
       call cyc_bracket(s%times, s%ntot, s%cycle, tneed, i1, i2, s%t1e, s%t2e)
       if (i1 /= s%it1) then
+        old2 = s%it2
         s%it1 = i1
-        call read_catalog_rec(s, i1, 1)
+        if (i1 == old2 .and. iand(frc_mode, 1) /= 0) then
+          call copy_upper_to_lower(s)
+        else
+          call read_catalog_rec(s, i1, 1)
+        endif
       endif
       if (i2 /= s%it2) then
         s%it2 = i2
@@ -547,7 +949,13 @@ contains
     old1 = s%it1; old2 = s%it2
     s%it1 = rec
     s%it2 = rec + 1
-    if (s%it1 /= old1) call read_catalog_rec(s, s%it1, 1)
+    if (s%it1 /= old1) then
+      if (s%it1 == old2 .and. iand(frc_mode, 1) /= 0) then
+        call copy_upper_to_lower(s)
+      else
+        call read_catalog_rec(s, s%it1, 1)
+      endif
+    endif
     if (s%it2 /= old2) call read_catalog_rec(s, s%it2, 2)
   end subroutine advance_series
 
@@ -576,7 +984,7 @@ contains
   end subroutine weights
 
   subroutine fill_r(s, tneed, dest)
-    type(series2d), intent(inout) :: s
+    type(series2d), intent(inout), target :: s
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp) :: c1, c2
@@ -597,7 +1005,7 @@ contains
   end subroutine fill_r
 
   subroutine fill_u(s, tneed, dest)
-    type(series2d), intent(inout) :: s
+    type(series2d), intent(inout), target :: s
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp) :: c1, c2
@@ -618,7 +1026,7 @@ contains
   end subroutine fill_u
 
   subroutine fill_v(s, tneed, dest)
-    type(series2d), intent(inout) :: s
+    type(series2d), intent(inout), target :: s
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp) :: c1, c2
@@ -707,6 +1115,14 @@ contains
     real(rp), WORK_ATTR intent(inout) :: xco2(decomp%is:decomp%ie, decomp%js:decomp%je)
     real(rp), WORK_ATTR intent(inout) :: xco2a(decomp%is:decomp%ie, decomp%js:decomp%je)
     if (.not. bgc_frc_on) return
+    call frc_batch_begin()
+    call advance_series(s_dust, tneed)
+    call advance_series(s_iron, tneed)
+    call advance_series(s_nox, tneed)
+    call advance_series(s_nhy, tneed)
+    call advance_series(s_xco2, tneed)
+    call advance_series(s_xco2a, tneed)
+    call frc_batch_flush()
     if (s_dust%ready) call fill_r(s_dust, tneed, dust)
     if (s_iron%ready) then
       call fill_r(s_iron, tneed, iron)

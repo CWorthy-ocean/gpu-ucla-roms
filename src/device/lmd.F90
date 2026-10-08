@@ -72,31 +72,15 @@ contains
   subroutine lmd_vmix(tind)
     integer(ip), intent(in) :: tind
 
+    ! Only the surface forcing needs its halo here (2026-10-08 audit): u, v
+    ! (tind and nstp), T(nstp), the geometry, bvf, f, hbls and hbbl are
+    ! current (exchanged after their last write, or static).
     call hg_begin()
-    call hg_add(F_U, tind)
-    call hg_add(F_V, tind)
-    call hg_end()
-    if (tind /= nstp) then
-      call hg_begin()
-      call hg_add(F_U, nstp)
-      call hg_add(F_V, nstp)
-      call hg_end()
-    endif
-    call hg_begin()
-    call hg_add(F_T, nstp, itemp)
-    if (size(t, 5) >= isalt) call hg_add(F_T, nstp, isalt)
-    call hg_add(F_ZR)
-    call hg_add(F_ZW)
-    call hg_add(F_HZ)
-    call hg_add(F_BVF)
     call hg_add(F_SUSTR)
     call hg_add(F_SVSTR)
     call hg_add(F_STFLX, itr=itemp)
     if (size(stflx, 3) >= isalt) call hg_add(F_STFLX, itr=isalt)
     call hg_add(F_SRFLX)
-    call hg_add(F_F)
-    call hg_add(F_HBLS)
-    call hg_add(F_HBBL)
     call hg_end()
 
     call ensure_scratch()

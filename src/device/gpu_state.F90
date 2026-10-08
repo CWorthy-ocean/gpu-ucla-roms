@@ -184,6 +184,23 @@ module gpu_state
 #endif
   public :: build_tp_columns
 
+  ! Lateral-mixing skip (2026-10-08). Harmonic viscosity / diffusion is zero
+  ! where visc2_r, visc2_p and diff2 are zero (on Pac everywhere but the
+  ! sponge band): the update of a cell is then +-0 exactly. mixact(i, j) = 1
+  ! where a nonzero coefficient lies within 2 cells (the consumers: t3dmix,
+  ! the visc3d u/v updates), mixact3 within 3 cells (the visc3d stress
+  ! kernels, whose scratch output the consumers read one cell away);
+  ! neighbourhoods leaving the arrays count as active. mix_lim = 1 when some
+  ! interior cell is inactive. mixc(1:nmix) = wet-list indices of the active
+  ! wet cells (passive t3dmix). ROMS_GPU_SKIP_MIX=0 turns the skip off.
+  integer(ip), public :: nmix = 0, mix_lim = 0
+#ifdef USE_CUDA
+  integer(ip), device, allocatable, public :: mixact(:,:), mixact3(:,:), mixc(:)
+#else
+  integer(ip), allocatable, public :: mixact(:,:), mixact3(:,:), mixc(:)
+#endif
+  public :: build_mix_map
+
 
 contains
 
@@ -320,6 +337,79 @@ contains
     tpnb = nb
     deallocate(nb)
   end subroutine build_tp_columns
+
+  subroutine build_mix_map()
+    ! Called after the mixing coefficients are final (apply_sponge). Host loops.
+    integer(ip) :: i, j, ii, jj, is, ie, js, je, nx, ny, n, c, r
+    integer(ip), allocatable :: src(:,:), a2(:,:), a3(:,:), lst(:)
+    character(len=16) :: val
+    integer :: stat
+    logical :: off
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    nx = decomp%nx; ny = decomp%ny
+    call get_environment_variable('ROMS_GPU_SKIP_MIX', val, status=stat)
+    off = (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '0')
+    allocate(src(is:ie, js:je), a2(is:ie, js:je), a3(is:ie, js:je))
+    src = 0
+    do j = js, je
+      do i = is, ie
+        if (visc2_r(i, j) /= 0.0_rp .or. visc2_p(i, j) /= 0.0_rp) src(i, j) = 1
+        if (any(diff2(i, j, :) /= 0.0_rp)) src(i, j) = 1
+      enddo
+    enddo
+    do r = 2, 3
+      do j = js, je
+        do i = is, ie
+          n = 0
+          if (i - r < is .or. i + r > ie .or. j - r < js .or. j + r > je) then
+            n = 1
+          else
+            do jj = j - r, j + r
+              do ii = i - r, i + r
+                if (src(ii, jj) /= 0) n = 1
+              enddo
+            enddo
+          endif
+          if (off) n = 1
+          if (r == 2) then
+            a2(i, j) = n
+          else
+            a3(i, j) = n
+          endif
+        enddo
+      enddo
+    enddo
+    mix_lim = 0
+    do j = 1, ny
+      do i = 1, nx
+        if (a2(i, j) == 0) mix_lim = 1
+      enddo
+    enddo
+    allocate(lst(max(nwet, 1)))
+    n = 0; c = 0
+    do j = 1, ny
+      do i = 1, nx
+        if (rmask(i, j) > 0.5_rp) then
+          c = c + 1
+          if (a2(i, j) /= 0) then
+            n = n + 1; lst(n) = c
+          endif
+        endif
+      enddo
+    enddo
+    nmix = n
+    if (allocated(mixact)) deallocate(mixact, mixact3)
+    allocate(mixact(is:ie, js:je), mixact3(is:ie, js:je))
+    mixact = a2; mixact3 = a3
+    if (allocated(mixc)) deallocate(mixc)
+    allocate(mixc(max(n, 1)))
+    if (n > 0) then
+      mixc(1:n) = lst(1:n)
+    else
+      mixc = 1
+    endif
+    deallocate(src, a2, a3, lst)
+  end subroutine build_mix_map
 
   subroutine dry_skip_update(step_index)
     ! Called at the start of every baroclinic step with iic - ntstart.

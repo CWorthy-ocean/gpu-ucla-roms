@@ -54,6 +54,21 @@ module halo_mod
   ! can pack/unpack up to HG_PER_LAUNCH fields with the same level range
   integer, parameter :: HG_PER_LAUNCH = 4
   type(c_devptr) :: hg_ptr(HG_MAX)
+  ! ROMS_GPU_HG_AUDIT=1 (debug): every group exchange snapshots its fields
+  ! and counts the halo values the exchange changed; per position of the
+  ! exchange within the step (aud_seq) and field, the number of calls and
+  ! of calls that changed something is printed at the end of the run.
+  integer, parameter :: AUD_MAX = 200
+  logical :: hg_audit_on = .false., hg_audit_checked = .false.
+  integer :: aud_seq = 0, aud_nseq = 0
+  integer :: aud_nf(AUD_MAX) = 0, aud_ids(HG_MAX, AUD_MAX) = 0, aud_slots(HG_MAX, AUD_MAX) = 0
+  integer :: aud_calls(AUD_MAX) = 0, aud_chg(HG_MAX, AUD_MAX) = 0
+  integer(kind=8) :: aud_nval(HG_MAX, AUD_MAX) = 0
+#ifdef USE_CUDA
+  real(rp), device, allocatable :: aud_buf(:)
+#else
+  real(rp), allocatable :: aud_buf(:)
+#endif
   integer(ip) :: hg_kb(HG_MAX), hg_ke(HG_MAX)
 #endif
 #ifdef USE_CUDA
@@ -96,6 +111,7 @@ module halo_mod
   public :: halo_fill_uv_n
   public :: halo_fill_zuv_n
   public :: hg_begin, hg_add, hg_end
+  public :: hg_audit_step, hg_audit_report
   ! Field ids for the group exchange (hg_*): several fields in one
   ! east-west and one north-south round. All fields use the rho-cell
   ! exchange bounds (see interior_bounds), so staggers may be mixed.
@@ -427,6 +443,13 @@ contains
     do k = 1, hg_n
       call hg_resolve(int(k))
     enddo
+    if (.not. hg_audit_checked) then
+      hg_audit_checked = .true.
+      call get_environment_variable('ROMS_GPU_HG_AUDIT', hg_val, status=hg_stat)
+      hg_audit_on = (hg_stat == 0 .and. len_trim(hg_val) > 0 .and. hg_val(1:1) == '1')
+      if (hg_audit_on) write(*,'(a)') 'halo: group-exchange audit on (ROMS_GPU_HG_AUDIT)'
+    endif
+    if (hg_audit_on) call hg_audit_before()
     if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
       call hg_run_phase(1, i1, i2, j1, j2)
       call deliver3(decomp%nbr_w, decomp%nbr_e, gew_slo(:, :, 1:L), gew_shi(:, :, 1:L), &
@@ -439,6 +462,7 @@ contains
                     gns_rlo(:, :, 1:L), gns_rhi(:, :, 1:L))
       call hg_run_phase(4, i1, i2, j1, j2)
     endif
+    if (hg_audit_on) call hg_audit_after(i1, i2, j1, j2)
 #else
     if (decomp%nbr_w /= NBR_NONE .or. decomp%nbr_e /= NBR_NONE) then
       do k = 1, hg_n
@@ -465,6 +489,91 @@ contains
   end subroutine hg_end
 
 #ifdef USE_CUDA
+  subroutine hg_audit_step()
+    ! Start of a baroclinic step: exchange positions count from 1 again.
+    aud_seq = 0
+  end subroutine hg_audit_step
+
+  subroutine hg_audit_before()
+#ifdef USE_CUDA
+    integer :: k
+    integer(ip) :: ni, nj, nel, off, tot, n
+    real(rp), device, pointer, contiguous :: p(:)
+    ni = decomp%ie - decomp%is + 1; nj = decomp%je - decomp%js + 1
+    tot = 0
+    do k = 1, hg_n
+      tot = tot + ni * nj * (hg_ke(k) - hg_kb(k) + 1)
+    enddo
+    if (allocated(aud_buf)) then
+      if (size(aud_buf) < tot) deallocate(aud_buf)
+    endif
+    if (.not. allocated(aud_buf)) allocate(aud_buf(tot))
+    off = 0
+    do k = 1, hg_n
+      nel = ni * nj * (hg_ke(k) - hg_kb(k) + 1)
+      call c_f_pointer(hg_ptr(k), p, (/nel/))
+      !$cuf kernel do(1) <<<*,*,0,work_stream>>>
+      do n = 1, nel
+        aud_buf(off + n) = p(n)
+      enddo
+      off = off + nel
+    enddo
+#endif
+  end subroutine hg_audit_before
+
+  subroutine hg_audit_after(i1, i2, j1, j2)
+#ifdef USE_CUDA
+    integer(ip), intent(in) :: i1, i2, j1, j2
+    integer :: k, q
+    integer(ip) :: ni, nj, nel, off, n, ii, jj, nchg, nhal, is, js
+    real(rp), device, pointer, contiguous :: p(:)
+    ni = decomp%ie - decomp%is + 1; nj = decomp%je - decomp%js + 1
+    is = decomp%is; js = decomp%js
+    aud_seq = aud_seq + 1
+    q = min(aud_seq, AUD_MAX)
+    aud_nseq = max(aud_nseq, q)
+    if (aud_calls(q) == 0) then
+      aud_nf(q) = hg_n
+      aud_ids(1:hg_n, q) = hg_id(1:hg_n)
+      aud_slots(1:hg_n, q) = hg_slot(1:hg_n)
+    endif
+    aud_calls(q) = aud_calls(q) + 1
+    off = 0
+    do k = 1, hg_n
+      nel = ni * nj * (hg_ke(k) - hg_kb(k) + 1)
+      call c_f_pointer(hg_ptr(k), p, (/nel/))
+      nchg = 0; nhal = 0
+      !$cuf kernel do(1) <<<*,*,0,work_stream>>>
+      do n = 1, nel
+        ii = mod(n - 1, ni) + is
+        jj = mod((n - 1) / ni, nj) + js
+        if (ii < i1 .or. ii > i2 .or. jj < j1 .or. jj > j2) then
+          nhal = nhal + 1
+          if (p(n) /= aud_buf(off + n)) nchg = nchg + 1
+        endif
+      enddo
+      if (nchg > 0) aud_chg(k, q) = aud_chg(k, q) + 1
+      aud_nval(k, q) = aud_nval(k, q) + nchg
+      off = off + nel
+    enddo
+#endif
+  end subroutine hg_audit_after
+
+  subroutine hg_audit_report()
+    integer :: q, k
+    character(len=600) :: line
+    if (.not. hg_audit_on) return
+    do q = 1, aud_nseq
+      line = ''
+      do k = 1, aud_nf(q)
+        write(line(len_trim(line) + 2:), '(i0,a,i0,a,i0,a)') aud_ids(k, q), '/', aud_slots(k, q), ':', aud_chg(k, q), ''
+      enddo
+      write(*,'(a,i0,a,i3,a,i5,a,a)') 'hg audit rank ', comm_rank(), ' seq ', q, ' calls ', aud_calls(q), &
+           '  id/slot:changed', trim(line)
+    enddo
+    flush(6)
+  end subroutine hg_audit_report
+
   subroutine hg_resolve(k)
     ! Device address + level range of field k (same table as hg_dispatch).
     integer, intent(in) :: k

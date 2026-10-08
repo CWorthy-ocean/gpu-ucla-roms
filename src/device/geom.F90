@@ -38,12 +38,11 @@ module geom
 contains
 
   subroutine set_depth()
+    ! z_w, z_r, Hz are formed over the whole array (halo included) from
+    ! zeta(knew), whose halo is current at every call (step start, last fast
+    ! step, load), so they equal the neighbour's values: no exchange (the
+    ! 2026-10-08 audit found it never changed a halo value).
     call set_depth_interior()
-    call hg_begin()
-    call hg_add(F_ZW)
-    call hg_add(F_ZR)
-    call hg_add(F_HZ)
-    call hg_end()
   end subroutine set_depth
 
   subroutine set_depth_interior()

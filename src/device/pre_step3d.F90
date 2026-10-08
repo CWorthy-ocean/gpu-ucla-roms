@@ -51,15 +51,8 @@ contains
     call dump_pre_col('pre in', 1, indx)
     if (nz > COL_KMAX) error stop 'pre_step3d: nz exceeds COL_KMAX'
 
-    call hg_begin()
-    call hg_add(F_HZ)
-    call hg_add(F_U, nrhs)
-    call hg_add(F_V, nrhs)
-    call hg_add(F_FLXU)
-    call hg_add(F_FLXV)
-    call hg_add(F_WE)
-    call hg_add(F_WI)
-    call hg_end()
+    ! Hz, u/v(nrhs), FlxU/FlxV, We/Wi are current here (exchanged after
+    ! their last write): no exchange (2026-10-08 audit).
     call set_bottom_drag()
     lim = dry_lim(G_TRC)
     limm = dry_lim(G_MOM)
@@ -325,10 +318,7 @@ contains
     zob_loc = zob
     rdrg_loc = rdrg
     dt_loc = dt
-    call hg_begin()
-    call hg_add(F_U, nstp)
-    call hg_add(F_V, nstp)
-    call hg_end()
+    ! u, v(nstp) are current (step3d_uv2's exchange): no exchange.
 
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>

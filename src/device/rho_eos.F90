@@ -9,14 +9,25 @@ module rho_eos_mod
   use formulas
   use halo_mod
   use arch_mod, only: sync_arch
+  use time_state, only: is_first_run_step
   implicit none
   private
   public :: rho_eos
 
 contains
 
-  subroutine rho_eos(tidx)
+  subroutine rho_eos(tidx, stage)
+    ! stage (optional): 1 predictor rho_eos(nrhs), 2 corrector rho_eos(nrhs),
+    ! 3 end of step rho_eos(nnew). The exchanges are cut to what changes a
+    ! halo (2026-10-08 audit): T, Hz, z_r, z_w are current before stages 1
+    ! and 2 (T(nstp) from the stage-3 exchange of the previous step, T(3)
+    ! from pre_step3d, the geometry from set_depth); the stage-1 results
+    ! equal the halo the previous stage 3 left (same T). The first step of a
+    ! run exchanges T and the results at stage 1 too. Without stage,
+    ! everything is exchanged as before.
     integer(ip), intent(in) :: tidx
+    integer, intent(in), optional :: stage
+    integer :: st
     integer(ip) :: i, j, k, nx, ny, nz, tid
     integer(ip) :: i0, i1, j0, j1, lim
     real(rp) :: Tt, Ts, r1, q1, dpth, cff, cff1, cffg, rm
@@ -41,13 +52,19 @@ contains
     if (edge_s) j0 = 0
     if (edge_n) j1 = ny + 1
 
-    call hg_begin()
-    call hg_add(F_T, tid, itemp)
-    if (has_salt) call hg_add(F_T, tid, isalt)
-    call hg_add(F_HZ)
-    call hg_add(F_ZR)
-    call hg_add(F_ZW)
-    call hg_end()
+    st = 0
+    if (present(stage)) st = stage
+    if (st == 0 .or. st == 3 .or. (st == 1 .and. is_first_run_step())) then
+      call hg_begin()
+      call hg_add(F_T, tid, itemp)
+      if (has_salt) call hg_add(F_T, tid, isalt)
+      if (st == 0) then
+        call hg_add(F_HZ)
+        call hg_add(F_ZR)
+        call hg_add(F_ZW)
+      endif
+      call hg_end()
+    endif
     ! (The kernel runs on the legacy default stream, which orders it after
     ! the exchange's work_stream kernels; no host sync needed.)
     lim = dry_lim(G_EOS)
@@ -121,14 +138,16 @@ contains
 
     call dump_eos(tid)
 
-    call hg_begin()
-    call hg_add(F_RHO1)
-    call hg_add(F_QP1)
-    call hg_add(F_RHO)
-    call hg_add(F_BVF)
-    call hg_add(F_RHOA)
-    call hg_add(F_RHOS)
-    call hg_end()
+    if (st /= 1 .or. is_first_run_step()) then
+      call hg_begin()
+      call hg_add(F_RHO1)
+      call hg_add(F_QP1)
+      call hg_add(F_RHO)
+      call hg_add(F_BVF)
+      call hg_add(F_RHOA)
+      call hg_add(F_RHOS)
+      call hg_end()
+    endif
   end subroutine rho_eos
 
   subroutine dump_eos(tind)

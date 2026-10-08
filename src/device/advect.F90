@@ -559,10 +559,15 @@ contains
   end function v_face
 
   subroutine tracer_halos(tidx, horiz, vert)
-    ! The halo fills horiz_*_fluxes / vert_fluxes do, for every tracer.
+    ! The halo fills horiz_*_fluxes / vert_fluxes do, for every tracer, cut
+    ! to the first step of a run (2026-10-08 audit): the masks are static,
+    ! FlxU/FlxV (set_HUV, set_HUV1, step3d_uv2), Hz (set_depth over the
+    ! whole array), We (omega) and t(tidx) (pre_step3d's and rho_eos(nnew)'s
+    ! exchanges) are current at every call after it.
     integer(ip), intent(in) :: tidx
     logical, intent(in) :: horiz, vert
     integer(ip) :: itrc
+    if (.not. is_first_run_step()) return
     if (horiz) then
       call hg_begin()
       call hg_add(F_UMASK)

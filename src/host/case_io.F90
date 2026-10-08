@@ -564,6 +564,8 @@ contains
     diff2(:, :, 1) = 0.0_rp
     if (size(diff2, 3) >= 2) diff2(:, :, 2) = 0.0_rp
     call apply_sponge()
+    call build_mix_map()
+    write(*,'(a,i0,a,i0,a,i0)') 'mixing skip: rank ', comm_rank(), '  active wet cells ', nmix, ' of ', nwet
 
     call nc_open_read(case_inifile, ncid)
     write(*,'(a,a)') 'init file: ', trim(case_inifile)

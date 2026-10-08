@@ -53,13 +53,8 @@ contains
     edge_s = decomp%edge_s
     edge_n = decomp%edge_n
 
-    call hg_begin()
-    call hg_add(F_ZR)
-    call hg_add(F_ZW)
-    call hg_add(F_HZ)
-    call hg_add(F_RHO1)
-    call hg_add(F_QP1)
-    call hg_end()
+    ! z_r, z_w, Hz, rho1, qp1 are current here (set_depth over the whole
+    ! array, rho_eos's exchange): no exchange (2026-10-08 audit).
     call ensure_scratch()
     ! Deep land: ru/rv there are unmasked but every consumer masks them
     ! (rufrc, DU_avg*, u, v are zero on all land faces), so the columns

@@ -93,6 +93,7 @@ module time_state
   public :: begin_predictor_indices
   public :: begin_corrector_indices
   public :: is_first_time_step
+  public :: is_first_run_step
   public :: update_clock
   public :: frc_modtime
 
@@ -258,6 +259,13 @@ contains
   logical function is_first_time_step()
     is_first_time_step = (iic == forw_start)
   end function is_first_time_step
+
+  logical function is_first_run_step()
+    ! The first baroclinic step of this run (fresh start or restart). Some
+    ! halo exchanges are only needed there: afterwards the halos they fill
+    ! are already current (2026-10-08 exchange audit).
+    is_first_run_step = (iic <= ntstart)
+  end function is_first_run_step
 
   subroutine update_clock()
     time = start_time + dt * real(iic - ntstart, rp)

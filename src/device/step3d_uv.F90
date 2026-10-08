@@ -48,14 +48,11 @@ contains
     i_u1 = nx
     j_v0 = 1
     if (decomp%edge_s) j_v0 = 2
+    ! u, v(nrhs), Hz, Wi, We are current (pre_step3d, set_depth, omega);
+    ! only u, v(nnew) need their halo here (2026-10-08 audit).
     call hg_begin()
-    call hg_add(F_U, nrhs)
-    call hg_add(F_V, nrhs)
     call hg_add(F_U, nnew)
     call hg_add(F_V, nnew)
-    call hg_add(F_HZ)
-    call hg_add(F_WI)
-    call hg_add(F_WE)
     call hg_end()
 
     call dump_ru_probe('after prsgrd', .false.)

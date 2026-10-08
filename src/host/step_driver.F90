@@ -21,7 +21,7 @@ module step_driver
   use t3dmix_mod, only: t3dmix
   use passive_mod, only: ntp, passive_t3dmix, passive_exchange_mid
   use lmd_mod, only: lmd_vmix
-  use frc_io, only: set_forces
+  use frc_io, only: set_forces, frc_prefetch
   use bry_io, only: set_bry_all, dump_bry_north
   use tide_io, only: set_tides
   use arch_mod, only: sync_arch
@@ -64,6 +64,7 @@ contains
 
     if (iic < ntstart) iic = ntstart
     call dry_skip_update(iic - ntstart)
+    call hg_audit_step()
     call update_clock()
     call set_probe_windows()
     probe_on = (iic - ntstart < probe_steps)
@@ -93,7 +94,7 @@ contains
     call step_mark('set_depth')
     call dump_pgf_col('after set_depth')
     call dump_rim('after set_depth')
-    call rho_eos(nrhs)
+    call rho_eos(nrhs, 1)
     call step_mark('rho_eos')
     call dump_pgf_col('after rho_eos')
     call set_HUV()
@@ -130,7 +131,7 @@ contains
     call omega()
     call dump_we_b('after corr omega')
     call dump_swflx_b('after corr omega')
-    call rho_eos(nrhs)
+    call rho_eos(nrhs, 2)
     frc_slot = 1
     call set_forces()
     call dump_swflx_b('after corr set_forces')
@@ -181,6 +182,10 @@ contains
     call dump_we_b('after uv2 omega')
     call dump_swflx_b('after uv2 omega')
     call step3d_t()
+    ! Read the next forcing records ahead while the passive corrector
+    ! kernels queued by step3d_t run on the device (before marbl_gpu_step,
+    ! which drains the device on some calls for its solver report).
+    call frc_prefetch()
     call marbl_gpu_step()
     call dump_max_t('after step3d_t')
     call dump_col_probe('after step3d_t', nnew)
@@ -188,7 +193,7 @@ contains
     call t3dmix()
     if (ntp > 0) call passive_t3dmix()
     call dump_col_probe('after t3dmix', nnew)
-    call rho_eos(nnew)
+    call rho_eos(nnew, 3)
     call step_mark('step3d_t')
     ! Step diagnostics are device reductions, every ninfo steps.
     info_step = (mod(iic - ntstart, ninfo_steps) == 0)

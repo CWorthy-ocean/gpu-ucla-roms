@@ -458,11 +458,11 @@ contains
                      west, east, south, north, tp_, nbt_, ncl, nwet, Hz_, Hzb_, pm_, pn_, FlxU_, FlxV_, umask_, vmask_, rmask_)
   end subroutine horiz_kernel
 
-  attributes(global) subroutine t3dmix_kernel(nel, nwet, wet_i, wet_j, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, nslot, nd, &
+  attributes(global) subroutine t3dmix_kernel(nel, nwet, nmx, mixc_, wet_i, wet_j, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, nslot, nd, &
                                               tp_, nbt_, ncl, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
     integer(ip), value :: nel, nr, nn, isl, ntr, nx, ny, nz, is, ie, js, je, nslot, nd
-    integer(ip), value :: nwet
-    integer(ip), device, intent(in) :: wet_i(*), wet_j(*)
+    integer(ip), value :: nwet, nmx
+    integer(ip), device, intent(in) :: wet_i(*), wet_j(*), mixc_(*)
     integer(ip) :: cc
     real(rp), value :: dtl
     integer(ip), value :: ncl
@@ -475,7 +475,7 @@ contains
     tid = (blockIdx%x - 1) * blockDim%x + threadIdx%x
     if (tid > nel) return
     itr = mod(tid - 1, ntr) + 1; c = (tid - 1) / ntr
-    cc = mod(c, nwet) + 1; k = c / nwet + 1
+    cc = mixc_(mod(c, nmx) + 1); k = c / nmx + 1
     i = wet_i(cc); j = wet_j(cc)
     call t3dmix_point(itr, cc, i, j, k, nr, nn, dtl, isl, ntr, nx, is, ie, js, je, nz, nslot, nd, &
                       tp_, nbt_, ncl, nwet, Hz_, pm_, pn_, pmon_u_, pnom_v_, umask_, vmask_, diff2_)
@@ -544,9 +544,12 @@ contains
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     nd = int(size(diff2, 3), ip); isl = min(2_ip, nd)
-    nel = ntr * nwet * nz
+    ! only the wet cells with a nonzero diffusivity within 2 cells (mixc):
+    ! elsewhere the update is +-0 (gpu_state build_mix_map)
+    nel = ntr * nmix * nz
+    if (nel <= 0) return
 #ifdef USE_CUDA
-    call t3dmix_kernel<<<(nel + 127) / 128, 128>>>(nel, nwet, wet_i, wet_j, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, 3_ip, nd, &
+    call t3dmix_kernel<<<(nel + 127) / 128, 128>>>(nel, nwet, nmix, mixc, wet_i, wet_j, nr, nn, dtl, isl, ntr, nx, ny, nz, is, ie, js, je, 3_ip, nd, &
          tp, tpnb, ntpcol, Hz, pm, pn, pmon_u, pnom_v, umask, vmask, diff2)
 #else
     do k = 1, nz; do j = 1, ny; do i = 1, nx; do itr = 1, ntr

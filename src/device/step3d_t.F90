@@ -30,10 +30,7 @@ contains
     n_new = nnew
     dt_loc = dt
     if (nz > COL_KMAX) error stop 'step3d_t: nz exceeds COL_KMAX'
-    call hg_begin()
-    call hg_add(F_HZ)
-    call hg_add(F_WI)
-    call hg_end()
+    ! Hz (set_depth) and Wi (omega) are current: no exchange.
 
     ! Advection of all tracers in one launch when it is safe (see
     ! fuse_tracers); forcing, the implicit solve and the OBC stay per tracer.

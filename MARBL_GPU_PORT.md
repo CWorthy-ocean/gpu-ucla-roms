@@ -826,6 +826,145 @@ array while keeping the 3-D exchanges at width 2. Remaining fast-loop idle
 is ~32 ms per step, of which perhaps 10-15 ms is the exchange rounds this
 would halve (~2-3%).
 
+## Mixing skip, exchange audit, and where a Pac step goes (2026-10-08)
+
+Lateral mixing only near nonzero coefficients: Pac has visc2 = 0 and
+diff2 nonzero only in the sponge band. `build_mix_map` (gpu_state) marks
+the cells within 2 (`mixact`) and 3 (`mixact3`, visc3d stress points) of
+a nonzero visc2_r/visc2_p/diff2. A neighbourhood that leaves the array
+counts as active. `mixc` lists the active wet columns for the passive
+t3dmix launch. t3dmix and visc3d test the mask after the dry test.
+`ROMS_GPU_SKIP_MIX=0` turns the skip off. Active wet cells per Pac strip:
+0-12%. Pac 3-day mean step 0.404 -> 0.381 s, bit-identical.
+
+Exchange audit: `ROMS_GPU_HG_AUDIT=1` makes `hg_end` copy every field's
+slab before the exchange and count the halo values the exchange changed,
+keyed by the exchange's position in the step (`hg audit rank R seq S`
+lines at the end). Positions differ on the first run step, so read the
+table from the second step on. Over MiniPac 2x2/4x2 3-day and Pac
+4x2/strips 24-step runs, 16 group exchanges per step never changed a
+value, 2 changed only on the first step, and 3 groups carried
+never-changing fields. Each removal below also has a reason in a comment
+at the call site:
+
+- set_depth: z_w, z_r, Hz are formed over the whole array from zeta(knew),
+  whose halo is current at every call: no exchange.
+- rho_eos(tidx, stage): stage 1 (predictor), 2 (corrector), 3 (end of
+  step). T is exchanged only at stage 3, plus stage 1 on the first run
+  step. The geometry is never exchanged here. The results (rho1, qp1,
+  rho, bvf, rhoA, rhoS) are not exchanged at stage 1 except on the first
+  run step (`is_first_run_step`), because they equal the halo stage 3 of
+  the previous step left.
+- lmd_vmix: only the surface forcing (sustr, svstr, stflx t/s, srflx).
+- Removed outright: the opening exchanges of prsgrd, pre_step3d,
+  set_bottom_drag, visc3d and step3d_t.
+- step3d_uv1: only u, v(nnew).
+- tracer_halos: first run step only.
+
+Pac 3-day mean step 0.381 -> 0.348 s, walltime 4:57 -> 4:40 (both items).
+Bit-identical: MiniPac 1x1/2x2 4-step, 2x2/4x2 3-day; Pac 4x2 4-step;
+strips 3-day history and restart.
+
+Where the time goes now. Do not read idle time from an all-rank nsys
+profile. It showed ~80 ms of idle per step, including 20 ms gaps at the
+same wall time on all 8 ranks at random fast substeps: profiler stalls on
+one rank, spread by the exchange chain. Without nsys the step times
+repeat with a 4-step (hourly) cycle:
+
+| step in the cycle | time (s) | extra |
+|---|---|---|
+| 1, 2 | 0.270 | - |
+| 3 (MARBL call) | 0.360 | MARBL interior 73 ms + carbonate 11 ms of GPU |
+| 4 (forcing read) | 0.433 | ~150 ms in the corrector's set_forces (host) |
+
+Clean steps take 0.267-0.272 s against 0.248-0.261 s of GPU busy on the
+slowest rank. So overlapping the 3-D exchanges and a wide fast-loop halo
+can recover at most ~10 ms per step together. The wide halo would need
+halo 3 (not 4) plus two time levels exchanged every second substep,
+because AB3 reads the level formed by the unexchanged substep. It would
+also need the OBC and volume sources applied in the seam halos at
+physical edges. The phase table comes from `ROMS_GPU_STEP_MARKS=1`
+(lines come in groups of 8, one per rank).
+
+The forcing read (`read_catalog_rec`) opens the file, reads one record
+of the tile window, closes, and copies to the device. When a series
+advances by one record it rereads both brackets (`advance_series`),
+although the new lower bracket is the old upper one.
+
+A GPU-aware MPI benchmark (8 ranks on 2 nodes, chain exchange of device
+buffers):
+
+| setting | 52 MB message |
+|---|---|
+| default (CUDA IPC) | 3-4 ms (13-18 GB/s per direction, inter-node included) |
+| MPICH_GPU_IPC_ENABLED=0 | 36 ms |
+| MPICH_ASYNC_PROGRESS=1 | 2x slower |
+
+The all-tracer exchange (~50 MB per side on the strips) costs ~4 ms of
+transfer.
+
+## Forcing reads while stepping (2026-10-08)
+
+The hourly surface forcing cost ~150 ms per Pac hour (every 4th step,
+inside the corrector's set_forces).
+
+- The Pac files are CDF5 classic: 33 GB per month, 7 float32 record
+  variables of 962x1858 (7 MB per variable and hour).
+- Every rank read a strided window of every variable. For the strips
+  that spans nearly every row, so each rank pulled each whole slab.
+- When a series moved on by one record, `advance_series` reread both
+  brackets.
+- The file was opened and closed per record.
+- A cold 7 MB slab read on Lustre takes 35-180 ms; a warm one ~14 ms.
+
+`ROMS_GPU_FRC_BATCH` (bitmask, default 7; 0 = the former path):
+
+1. Slot reuse: the new lower bracket is the old upper one, so slot 2 is
+   copied into slot 1 on the device (`copy_upper_to_lower`, a D2D
+   cudaMemcpy) instead of reading that record again.
+2. One read per record: `set_forces` and `set_bgc_forces` advance every
+   series first with the reads deferred (`frc_batch_begin`).
+   `frc_batch_flush` then reads each needed record whole, once, on rank
+   mod(r-1, nranks), through a handle kept open for the run
+   (`frc_run_ncid`), and sends every tile its window. Files with time as
+   the first Fortran dimension keep the window reads.
+3. Read-ahead: `frc_prefetch`, called right after step3d_t, reads the
+   record after each series' upper bracket.
+   - It runs while the passive-corrector kernels are queued.
+     marbl_gpu_step drains the device on some calls, so the call sits
+     before it.
+   - Each rank reads at most one record per call. The windows go out
+     with non-blocking sends, one fixed tag per series.
+   - The flush that needs the record only waits for its messages. A
+     prefetched record that turns out not to be the needed one is dropped
+     and read as in 2.
+   - `frc_prefetch_drain` completes leftovers before finalize.
+
+The bytes that land in a tile are the window read's (float32 -> double
+is exact), so results are unchanged.
+
+`ROMS_GPU_FRC_TIMING=1` prints every flush and prefetch. Pac hourly flush:
+60-115 ms with 1+2 (`records 7 ... whole T`), 4 ms with 1+2+3 (`prefetched
+7`). The prefetch reads cost the owner 15-70 ms of host time, mostly
+hidden behind the queued kernels.
+
+| Pac strips 3-day | mean step | 4-step cycle (s) | walltime |
+|---|---|---|---|
+| before | 0.348 s | 0.283 0.272 0.383 0.455 | 4:40 |
+| slot reuse + one read per record | 0.321 s | 0.287 0.272 0.398 0.327 | 4:36 |
+| + read-ahead (final) | 0.308 s | 0.291 0.273 0.378 0.290 | 4:33 |
+
+Bit-identical for every build:
+
+- MiniPac 1x1 and 2x2 4-step.
+- MiniPac 2x2 and 4x2 3-day. These cross into April; one flush there
+  needed 12 records with only 4 prefetched, which exercised the fallback.
+- Pac 4x2 4-step.
+- Pac strips 3-day history and restart.
+
+What is left of a Pac hour beyond the clean steps: the MARBL call (~105 ms,
+of which ~85 ms MARBL kernels) and ~35 ms around the forcing step.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;
