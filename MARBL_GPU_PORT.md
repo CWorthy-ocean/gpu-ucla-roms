@@ -1148,6 +1148,67 @@ system variance is +-20 s).
   the compute ranks wait on the writers. The fix is to write different files
   concurrently, e.g. writer groups with one history file per record.
 
+## Writer groups: different files written at the same time (2026-10-08 night)
+
+From the per-run round's write benchmark, one file's bandwidth is limited
+(~1-2 GB/s; 8 writers on one file are slower than 4), while two files at
+once write ~1.3-1.6x faster. io_server therefore splits the writer ranks
+into groups.
+
+How it works:
+
+- **Group size.** `ROMS_GPU_IO_GROUP` writers per group; the default,
+  min(4, max(1, nwriters/2)), is lowered until it divides the writer count.
+- **File routing.** File `nfile` of kind `fkind` (history 1, restart 2)
+  belongs to group mod(nfile-1 + fkind-1, ngroups). So the restart and the
+  history file of the same number, and consecutive history files when
+  nrpf_his splits the history, go to different groups.
+- **Collectives.** Each group has its own communicator for the parallel
+  open, the record extension and the sync.
+- **Sends.** Compute ranks send a record (data, headers, open command) only
+  to its group's writers.
+- **Dispatch order.** Records are dispatched in staging order (a sequence
+  number per record), not by staging-set index. The lazy second set
+  introduced in the per-run round let ranks place the same record in
+  different sets, so with a history record and a restart staged in the
+  same step, two ranks could send them in opposite orders. The writers'
+  collective calls need one completion order per group, and staging order
+  guarantees it.
+- **Layout.** `tools/gpu_layout.py` takes writers per group from the record
+  size (at most 4), and 2 groups when the run writes more than one file at
+  a time (history and restart, or nrpf_his smaller than the number of
+  history records); `--groups` overrides. Pac: 8 writers (2 x 4); MiniPac: 2
+  (2 x 1); no output: 1.
+
+Pac 8x1 strips, 3-day, 8 GPUs:
+
+| output | writers | walltime | stepping | after the last step | worst step |
+|---|---|---|---|---|---|
+| daily history + restart | 1 group of 4 (before) | 244 s | 68 s | 95 s | 3.4 s |
+| daily history + restart | 2 groups of 2 | 245 s | 70 s | 96 s | 0.7 s |
+| daily history + restart | 2 groups of 4 | 223 s | 68 s | 66 s | 3.8 s |
+| 12-hourly, one file per record | 1 group of 4 | 297 s | 126 s | 81 s | 12.4 s |
+| 12-hourly, one file per record | 2 groups of 2 | 270 s | 96 s | 95 s | 9.7 s |
+| 12-hourly, one file per record | 2 groups of 4 | 226 s | 75 s | 58 s | 3.8 s |
+
+- **Groups of 2 are too small.** Two writers make one file writer-bound:
+  a history record takes 28 s instead of 20, the restart 51 s instead of 33.
+- **Groups of 4 deliver both gains.** They overlap the restart with the last
+  history record (-29 s at the end of the run). Under heavy output they keep
+  stepping nearly unthrottled: before, a daily-or-faster Pac history made the
+  model wait on the writers.
+- **One run had a hiccup.** One 2 x 4 run had a 40 s put on one writer, which
+  stalled the model for 54 s; the repeat was clean.
+- **Bit-identical:** MiniPac 2x2 4-step and 3-day (1 and 2 writers), Pac
+  4x2 4-step, Pac strips 3-day history and restart for every layout, and all
+  seven per-record history files of the heavy-output run (2 x 2 against
+  1 x 4).
+
+**For long runs.** If the writers cannot keep up with the output, split the
+history (small nrpf_his, e.g. 1-5) so consecutive records go to different
+groups, and add groups (`--groups 3` or 4 in the layout tool). A single
+history file can only be written as fast as one file allows.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

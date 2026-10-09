@@ -16,6 +16,16 @@ module io_server
   ! compute rank; the server only opens, appends records and closes.
   ! Commands for one record travel together, in order, so a file switch
   ! can never overtake a record that belongs to the previous file.
+  !
+  ! Writer groups: the writer ranks are split into groups of
+  ! ROMS_GPU_IO_GROUP writers (default min(4, max(1, nwriters/2))). File
+  ! nfile of kind fkind belongs to group mod(nfile-1 + fkind-1, ngroups),
+  ! so a restart and the history file of the same number, and consecutive
+  ! history files, are written by different groups at the same time. A
+  ! file's bandwidth is limited (more writers on one file do not help;
+  ! two files at once write ~1.3-1.6x faster). Records are dispatched in
+  ! staging order on every compute rank (seq), so each group's writers
+  ! complete its records in one order, as their collective file calls need.
   use kinds
   use decomp_mod, only: decomp
   use gpu_state
@@ -42,6 +52,7 @@ module io_server
   type rec_t
     logical :: used = .false., sent = .false.
     integer :: fkind = 0, rec = 0, nfile = 0, nvars = 0, nfloat = 0
+    integer :: seq = 0                       ! staging order (dispatch in this order)
     logical :: dbl = .false.                 ! real(8) record (restart)
     real(rp) :: time = 0.0_rp
     character(len=PATHLEN) :: open_path = ''
@@ -60,6 +71,9 @@ module io_server
   type(rec_t) :: pend(NSET)
   real :: t_ext = 0.0, t_asm = 0.0, t_put = 0.0   ! writer timing of the last write_assembled
   integer :: cur = 0                 ! set being filled
+  integer :: stage_seq = 0           ! records staged so far (compute side)
+  integer :: wgroup_size = 0, wgroups = 1   ! writers per group, number of groups (both sides)
+  integer :: me_g = 0, my_group = 0, gcomm = 0   ! server side: index in my group, my group, its communicator
   integer :: hcap = 0, dcap = 0
   integer :: hcap8 = 0, dcap8 = 0
   ! Server side: every tile's part of a record is received into its own
@@ -160,11 +174,14 @@ contains
         allocate(hpin2(hcap))
       endif
     endif
-    ! The set must be free: dispatched and its sends complete.
-    if (pend(idx)%used .and. .not. pend(idx)%sent) call dispatch(idx, .true.)
+    ! The set must be free: dispatched (with every older record, in staging
+    ! order) and its sends complete.
+    if (pend(idx)%used .and. .not. pend(idx)%sent) call dispatch_through(pend(idx)%seq, .true.)
     call wait_sends(idx)
     pend(idx) = rec_t()
     pend(idx)%used = .true.
+    stage_seq = stage_seq + 1
+    pend(idx)%seq = stage_seq
     pend(idx)%fkind = fkind
     pend(idx)%rec = rec
     pend(idx)%nfile = nfile
@@ -380,24 +397,80 @@ contains
   end function set_ready
 
   subroutine io_poll()
-    ! Called every step: hand over records whose GPU copies have landed.
+    ! Called every step: hand over records whose GPU copies have landed,
+    ! oldest first; a record waits for every older one (same send order on
+    ! every compute rank, whatever set each record landed in).
     integer :: i
-    do i = 1, NSET
-      if (pend(i)%used .and. .not. pend(i)%sent) then
-        if (set_ready(i)) call dispatch(i, .false.)
-      endif
+    do
+      i = oldest_pending()
+      if (i == 0) exit
+      if (.not. set_ready(i)) exit
+      call dispatch(i, .false.)
     enddo
   end subroutine io_poll
 
   subroutine io_flush()
     integer :: i
-    do i = 1, NSET
-      if (pend(i)%used .and. .not. pend(i)%sent) call dispatch(i, .true.)
-    enddo
+    call dispatch_through(huge(1), .true.)
     do i = 1, NSET
       call wait_sends(i)
     enddo
   end subroutine io_flush
+
+  integer function oldest_pending() result(idx)
+    ! The staged, not yet dispatched record with the smallest seq (0: none).
+    integer :: i
+    idx = 0
+    do i = 1, NSET
+      if (pend(i)%used .and. .not. pend(i)%sent) then
+        if (idx == 0) then
+          idx = i
+        elseif (pend(i)%seq < pend(idx)%seq) then
+          idx = i
+        endif
+      endif
+    enddo
+  end function oldest_pending
+
+  subroutine dispatch_through(seq, block)
+    ! Dispatch, in staging order, every pending record with seq <= seq.
+    integer, intent(in) :: seq
+    logical, intent(in) :: block
+    integer :: i
+    do
+      i = oldest_pending()
+      if (i == 0) exit
+      if (pend(i)%seq > seq) exit
+      call dispatch(i, block)
+    enddo
+  end subroutine dispatch_through
+
+  subroutine writer_groups(nw, gs, ng)
+    ! Writers per group and number of groups for nw writers (the same on
+    ! the compute and the writer ranks): ROMS_GPU_IO_GROUP, default
+    ! min(4, max(1, nw/2)), lowered until it divides nw.
+    integer, intent(in) :: nw
+    integer, intent(out) :: gs, ng
+    character(len=16) :: val
+    integer :: stat
+    gs = min(4, max(1, nw / 2))
+    call get_environment_variable('ROMS_GPU_IO_GROUP', val, status=stat)
+    if (stat == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=stat) gs
+      if (stat /= 0) gs = min(4, max(1, nw / 2))
+    endif
+    gs = max(1, min(gs, max(nw, 1)))
+    do while (mod(max(nw, 1), gs) /= 0)
+      gs = gs - 1
+    enddo
+    ng = max(nw, 1) / gs
+  end subroutine writer_groups
+
+  integer function file_group(fkind, nfile)
+    ! Writer group of file nfile of kind fkind.
+    integer, intent(in) :: fkind, nfile
+    file_group = mod(max(nfile, 1) - 1 + fkind - 1, wgroups)
+  end function file_group
 
   subroutine io_finalize()
 #ifdef USE_MPI
@@ -498,18 +571,21 @@ contains
   subroutine send_set(idx)
     integer, intent(in) :: idx
 #ifdef USE_MPI
-    integer :: ierr, iv, n, dest, comm, nw, w, nr
+    integer :: ierr, iv, n, dest, comm, nw, w, nr, base
     comm = comm_world()
     nw = io_server_count()
     if (nw > MAXW) error stop 'io: too many writer ranks (raise MAXW)'
+    if (wgroup_size == 0) call writer_groups(nw, wgroup_size, wgroups)
+    ! the writers of this file's group
+    base = io_server_rank() + file_group(pend(idx)%fkind, pend(idx)%nfile) * wgroup_size
     call pack_hdr(pend(idx), pend(idx)%hdr)
     pend(idx)%namebuf = ''
     do iv = 1, pend(idx)%nvars
       pend(idx)%namebuf((iv - 1) * NAMELEN + 1:iv * NAMELEN) = pend(idx)%names(iv)
     enddo
-    ! data first (variable iv to writer mod(iv-1, nw)), all non-blocking
+    ! data first (variable iv to the group's writer mod(iv-1, size)), all non-blocking
     do iv = 1, pend(idx)%nvars
-      dest = io_server_rank() + mod(iv - 1, nw)
+      dest = base + mod(iv - 1, wgroup_size)
       n = pend(idx)%n1(iv) * pend(idx)%n2(iv) * pend(idx)%n3(iv)
       if (pend(idx)%dbl) then
         if (idx == 1) then
@@ -528,9 +604,9 @@ contains
       endif
     enddo
     nr = pend(idx)%nvars
-    ! every writer gets the (optional) open command and the record header
-    do w = 0, nw - 1
-      dest = io_server_rank() + w
+    ! every writer of the group gets the (optional) open command and the header
+    do w = 0, wgroup_size - 1
+      dest = base + w
       if (len_trim(pend(idx)%open_path) > 0) then
         pend(idx)%ohdr = 0
         pend(idx)%ohdr(1) = CMD_OPEN
@@ -554,9 +630,9 @@ contains
   end subroutine send_set
 
   logical function mine(iv)
-    ! Variable iv of a record belongs to writer mod(iv-1, nserv).
+    ! Variable iv of a record belongs to the group's writer mod(iv-1, size).
     integer, intent(in) :: iv
-    mine = (mod(iv - 1, nserv) == me_w)
+    mine = (mod(iv - 1, wgroup_size) == me_g)
   end function mine
 
   subroutine write_assembled(ncid, isl)
@@ -572,7 +648,7 @@ contains
     call system_clock(ca, cr)
     ntile = size(tbuf, 1)
     r0 = tmeta(0, isl)
-    if (nserv > 1) then
+    if (wgroup_size > 1) then
       ! Parallel NetCDF: a record variable may only be extended collectively,
       ! so every writer first extends every variable of this record with a
       ! one-element put at its own position (overwritten below), then the
@@ -586,7 +662,7 @@ contains
           call nc_put_3d_rec_f(ncid, trim(r0%names(iv)), zero1, 1, 1, 1, r0%rec, me_w + 1, 1)
         endif
       enddo
-      call MPI_Barrier(comm_writers(), ierr)
+      call MPI_Barrier(gcomm, ierr)
       call nc_set_par_access(ncid, .false.)
     else
       call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
@@ -884,11 +960,17 @@ contains
     nserv = io_server_count()
     me_w = io_server_index()
     ncompute = comm_world_size() - nserv   ! every compute rank sends its own slabs and its own quit
+    call writer_groups(nserv, wgroup_size, wgroups)
+    my_group = me_w / wgroup_size
+    me_g = mod(me_w, wgroup_size)
+    call MPI_Comm_split(comm_writers(), my_group, me_w, gcomm, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Comm_split groups'
     trecv = 0.0
     nquit = 0
     open_name = ''
     open_pending = .false.
-    write(*,'(a,i0,a,i0,a,i0)') 'io_server: ready on world rank ', comm_world_rank(), '  writer ', me_w, ' of ', nserv
+    write(*,'(a,i0,a,i0,a,i0,a,i0,a,i0)') 'io_server: ready on world rank ', comm_world_rank(), '  writer ', me_w, ' of ', nserv, &
+         '  group ', my_group, ' of ', wgroups
     flush(6)
     do
       call MPI_Recv(hdr, NHDR, MPI_INTEGER, MPI_ANY_SOURCE, TAG_CMD, comm, stat, ierr)
@@ -933,7 +1015,7 @@ contains
           enddo
           write(*,'(a,i0,a,i0,a,i0,a)') 'io_server: WARNING all ', NSLOT, ' record slots busy; writing record ', &
                slot_key(3, isl), ' with ', slot_n(isl), ' of its tiles present (output faster than the writer)'
-          if (nserv > 1) error stop 'io_server: record slots overrun with several writers (output faster than the writers): raise NSLOT or lower the output frequency'
+          if (wgroup_size > 1) error stop 'io_server: record slots overrun with several writers (output faster than the writers): raise NSLOT or lower the output frequency'
           if (open_pending(tmeta(0, isl)%fkind)) call open_now(tmeta(0, isl)%fkind)
           call flush_slot_partial(isl)
         endif
@@ -1020,7 +1102,7 @@ contains
           if (slot_n(k) > 0) then
             write(*,'(a,i0,a,i0,a)') 'io_server: WARNING record ', slot_key(3, k), ' incomplete at quit (', &
                  slot_n(k), ' tiles); writing what arrived'
-            if (nserv > 1) then
+            if (wgroup_size > 1) then
               write(*,'(a)') 'io_server: (several writers: the incomplete record is dropped to keep the collective order)'
             else
               call flush_slot_partial(k)
@@ -1043,8 +1125,8 @@ contains
     subroutine open_now(kind)
       integer, intent(in) :: kind
       if (ncid_open(kind) >= 0) call nc_close(ncid_open(kind))
-      if (nserv > 1) then
-        call nc_open_write_par(trim(open_name(kind)), ncid_open(kind), comm_writers())
+      if (wgroup_size > 1) then
+        call nc_open_write_par(trim(open_name(kind)), ncid_open(kind), gcomm)
       else
         call nc_open_write(trim(open_name(kind)), ncid_open(kind))
       endif

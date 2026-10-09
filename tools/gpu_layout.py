@@ -2,20 +2,30 @@
 ranks from the history record size, and the PBS select line to launch it.
 
 usage: python gpu_layout.py <namelist> [--gpus-per-node 4] [--target-seconds 15]
-                                       [--rate-gbps 0.6] [--max-writers 8]
+                                       [--rate-gbps 0.6] [--max-writers 16] [--groups G]
 Prints:  NTILE NWRITERS NRANKS SELECT   (one line, space separated)
 
-Rule: one writer streams about 0.6 GB/s (measured, Derecho Lustre); choose
-the smallest number of writers that writes one history record within
---target-seconds, clamped to 1..--max-writers. The writers are the extra
-ranks on the last node; the model derives their count from the namelist.
+Rule:
+- Writers per group: one writer streams about 0.6 GB/s (measured, Derecho
+  Lustre). Take the smallest number that writes one history record within
+  --target-seconds, at most 4 (one file's bandwidth is limited, and more
+  writers on one file were slower).
+- Groups: 2 when the run writes more than one file at a time (history and
+  restart, or history split over files by nrpf_his), else 1; --groups
+  overrides.
+- The model's io_server writes different files with different groups at
+  the same time. Its default group size, min(4, nwriters/2), matches this
+  layout.
+
+The writers are the extra ranks on the last node; the model derives their
+count from the namelist.
 """
 import math
 import re
 import sys
 
 args = sys.argv[1:]
-opts = {'--gpus-per-node': 4, '--target-seconds': 15.0, '--rate-gbps': 0.6, '--max-writers': 8}
+opts = {'--gpus-per-node': 4, '--target-seconds': 15.0, '--rate-gbps': 0.6, '--max-writers': 16, '--groups': 0}
 path = None
 while args:
     a = args.pop(0)
@@ -56,9 +66,18 @@ if nt_bgc > 0:
     n2d += 8      # MARBL surface diagnostics (PH, pCO2, FG_CO2, zsat, ...)
     n3d += 4      # MARBL 3-D carbonate diagnostics
 record_gb = 4.0 * cells * (n3d * nz + n2d) / 1e9
-nw = 1
-if val('wrt_file_his', True):
-    nw = max(1, min(opts['--max-writers'], math.ceil(record_gb / (opts['--rate-gbps'] * opts['--target-seconds']))))
+his = val('wrt_file_his', True)
+rst = val('wrt_file_rst', True)
+per_group = 1
+if his:
+    per_group = max(1, min(4, math.ceil(record_gb / (opts['--rate-gbps'] * opts['--target-seconds']))))
+# files in flight at once: history + restart, or several history files
+dt = float(val('dt', 1.0)); ntimes = int(val('ntimes', 1))
+period = float(val('output_period_his', 0.0) or 0.0)
+nrec_his = int(ntimes * dt / period) + 1 if (his and period > 0) else (1 if his else 0)
+split_his = his and int(val('nrpf_his', 20)) < nrec_his
+groups = opts['--groups'] if opts['--groups'] > 0 else (2 if (his and (rst or split_his)) else 1)
+nw = max(1, min(opts['--max-writers'], groups * per_group))
 ntile = npx * npy
 g = opts['--gpus-per-node']
 nodes = max(1, math.ceil(ntile / g))
@@ -68,5 +87,6 @@ else:
     last = ntile - g * (nodes - 1)
     select = '%d:ncpus=64:mpiprocs=%d:ngpus=%d+1:ncpus=64:mpiprocs=%d:ngpus=%d' % (nodes - 1, g, g, last + nw, g)
 print('%d %d %d %s' % (ntile, nw, ntile + nw, select))
-print('# history record ~%.1f GB -> %d writer(s) for <= %.0f s per record at %.1f GB/s each' %
-      (record_gb, nw, opts['--target-seconds'], opts['--rate-gbps']), file=sys.stderr)
+print('# history record ~%.1f GB -> %d writer(s) per group for <= %.0f s per record at %.1f GB/s each; '
+      '%d group(s) -> %d writer(s)' % (record_gb, per_group, opts['--target-seconds'], opts['--rate-gbps'],
+                                      groups, nw), file=sys.stderr)
