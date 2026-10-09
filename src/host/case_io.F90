@@ -584,21 +584,11 @@ contains
     call sanitize_land()
     call pad_physical_halo()
     call fill_static_halos()
-    do k = 2, 4
-      zeta(:, :, k) = zeta(:, :, 1)
-      ubar(:, :, k) = ubar(:, :, 1)
-      vbar(:, :, k) = vbar(:, :, 1)
-    enddo
     ! Slot 3 is the nnew workspace. CPU leaves it at 0 after get_init;
     ! Orlanski vin on the first step is that zero, not a copy of nstp.
     ! Slot 2 is n-1 only when both records were restored; otherwise copy
     ! the current state into the AB/AM slots.
-    if (.not. case_have_prev) then
-      u(:, :, :, 2) = u(:, :, :, 1)
-      v(:, :, :, 2) = v(:, :, :, 1)
-      t(:, :, :, 2, 1) = t(:, :, :, 1, 1)
-      t(:, :, :, 2, 2) = t(:, :, :, 1, 2)
-    endif
+    call copy_initial_slots(.not. case_have_prev)
     knew = 1
     nstp = 1
     nrhs = 1
@@ -867,113 +857,200 @@ contains
   end subroutine infer_layout
 
   subroutine sanitize_land()
-    integer(ip) :: i, j, k, n
-    do j = decomp%js, decomp%je
-      do i = decomp%is, decomp%ie
-        if (is_nan(rmask(i, j))) rmask(i, j) = 0.0_rp
+    ! Elementwise on the device: the state may already be on the GPU (the
+    ! restart is stored by device kernels), and host loops over these
+    ! managed arrays migrated ~2 GB per rank to the host and back. The tests
+    ! and assignments per element are those of the former host loops.
+    integer(ip) :: i, j, k, n, m, is, ie, js, je, nz, ntr
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    nz = decomp%nz; ntr = size(t, 5)
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = js, je
+      do i = is, ie
+        if (rmask(i, j) /= rmask(i, j)) rmask(i, j) = 0.0_rp
         if (rmask(i, j) < 0.5_rp) then
           rmask(i, j) = 0.0_rp
-          if (is_nan(h(i, j)) .or. h(i, j) <= 0.0_rp) h(i, j) = 1.0_rp
-          if (is_nan(pm(i, j)) .or. pm(i, j) <= 0.0_rp) pm(i, j) = 1.0_rp
-          if (is_nan(pn(i, j)) .or. pn(i, j) <= 0.0_rp) pn(i, j) = 1.0_rp
+          if (h(i, j) /= h(i, j) .or. h(i, j) <= 0.0_rp) h(i, j) = 1.0_rp
+          if (pm(i, j) /= pm(i, j) .or. pm(i, j) <= 0.0_rp) pm(i, j) = 1.0_rp
+          if (pn(i, j) /= pn(i, j) .or. pn(i, j) <= 0.0_rp) pn(i, j) = 1.0_rp
           ! CPU setup_grid writes f from lat_rho unmasked; Coriolis uses it on land.
-          zeta(i, j, :) = 0.0_rp
+          do m = 1, 4
+            zeta(i, j, m) = 0.0_rp
+          enddo
           hbls(i, j) = 0.0_rp
           hbbl(i, j) = 0.0_rp
-          t(i, j, :, :, :) = 0.0_rp
+          do n = 1, ntr
+            do m = 1, 3
+              do k = 1, nz
+                t(i, j, k, m, n) = 0.0_rp
+              enddo
+            enddo
+          enddo
         endif
-        if (is_nan(h(i, j)) .or. h(i, j) <= 0.0_rp) h(i, j) = 1.0_rp
-        if (is_nan(pm(i, j)) .or. pm(i, j) <= 0.0_rp) pm(i, j) = 1.0e-4_rp
-        if (is_nan(pn(i, j)) .or. pn(i, j) <= 0.0_rp) pn(i, j) = 1.0e-4_rp
-        if (is_nan(f(i, j))) f(i, j) = 0.0_rp
+        if (h(i, j) /= h(i, j) .or. h(i, j) <= 0.0_rp) h(i, j) = 1.0_rp
+        if (pm(i, j) /= pm(i, j) .or. pm(i, j) <= 0.0_rp) pm(i, j) = 1.0e-4_rp
+        if (pn(i, j) /= pn(i, j) .or. pn(i, j) <= 0.0_rp) pn(i, j) = 1.0e-4_rp
+        if (f(i, j) /= f(i, j)) f(i, j) = 0.0_rp
       enddo
     enddo
-    do n = 1, 3
-      do k = 1, decomp%nz
-        do j = decomp%js, decomp%je
-          do i = decomp%is, decomp%ie
-            if (is_nan(u(i, j, k, n))) u(i, j, k, n) = 0.0_rp
-            if (is_nan(v(i, j, k, n))) v(i, j, k, n) = 0.0_rp
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*,*>>>
+#endif
+    do k = 1, nz
+      do j = js, je
+        do i = is, ie
+          do n = 1, 3
+            if (u(i, j, k, n) /= u(i, j, k, n)) u(i, j, k, n) = 0.0_rp
+            if (v(i, j, k, n) /= v(i, j, k, n)) v(i, j, k, n) = 0.0_rp
+          enddo
+          do n = 1, ntr
+            do m = 1, 3
+              if (t(i, j, k, m, n) /= t(i, j, k, m, n)) t(i, j, k, m, n) = 0.0_rp
+            enddo
           enddo
         enddo
       enddo
     enddo
-    where (is_nan(ubar)) ubar = 0.0_rp
-    where (is_nan(vbar)) vbar = 0.0_rp
-    where (is_nan(zeta)) zeta = 0.0_rp
-    where (is_nan(t)) t = 0.0_rp
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = js, je
+      do i = is, ie
+        do m = 1, 4
+          if (ubar(i, j, m) /= ubar(i, j, m)) ubar(i, j, m) = 0.0_rp
+          if (vbar(i, j, m) /= vbar(i, j, m)) vbar(i, j, m) = 0.0_rp
+          if (zeta(i, j, m) /= zeta(i, j, m)) zeta(i, j, m) = 0.0_rp
+        enddo
+      enddo
+    enddo
   end subroutine sanitize_land
 
   subroutine pad_physical_halo()
-    integer(ip) :: i, j, is, ie, js, je, nx, ny
+    ! Halo cells outside a physical edge: copy column 0 / nx+1 outward
+    ! (west/east), then copy row 0 / ny+1 metrics and zero the state
+    ! (south/north). Device kernels, one per edge in the former order (the
+    ! south/north passes read the corner cells the west/east passes wrote).
+    integer(ip) :: i, j, k, m, n, ms, is, ie, js, je, nx, ny, nz, ntr, isrc, jsrc, i0, i1, j0, j1
     is = decomp%is; ie = decomp%ie
     js = decomp%js; je = decomp%je
-    nx = decomp%nx; ny = decomp%ny
-    if (decomp%edge_w) then
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = size(t, 5)
+    do m = 1, 2
+      if (m == 1) then
+        if (.not. decomp%edge_w) cycle
+        i0 = is; i1 = -1; isrc = 0
+      else
+        if (.not. decomp%edge_e) cycle
+        i0 = nx + 2; i1 = ie; isrc = nx + 1
+      endif
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
       do j = js, je
-        do i = is, -1
-          call copy_col(i, 0, j)
+        do i = i0, i1
+          h(i, j) = h(isrc, j); pm(i, j) = pm(isrc, j); pn(i, j) = pn(isrc, j)
+          rmask(i, j) = rmask(isrc, j); f(i, j) = f(isrc, j)
+          lonr(i, j) = lonr(isrc, j); latr(i, j) = latr(isrc, j); angler(i, j) = angler(isrc, j)
+          do k = 1, 4
+            zeta(i, j, k) = zeta(isrc, j, k)
+            ubar(i, j, k) = ubar(isrc, j, k)
+            vbar(i, j, k) = vbar(isrc, j, k)
+          enddo
+          do n = 1, 3
+            do k = 1, nz
+              u(i, j, k, n) = u(isrc, j, k, n)
+              v(i, j, k, n) = v(isrc, j, k, n)
+            enddo
+          enddo
+          do n = 1, ntr
+            do ms = 1, 3
+              do k = 1, nz
+                t(i, j, k, ms, n) = t(isrc, j, k, ms, n)
+              enddo
+            enddo
+          enddo
+          hbls(i, j) = hbls(isrc, j); hbbl(i, j) = hbbl(isrc, j)
         enddo
       enddo
-    endif
-    if (decomp%edge_e) then
-      do j = js, je
-        do i = nx + 2, ie
-          call copy_col(i, nx + 1, j)
+    enddo
+    do m = 1, 2
+      if (m == 1) then
+        if (.not. decomp%edge_s) cycle
+        j0 = js; j1 = -1; jsrc = 0
+      else
+        if (.not. decomp%edge_n) cycle
+        j0 = ny + 2; j1 = je; jsrc = ny + 1
+      endif
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = j0, j1
+        do i = is, ie
+          h(i, j) = h(i, jsrc); pm(i, j) = pm(i, jsrc); pn(i, j) = pn(i, jsrc)
+          f(i, j) = f(i, jsrc)
+          lonr(i, j) = lonr(i, jsrc); latr(i, j) = latr(i, jsrc); angler(i, j) = angler(i, jsrc)
+          rmask(i, j) = 0.0_rp
+          umask(i, j) = 0.0_rp
+          vmask(i, j) = 0.0_rp
+          do k = 1, 4
+            zeta(i, j, k) = 0.0_rp
+            ubar(i, j, k) = 0.0_rp
+            vbar(i, j, k) = 0.0_rp
+          enddo
+          do n = 1, 3
+            do k = 1, nz
+              u(i, j, k, n) = 0.0_rp
+              v(i, j, k, n) = 0.0_rp
+            enddo
+          enddo
+          do n = 1, ntr
+            do ms = 1, 3
+              do k = 1, nz
+                t(i, j, k, ms, n) = 0.0_rp
+              enddo
+            enddo
+          enddo
+          hbls(i, j) = 0.0_rp
+          hbbl(i, j) = 0.0_rp
         enddo
       enddo
-    endif
-    if (decomp%edge_s) then
-      do i = is, ie
-        do j = js, -1
-          call copy_row_metrics(i, j, 0)
-          call zero_row_state(i, j)
-        enddo
-      enddo
-    endif
-    if (decomp%edge_n) then
-      do i = is, ie
-        do j = ny + 2, je
-          call copy_row_metrics(i, j, ny + 1)
-          call zero_row_state(i, j)
-        enddo
-      enddo
-    endif
-  contains
-    subroutine copy_col(idst, isrc, j)
-      integer(ip), intent(in) :: idst, isrc, j
-      h(idst, j) = h(isrc, j); pm(idst, j) = pm(isrc, j); pn(idst, j) = pn(isrc, j)
-      rmask(idst, j) = rmask(isrc, j); f(idst, j) = f(isrc, j)
-      lonr(idst, j) = lonr(isrc, j); latr(idst, j) = latr(isrc, j); angler(idst, j) = angler(isrc, j)
-      zeta(idst, j, :) = zeta(isrc, j, :)
-      ubar(idst, j, :) = ubar(isrc, j, :)
-      vbar(idst, j, :) = vbar(isrc, j, :)
-      u(idst, j, :, :) = u(isrc, j, :, :)
-      v(idst, j, :, :) = v(isrc, j, :, :)
-      t(idst, j, :, :, :) = t(isrc, j, :, :, :)
-      hbls(idst, j) = hbls(isrc, j); hbbl(idst, j) = hbbl(isrc, j)
-    end subroutine copy_col
-    subroutine copy_row_metrics(i, jdst, jsrc)
-      integer(ip), intent(in) :: i, jdst, jsrc
-      h(i, jdst) = h(i, jsrc); pm(i, jdst) = pm(i, jsrc); pn(i, jdst) = pn(i, jsrc)
-      f(i, jdst) = f(i, jsrc)
-      lonr(i, jdst) = lonr(i, jsrc); latr(i, jdst) = latr(i, jsrc); angler(i, jdst) = angler(i, jsrc)
-    end subroutine copy_row_metrics
-    subroutine zero_row_state(i, jdst)
-      integer(ip), intent(in) :: i, jdst
-      rmask(i, jdst) = 0.0_rp
-      umask(i, jdst) = 0.0_rp
-      vmask(i, jdst) = 0.0_rp
-      zeta(i, jdst, :) = 0.0_rp
-      ubar(i, jdst, :) = 0.0_rp
-      vbar(i, jdst, :) = 0.0_rp
-      u(i, jdst, :, :) = 0.0_rp
-      v(i, jdst, :, :) = 0.0_rp
-      t(i, jdst, :, :, :) = 0.0_rp
-      hbls(i, jdst) = 0.0_rp
-      hbbl(i, jdst) = 0.0_rp
-    end subroutine zero_row_state
+    enddo
   end subroutine pad_physical_halo
+
+  subroutine copy_initial_slots(copy_prev)
+    ! zeta/ubar/vbar slots 2-4 = slot 1; with copy_prev also u, v and the
+    ! two active tracers slot 2 = slot 1 (device kernels, as sanitize_land).
+    logical, intent(in) :: copy_prev
+    integer(ip) :: i, j, k, m, is, ie, js, je, nz
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je; nz = decomp%nz
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = js, je
+      do i = is, ie
+        do m = 2, 4
+          zeta(i, j, m) = zeta(i, j, 1)
+          ubar(i, j, m) = ubar(i, j, 1)
+          vbar(i, j, m) = vbar(i, j, 1)
+        enddo
+      enddo
+    enddo
+    if (.not. copy_prev) return
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*,*>>>
+#endif
+    do k = 1, nz
+      do j = js, je
+        do i = is, ie
+          u(i, j, k, 2) = u(i, j, k, 1)
+          v(i, j, k, 2) = v(i, j, k, 1)
+          t(i, j, k, 2, 1) = t(i, j, k, 1, 1)
+          t(i, j, k, 2, 2) = t(i, j, k, 1, 2)
+        enddo
+      enddo
+    enddo
+  end subroutine copy_initial_slots
 
   subroutine fill_static_halos()
     ! Tile halos of the grid fields: the window read covers local 0..nx+1

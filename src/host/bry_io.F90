@@ -13,7 +13,7 @@ module bry_io
   use decomp_mod
   use gpu_state
   use time_state
-  use frc_io, only: case_frcfiles, case_nfrc, cyc_bracket, frc_file_ncid, cached_times
+  use frc_io, only: case_frcfiles, case_nfrc, cyc_bracket, frc_file_ncid, cached_times, frc_run_ncid_path
   use passive_mod, only: ntp, passive_marbl, passive_name, tb_west, tb_east, tb_south, tb_north
   use nc_io
   use arch_mod, only: sync_arch
@@ -184,9 +184,14 @@ contains
     s%n = n1
     call tile_window(axis, s%n, s%f0)
     allocate(s%buf(s%n, 2))
-    s%it1 = 1; s%it2 = min(2, s%nrec)
-    call read_rec1(s, s%it1, 1)
-    call read_rec1(s, s%it2, 2)
+    if (s%nrec >= 2) then
+      ! No bracket yet: the first adv1 (the first set_bry_all) reads it.
+      s%it1 = 0; s%it2 = 0
+    else
+      s%it1 = 1; s%it2 = 1
+      call read_rec1(s, s%it1, 1)
+      call read_rec1(s, s%it2, 2)
+    endif
   end subroutine bind1
 
   subroutine bindz(s, vname, axis)
@@ -200,9 +205,14 @@ contains
     s%n = n1; s%nz = n2
     call tile_window(axis, s%n, s%f0)
     allocate(s%buf(s%n, n2, 2))
-    s%it1 = 1; s%it2 = min(2, s%nrec)
-    call read_recz(s, s%it1, 1)
-    call read_recz(s, s%it2, 2)
+    if (s%nrec >= 2) then
+      ! No bracket yet: the first advz (the first set_bry_all) reads it.
+      s%it1 = 0; s%it2 = 0
+    else
+      s%it1 = 1; s%it2 = 1
+      call read_recz(s, s%it1, 1)
+      call read_recz(s, s%it2, 2)
+    endif
   end subroutine bindz
 
   subroutine build_catalog(vname, tname, times, paths, irec, ntot, n1, n2, cycle)
@@ -270,6 +280,30 @@ contains
     enddo
   end subroutine build_catalog
 
+  subroutine copy_upper1(s)
+    ! slot 1 = slot 2 on the device (the record already read).
+    type(series1d), intent(inout) :: s
+#ifdef USE_CUDA
+    integer :: ierr
+    ierr = cudaMemcpy(s%buf(:,1), s%buf(:,2), s%n, cudaMemcpyDeviceToDevice)
+    if (ierr /= 0) error stop 'copy_upper1: cudaMemcpy'
+#else
+    s%buf(:,1) = s%buf(:,2)
+#endif
+  end subroutine copy_upper1
+
+  subroutine copy_upperz(s)
+    ! slot 1 = slot 2 on the device (the record already read).
+    type(series_z), intent(inout) :: s
+#ifdef USE_CUDA
+    integer :: ierr
+    ierr = cudaMemcpy(s%buf(:,:,1), s%buf(:,:,2), s%n * s%nz, cudaMemcpyDeviceToDevice)
+    if (ierr /= 0) error stop 'copy_upperz: cudaMemcpy'
+#else
+    s%buf(:,:,1) = s%buf(:,:,2)
+#endif
+  end subroutine copy_upperz
+
   subroutine read_rec1(s, idx, slot)
     type(series1d), intent(inout) :: s
     integer,        intent(in)    :: idx, slot
@@ -279,9 +313,14 @@ contains
     integer :: ierr
 #endif
     allocate(tmp(s%n, 1))
-    call nc_open_read(s%paths(idx), ncid)
-    call nc_read_2d(ncid, s%vname, tmp, s%n, 1, s%irec(idx), s%f0, 1)
-    call nc_close(ncid)
+    ncid = frc_run_ncid_path(s%paths(idx))   ! kept open for the run
+    if (ncid < 0) then
+      call nc_open_read(s%paths(idx), ncid)
+      call nc_read_2d(ncid, s%vname, tmp, s%n, 1, s%irec(idx), s%f0, 1)
+      call nc_close(ncid)
+    else
+      call nc_read_2d(ncid, s%vname, tmp, s%n, 1, s%irec(idx), s%f0, 1)
+    endif
 #ifdef USE_CUDA
     ierr = cudaMemcpy(s%buf(:,slot), tmp(:,1), s%n, cudaMemcpyHostToDevice)
     if (ierr /= 0) error stop 'read_rec1: cudaMemcpy'
@@ -300,9 +339,14 @@ contains
     integer :: ierr
 #endif
     allocate(tmp(s%n, s%nz))
-    call nc_open_read(s%paths(idx), ncid)
-    call nc_read_2d(ncid, s%vname, tmp, s%n, s%nz, s%irec(idx), s%f0, 1)
-    call nc_close(ncid)
+    ncid = frc_run_ncid_path(s%paths(idx))   ! kept open for the run
+    if (ncid < 0) then
+      call nc_open_read(s%paths(idx), ncid)
+      call nc_read_2d(ncid, s%vname, tmp, s%n, s%nz, s%irec(idx), s%f0, 1)
+      call nc_close(ncid)
+    else
+      call nc_read_2d(ncid, s%vname, tmp, s%n, s%nz, s%irec(idx), s%f0, 1)
+    endif
 #ifdef USE_CUDA
     ierr = cudaMemcpy(s%buf(:,:,slot), tmp, s%n * s%nz, cudaMemcpyHostToDevice)
     if (ierr /= 0) error stop 'read_recz: cudaMemcpy'
@@ -448,13 +492,18 @@ contains
   subroutine adv1(s, tneed)
     type(series1d), intent(inout) :: s
     real(rp),       intent(in)    :: tneed
-    integer :: rec, i, i1, i2
+    integer :: rec, i, i1, i2, old2
     if (s%nrec < 2) return
     if (s%cycle > 0.0_rp) then
       call cyc_bracket(s%times, s%nrec, s%cycle, tneed, i1, i2, s%t1e, s%t2e)
       if (i1 /= s%it1) then
+        old2 = s%it2
         s%it1 = i1
-        call read_rec1(s, i1, 1)
+        if (i1 == old2) then
+          call copy_upper1(s)
+        else
+          call read_rec1(s, i1, 1)
+        endif
       endif
       if (i2 /= s%it2) then
         s%it2 = i2
@@ -462,7 +511,9 @@ contains
       endif
       return
     endif
-    if (s%times(s%it2) >= tneed .and. s%times(s%it1) <= tneed) return
+    if (s%it1 >= 1) then
+      if (s%times(s%it2) >= tneed .and. s%times(s%it1) <= tneed) return
+    endif
     rec = 1
     do i = 1, s%nrec - 1
       if (s%times(i) <= tneed) rec = i
@@ -472,21 +523,32 @@ contains
     enddo
     rec = max(1, min(rec, s%nrec - 1))
     if (rec == s%it1 .and. rec + 1 == s%it2) return
+    old2 = s%it2
     s%it1 = rec; s%it2 = rec + 1
-    call read_rec1(s, s%it1, 1)
+    ! moving on by one record: the old upper bracket becomes the lower one
+    if (s%it1 == old2) then
+      call copy_upper1(s)
+    else
+      call read_rec1(s, s%it1, 1)
+    endif
     call read_rec1(s, s%it2, 2)
   end subroutine adv1
 
   subroutine advz(s, tneed)
     type(series_z), intent(inout) :: s
     real(rp),       intent(in)    :: tneed
-    integer :: rec, i, i1, i2
+    integer :: rec, i, i1, i2, old2
     if (s%nrec < 2) return
     if (s%cycle > 0.0_rp) then
       call cyc_bracket(s%times, s%nrec, s%cycle, tneed, i1, i2, s%t1e, s%t2e)
       if (i1 /= s%it1) then
+        old2 = s%it2
         s%it1 = i1
-        call read_recz(s, i1, 1)
+        if (i1 == old2) then
+          call copy_upperz(s)
+        else
+          call read_recz(s, i1, 1)
+        endif
       endif
       if (i2 /= s%it2) then
         s%it2 = i2
@@ -494,7 +556,9 @@ contains
       endif
       return
     endif
-    if (s%times(s%it2) >= tneed .and. s%times(s%it1) <= tneed) return
+    if (s%it1 >= 1) then
+      if (s%times(s%it2) >= tneed .and. s%times(s%it1) <= tneed) return
+    endif
     rec = 1
     do i = 1, s%nrec - 1
       if (s%times(i) <= tneed) rec = i
@@ -504,8 +568,14 @@ contains
     enddo
     rec = max(1, min(rec, s%nrec - 1))
     if (rec == s%it1 .and. rec + 1 == s%it2) return
+    old2 = s%it2
     s%it1 = rec; s%it2 = rec + 1
-    call read_recz(s, s%it1, 1)
+    ! moving on by one record: the old upper bracket becomes the lower one
+    if (s%it1 == old2) then
+      call copy_upperz(s)
+    else
+      call read_recz(s, s%it1, 1)
+    endif
     call read_recz(s, s%it2, 2)
   end subroutine advz
 

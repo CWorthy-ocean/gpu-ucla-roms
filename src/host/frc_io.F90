@@ -13,7 +13,7 @@ module frc_io
   use arch_mod, only: sync_arch
   use comm_mod, only: comm_rank, comm_size, comm_compute
   use netcdf, only: nf90_inquire, nf90_inq_varid, nf90_inquire_variable, nf90_inquire_dimension, nf90_get_var, &
-                    nf90_double, nf90_float, nf90_max_var_dims
+                    nf90_double, nf90_float, nf90_max_var_dims, nf90_open, nf90_nowrite
 #ifdef USE_CUDA
   use cudafor
 #endif
@@ -33,6 +33,11 @@ module frc_io
   ! mod(i-1, nranks)) and broadcast: every record of a classic-format file
   ! costs one seek, so a month of hourly times is thousands of reads.
   integer, parameter :: MAXTC = 1024
+  ! Time axes the binders request (frc_io bind_series, bry_io 'bry_time').
+  character(len=16), parameter :: TAXES(12) = [character(len=16) :: 'time', 'sms_time', 'shf_time', &
+       'swf_time', 'srf_time', 'sss_time', 'dust_time', 'iron_time', 'nox_time', 'nhy_time', &
+       'xco2_time', 'bry_time']
+  integer, parameter :: AXIS_BLOCK = 8192   ! netCDF block size for the axis reads, bytes
   type :: tc_t
     integer :: ifile = 0, n = 0
     character(len=64) :: name = ''
@@ -105,7 +110,7 @@ module frc_io
   logical :: frc_timing = .false.
   integer :: run_ncid(max_frc) = -1       ! read handles kept open while stepping
   integer, parameter :: FRC_TAG0 = 6000, FRC_PF_TAG0 = 6100
-  public :: frc_prefetch, frc_prefetch_drain
+  public :: frc_prefetch, frc_prefetch_drain, frc_run_ncid_path
   logical, public :: bgc_frc_on = .false.
   real(rp), WORK_ATTR allocatable :: uwnd(:,:), vwnd(:,:), qair(:,:), prate(:,:), lwrad_in(:,:)
   real(rp), WORK_ATTR allocatable :: sss(:,:)
@@ -294,9 +299,14 @@ contains
   end subroutine set_forces
 
   subroutine prefetch_time_axes()
-    ! Collective over the compute ranks. Every 1-D real variable of every
-    ! forcing file lands in tcache on every rank.
-    integer :: i, nc, me, owner, ncid, nv, v, ndims, xtype, dimids(nf90_max_var_dims), n, k, cnt, k0
+    ! Collective over the compute ranks. The 1-D real variables of every
+    ! forcing file that are time axes the binders ask for (TAXES; any other
+    ! axis is read by its binder, so the list only affects speed) land in
+    ! tcache on every rank. They are read through a handle opened with a
+    ! small block size: in a classic file every value of a record variable
+    ! sits in its own record, and the default 4 MB block per value made
+    ! a 744-record axis cost ~3 GB of reads.
+    integer :: i, nc, me, owner, ncid, nv, v, ndims, xtype, dimids(nf90_max_var_dims), n, k, cnt, k0, csz
     integer :: nfirst(max_frc), nlast(max_frc), owner_of(max_frc)
     integer(8) :: fsize(max_frc)
     integer(8), allocatable :: load(:)
@@ -326,12 +336,15 @@ contains
       owner = owner_of(i)
       if (me == owner) then
         nfirst(i) = ntc + 1
-        ncid = frc_file_ncid(i)
+        csz = AXIS_BLOCK
+        call nc_check(nf90_open(trim(case_frcfiles(i)), nf90_nowrite, ncid, chunksize=csz), &
+                      'open '//trim(case_frcfiles(i)))
         call nc_check(nf90_inquire(ncid, nvariables=nv), 'inquire forcing file')
         do v = 1, nv
           call nc_check(nf90_inquire_variable(ncid, v, name=vname, xtype=xtype, ndims=ndims, dimids=dimids), 'inquire var')
           if (ndims /= 1) cycle
           if (xtype /= nf90_double .and. xtype /= nf90_float) cycle
+          if (.not. any(TAXES == vname)) cycle
           call nc_check(nf90_inquire_dimension(ncid, dimids(1), len=n), 'dim len')
           if (n < 1) cycle
           if (ntc >= MAXTC) error stop 'prefetch_time_axes: raise MAXTC'
@@ -340,6 +353,7 @@ contains
           allocate(tcache(ntc)%t(n))
           call nc_check(nf90_get_var(ncid, v, tcache(ntc)%t), 'get '//trim(vname))
         enddo
+        call nc_close(ncid)
         nlast(i) = ntc
       endif
     enddo
@@ -482,10 +496,17 @@ contains
     s%ready = .true.
     allocate(s%buf(s%n1, s%n2, 2))
     s%buf = 0.0_rp
-    s%it1 = 1
-    s%it2 = min(2, s%ntot)
-    call read_catalog_rec(s, s%it1, 1)
-    call read_catalog_rec(s, s%it2, 2)
+    if (s%ntot >= 2) then
+      ! No bracket yet: the first advance_series (the first set_forces /
+      ! set_bgc_forces) reads the two records it needs.
+      s%it1 = 0
+      s%it2 = 0
+    else
+      s%it1 = 1
+      s%it2 = 1
+      call read_catalog_rec(s, s%it1, 1)
+      call read_catalog_rec(s, s%it2, 2)
+    endif
     if (first_bind) call wall_stamp('bound '//trim(vname))
     first_bind = .false.
   end subroutine bind_series
@@ -571,6 +592,19 @@ contains
     s%buf(:,:,1) = s%buf(:,:,2)
 #endif
   end subroutine copy_upper_to_lower
+
+  integer function frc_run_ncid_path(path) result(ncid)
+    ! Kept-open read handle for the forcing file with this path (bry_io).
+    character(len=*), intent(in) :: path
+    integer :: i
+    do i = 1, case_nfrc
+      if (trim(case_frcfiles(i)) == trim(path)) then
+        ncid = frc_run_ncid(i)
+        return
+      endif
+    enddo
+    ncid = -1
+  end function frc_run_ncid_path
 
   integer function frc_run_ncid(i) result(ncid)
     ! Read handle for forcing file i, opened on first use and kept open.
@@ -751,6 +785,7 @@ contains
     integer,        intent(inout) :: n
     integer :: nxt
     if (.not. s%ready .or. s%ntot < 2 .or. s%time_axis == 1 .or. s%pf_idx /= 0) return
+    if (s%it2 < 1) return                      ! not advanced yet
     if (s%cycle > 0.0_rp) then
       nxt = mod(s%it2, s%ntot) + 1
     else
@@ -935,7 +970,9 @@ contains
       endif
       return
     endif
-    if (s%times(s%it2) >= tneed .and. s%times(s%it1) <= tneed) return
+    if (s%it1 >= 1) then
+      if (s%times(s%it2) >= tneed .and. s%times(s%it1) <= tneed) return
+    endif
     rec = 1
     do i = 1, s%ntot - 1
       if (s%times(i) <= tneed .and. s%times(i + 1) >= tneed) then

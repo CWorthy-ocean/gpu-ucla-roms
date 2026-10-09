@@ -1074,6 +1074,80 @@ Notes:
   ncarenv) collide with "IILM file version error". Give each build its
   own TMPDIR.
 
+## Per-run round: init, output and placement (2026-10-08 evening)
+
+Pac 8x1 strips, 3-day, starting from ed156ed: walltime 275 s = init 97 s +
+stepping ~64 s + ~107 s after the last step (writer backlog plus shutdown).
+
+**Kept (bit-identical):**
+
+- **C, forcing time axes.** `prefetch_time_axes` reads only the axes the
+  binders request (`TAXES` in frc_io; any other axis is read by its
+  binder). They are read through a handle opened with an 8 KB netCDF block.
+  The hourly files carried two unused 744-record axes, and each value of a
+  record variable cost a 4 MB block read. Forcing init 10.7 -> ~8 s.
+- **D, init leftovers:**
+  - bind_series, bind1 and bindz no longer read records 1-2 of
+    multi-record series (the first advance reads the bracket it needs);
+  - the boundary series reuse the upper slot and keep their files open
+    (`frc_run_ncid_path`);
+  - output staging set 2 is pinned only when a record finds set 1 still in
+    flight (`set_free`);
+  - sanitize_land, pad_physical_halo and the initial slot copies run as
+    device kernels (the host loops migrated ~2 GB of managed state per rank).
+
+  Boundary init 2.6 -> ~0 s, output init 12 -> ~8 s, cheaper daily
+  boundary steps.
+- **E, NUMA placement** (`tools/numa_bind.sh`, `--cpu-bind none`; used in
+  cases/pac/gpu pac3dS10; `submit_gpu.sh` passes `NUMA_BIND_NRANKS`).
+  - PALS pins every rank to one core of NUMA 0 (cores 0-4), while GPU 0..3
+    sit on NUMA 3..0. The wrapper binds each GPU rank to its GPU's domain
+    (read from nvidia-smi and /sys) and leaves the writers unbound. Binding
+    the writers too slowed their file writes ~20%.
+  - The step mean drops 0.196 -> 0.186 s (the MARBL and forcing steps gain
+    most).
+  - The end-of-run output is ~8 s slower on average: the restart and
+    history parts now cross NUMA domains on their way to the writers.
+  - Roughly neutral for a 3-day run; ~5% for long runs.
+- **Writer timing:** each writer prints extend / assemble / put / sync per
+  record.
+
+**Measured and dropped:**
+
+| Item | Result |
+|---|---|
+| B: size-balanced, non-lockstep restart reader | No gain. Reads are file-system bound (33-40 s per rank, ~3 GB/s aggregate); every rank still finishes at ~56 s. |
+| 64 MB netCDF block for the restart file | Read 59 -> 93 s. |
+| A1: 8 writers | Same put time per record. |
+| A2: NOFILL | No change in the extension round. Its run also landed on deg0072. |
+| A4: non-blocking part receives | No measurable gain. |
+| A5: fixed 24-stripe output directory | Worse: record 3 took 34 s put + 22 s sync. |
+
+**Write benchmark** (`scratchpad/iobench/wbench.f90`): netCDF-4 parallel,
+writers' pattern, 14 GB per file.
+
+| Case | Aggregate |
+|---|---|
+| 1 file, 4 ranks | 0.75 GB/s |
+| 2 files at once, one group per node | 1.23 GB/s |
+| 2 files at once, both groups on one node | 1.00 GB/s |
+| 1 file, 8 ranks | 0.50 GB/s |
+
+Bandwidth is limited per file, and more writers on one file hurt. History
+record 3, which crosses the 64 GB PFL component boundary, spends 17-18 s in
+the collective extension round in the default directory.
+
+**Result:** 3-day Pac walltime 275 -> ~250 s unbound (260-270 s bound; file
+system variance is +-20 s).
+
+**Open:**
+- **A3:** write the final restart concurrently with the last history record
+  (another file). From the benchmark, ~15-20 s per run.
+- **Long runs are output-bound.** A daily Pac history record takes 4
+  writers ~23-25 s, while a model day is ~18 s of compute. After about a week
+  the compute ranks wait on the writers. The fix is to write different files
+  concurrently, e.g. writer groups with one history file per record.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

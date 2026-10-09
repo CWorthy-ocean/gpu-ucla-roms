@@ -58,6 +58,7 @@ module io_server
   end type rec_t
 
   type(rec_t) :: pend(NSET)
+  real :: t_ext = 0.0, t_asm = 0.0, t_put = 0.0   ! writer timing of the last write_assembled
   integer :: cur = 0                 ! set being filled
   integer :: hcap = 0, dcap = 0
   integer :: hcap8 = 0, dcap8 = 0
@@ -121,7 +122,9 @@ contains
     if (hcap > 0) return
     hcap = max(cap_record, 1)
     dcap = max(cap_field, 1)
-    allocate(hpin1(hcap), hpin2(hcap), dstage(dcap))
+    ! Set 2 is pinned only when a record finds set 1 still in flight
+    ! (io_stage_begin): pinning a set costs seconds per rank at init.
+    allocate(hpin1(hcap), dstage(dcap))
 #ifdef USE_CUDA
     do i = 1, NSET
       ierr = cudaEventCreateWithFlags(ev(i), cudaEventDisableTiming)
@@ -130,19 +133,33 @@ contains
 #endif
     if (have_io_server()) then
       write(*,'(a,i0,a,f6.2,a)') 'io: asynchronous output to server rank ', &
-           io_server_rank(), '  (staging ', 2.0 * real(hcap) * 4.0 / 2.0**30, ' GB pinned)'
+           io_server_rank(), '  (staging ', real(hcap) * 4.0 / 2.0**30, ' GB pinned, a second set when needed)'
     else
       write(*,'(a)') 'io: no server rank; staged records are written by the compute rank'
     endif
   end subroutine io_init
 
-  subroutine io_stage_begin(fkind, rec, nfile, time, open_path)
+  subroutine io_stage_begin(fkind, rec, nfile, time, open_path, dbl)
     integer, intent(in) :: fkind, rec, nfile
     real(rp), intent(in) :: time
     character(len=*), intent(in) :: open_path
+    logical, intent(in), optional :: dbl
     integer :: idx
+    logical :: is_dbl
     if (hcap == 0) error stop 'io_stage_begin: io_init not called'
+    is_dbl = .false.
+    if (present(dbl)) is_dbl = dbl
     idx = mod(cur, NSET) + 1
+    if (idx == 2 .and. .not. allocated(hpin2)) then
+      ! Reuse set 1 when it is already free (the usual case for daily
+      ! output); otherwise a float record pins set 2 now. Double records
+      ! stage into hpin8_2 and do not need hpin2.
+      if (set_free(1)) then
+        idx = 1
+      elseif (.not. is_dbl) then
+        allocate(hpin2(hcap))
+      endif
+    endif
     ! The set must be free: dispatched and its sends complete.
     if (pend(idx)%used .and. .not. pend(idx)%sent) call dispatch(idx, .true.)
     call wait_sends(idx)
@@ -421,6 +438,29 @@ contains
     pend(idx)%sent = .true.
   end subroutine dispatch
 
+  logical function set_free(idx)
+    ! Set idx holds no record, or its record is handed over and every send
+    ! of it has completed (tested without blocking).
+    integer, intent(in) :: idx
+#ifdef USE_MPI
+    integer :: ierr
+    logical :: flag
+#endif
+    set_free = .true.
+    if (.not. pend(idx)%used) return
+    set_free = .false.
+    if (.not. pend(idx)%sent) return
+#ifdef USE_MPI
+    if (pend(idx)%nreq > 0) then
+      call MPI_Testall(pend(idx)%nreq, pend(idx)%reqs, flag, MPI_STATUSES_IGNORE, ierr)
+      if (ierr /= MPI_SUCCESS) error stop 'io: MPI_Testall'
+      if (.not. flag) return
+      pend(idx)%nreq = 0
+    endif
+#endif
+    set_free = .true.
+  end function set_free
+
   subroutine wait_sends(idx)
     integer, intent(in) :: idx
 #ifdef USE_MPI
@@ -526,7 +566,10 @@ contains
     integer :: iv, t, gx, gy, n3, i, j, k, n1, n2, i0, j0, off, ntile, ierr
     real(4) :: zero1(1, 1, 1)
     type(rec_t) :: r0
+    integer(8) :: ca, cb, cr
     zero1 = 0.0
+    t_ext = 0.0; t_asm = 0.0; t_put = 0.0
+    call system_clock(ca, cr)
     ntile = size(tbuf, 1)
     r0 = tmeta(0, isl)
     if (nserv > 1) then
@@ -548,8 +591,11 @@ contains
     else
       call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
     endif
+    call system_clock(cb, cr)
+    t_ext = real(cb - ca) / real(cr)
     do iv = 1, r0%nvars
       if (.not. mine(iv)) cycle
+      call system_clock(cb, cr)
       gx = 0; gy = 0; n3 = r0%n3(iv)
       do t = 0, ntile - 1
         if (trim(tmeta(t, isl)%names(iv)) /= trim(r0%names(iv))) error stop 'io_server: tiles disagree on the variable list'
@@ -573,11 +619,15 @@ contains
             enddo
           enddo
         enddo
+        call system_clock(ca, cr)
+        t_asm = t_asm + real(ca - cb) / real(cr)
         if (r0%nrank(iv) == 2) then
           call nc_put_2d_rec_d(ncid, trim(r0%names(iv)), gbuf8, gx, gy, r0%rec)
         else
           call nc_put_3d_rec_d(ncid, trim(r0%names(iv)), gbuf8, gx, gy, n3, r0%rec)
         endif
+        call system_clock(cb, cr)
+        t_put = t_put + real(cb - ca) / real(cr)
         cycle
       endif
       if (allocated(gbuf)) then
@@ -596,11 +646,15 @@ contains
           enddo
         enddo
       enddo
+      call system_clock(ca, cr)
+      t_asm = t_asm + real(ca - cb) / real(cr)
       if (r0%nrank(iv) == 2) then
         call nc_put_2d_rec_f(ncid, trim(r0%names(iv)), gbuf, gx, gy, r0%rec)
       else
         call nc_put_3d_rec_f(ncid, trim(r0%names(iv)), gbuf, gx, gy, n3, r0%rec)
       endif
+      call system_clock(cb, cr)
+      t_put = t_put + real(cb - ca) / real(cr)
     enddo
   end subroutine write_assembled
 
@@ -660,7 +714,7 @@ contains
     if (hcap8 == 0) error stop 'io_stage8_begin: io_init8 not called'
     if (hcap == 0) error stop 'io_stage8_begin: io_init not called'
     call ensure_stage8()
-    call io_stage_begin(fkind, rec, nfile, time, open_path)
+    call io_stage_begin(fkind, rec, nfile, time, open_path, dbl=.true.)
     pend(cur)%dbl = .true.
   end subroutine io_stage8_begin
 
@@ -822,7 +876,7 @@ contains
     real :: trecv(NSLOT)
     character(len=PATHLEN) :: open_name(2)
     logical :: open_pending(2)
-    integer :: c0, c1, c2, rate
+    integer :: c0, c1, c2, c3, rate
     character(len=PATHLEN) :: path
     character(len=NAMELEN * MAXV) :: namebuf
     type(rec_t) :: r
@@ -945,8 +999,12 @@ contains
           if (ncid_open(k) < 0) error stop 'io_server: record before file open'
           call system_clock(c1)
           call write_assembled(ncid_open(k), isl)
+          call system_clock(c3)
           call nc_sync(ncid_open(k))
           call system_clock(c2)
+          write(*,'(a,i0,a,i0,a,i0,a,f7.2,a,f7.2,a,f7.2,a,f7.2,a)') 'io_server: writer ', me_w, ' kind ', k, &
+               ' rec ', r%rec, ': extend ', t_ext, ' s  assemble ', t_asm, ' s  put ', t_put, &
+               ' s  sync ', real(c2 - c3) / real(rate), ' s'
           call report_written(r)
           write(*,'(a,i0,a,f7.2,a,f7.2,a)') 'io_server:   parts ', ncompute, '  recv ', trecv(isl), &
                ' s  write ', real(c2 - c1) / real(rate), ' s'
