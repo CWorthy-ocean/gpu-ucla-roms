@@ -126,7 +126,8 @@ not included; its README lists the files.
   check the GPU MARBL kernels column by column against unchanged MARBL
   (`make build_gpu/test_marbl_sflux build_gpu/test_marbl_interior` with the
   same flags as `make gpu`). The other tests exercise individual routines on
-  the CPU backend (`make tests`).
+  the CPU backend (`make tests`, gfortran); they date from the single-GPU
+  development phase and have not been kept up to date.
 
 ## Layout
 

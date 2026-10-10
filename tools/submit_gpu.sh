@@ -12,9 +12,12 @@ ROOT=${ROMS_GPU_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}   # roms
 PYTHON=${PYTHON:-python3}                                                 # gpu_layout.py needs only the standard library
 GPUS_PER_NODE=${GPUS_PER_NODE:-4}
 SCRIPT=$1; shift
-CASE=$(grep -E '^CASE=' "$SCRIPT" | head -1 | sed -E 's/^CASE=//; s/^"//; s/"$//' || true)
-NML=$(grep -E '^NML=' "$SCRIPT" | head -1 | sed -E 's/^NML=//; s/^"//; s/"$//')
+# value of a VAR= line in the job script, without a trailing comment or quotes
+value() { grep -E "^$1=" "$SCRIPT" | head -1 | sed -E "s/^$1=//; s/[[:space:]]+#.*\$//; s/^\"//; s/\"\$//" || true; }
+CASE=$(value CASE)
+NML=$(value NML)
 NML=${NML//'${CASE}'/$CASE}
+[ -f "$NML" ] || { echo "submit_gpu.sh: namelist not found: '$NML' (from the NML= line of $SCRIPT)" >&2; exit 1; }
 EXTRA=""
 NWOPT=""
 for a in "$@"; do
@@ -23,6 +26,8 @@ for a in "$@"; do
     *) EXTRA="${EXTRA},${a}" ;;
   esac
 done
-read NTILE NW NRANKS SELECT <<< "$($PYTHON "$ROOT/tools/gpu_layout.py" "$NML" --gpus-per-node $GPUS_PER_NODE $NWOPT)"
+LAYOUT=$($PYTHON "$ROOT/tools/gpu_layout.py" "$NML" --gpus-per-node $GPUS_PER_NODE $NWOPT)
+read NTILE NW NRANKS SELECT <<< "$LAYOUT"
+[ -n "$SELECT" ] || { echo "submit_gpu.sh: gpu_layout.py gave no layout for $NML" >&2; exit 1; }
 echo "layout: $NTILE compute ranks + $NW writer(s) = $NRANKS ranks; select=$SELECT"
 qsub -l select=$SELECT -v "ROMS_GPU_PROBES=0,NRANKS=${NRANKS},NUMA_BIND_NRANKS=${NTILE}${EXTRA}" "$SCRIPT"
