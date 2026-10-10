@@ -26,6 +26,7 @@ module nc_io
   public :: nc_read_3d
   public :: nc_def_dim
   public :: nc_def_var
+  public :: nc_def_var_i, nc_put_ints_rec
   public :: nc_enddef
   public :: nc_put_2d
   public :: nc_put_3d
@@ -258,6 +259,13 @@ contains
     call nc_chunk_one_record(ncid, varid, dimids)
   end function nc_def_var
 
+  integer function nc_def_var_i(ncid, name, dimids) result(varid)
+    ! Integer variable (time_step in restart files).
+    integer,          intent(in) :: ncid, dimids(:)
+    character(len=*), intent(in) :: name
+    call nc_check(nf90_def_var(ncid, trim(name), nf90_int, dimids, varid), 'def_var '//trim(name))
+  end function nc_def_var_i
+
   integer function nc_def_var_f(ncid, name, dimids) result(varid)
     ! Single-precision variable (history output), chunked as one record:
     ! the full spatial extents and 1 along the unlimited dimension, so a
@@ -389,6 +397,17 @@ contains
     call nc_check(nf90_put_var(ncid, varid, buf, start=(/rec/), count=(/1/)), &
                   'putrec '//trim(name))
   end subroutine nc_put_1d_rec
+
+  subroutine nc_put_ints_rec(ncid, name, vals, rec)
+    ! Integer vector vals(:) into record rec of a (n, time) variable.
+    integer,          intent(in) :: ncid, rec
+    character(len=*), intent(in) :: name
+    integer,          intent(in) :: vals(:)
+    integer :: varid
+    call nc_check(nf90_inq_varid(ncid, trim(name), varid), 'inq '//trim(name))
+    call nc_check(nf90_put_var(ncid, varid, vals, start=(/1, rec/), count=(/size(vals), 1/)), &
+                  'putrec '//trim(name))
+  end subroutine nc_put_ints_rec
 
   subroutine nc_put_2d_rec(ncid, name, arr, rec, i0f, j0f)
     integer,          intent(in) :: ncid, rec

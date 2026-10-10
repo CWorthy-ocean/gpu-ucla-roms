@@ -17,6 +17,7 @@ module marbl_gpu
 #endif
   use nc_io
   use frc_io, only: init_bgc_forcing, set_bgc_forces, uwnd, vwnd, bgc_frc_on
+  use run_timers, only: rt_dev_begin, rt_dev_end
   use passive_mod, only: ntp, tp, set_passive_marbl, passive_marbl, passive_name
   use marbl_host
   use marbl_sflux_mod
@@ -159,6 +160,7 @@ contains
     tfrc = frc_modtime()
     frc_slot = islot
     call set_bgc_forces(tfrc, sf_dust, sf_iron, sf_nox, sf_nhy, sf_xco2, sf_xco2_alt)
+    call rt_dev_begin()     ! MARBL proper, as the CPU's marbldrv_column_physics timer
     ! wind speed squared (bulk winds on the device) and shortwave in W/m2
     CUF_DO2
     do j = 1, ny
@@ -182,6 +184,7 @@ contains
     call marbl_carbonate_compute(ntp, nz, nn, 3_ip, tp, nt, t, z_r, rmask)
     if (his_staged) call marbl_zsat_compute(nz, z_r, z_w, rmask)
     call marbl_interior_compute(ntp, nz, nn, 3_ip, tp, nt, t, z_r, z_w, Hz, rmask, sf_dust, dtm, .false.)
+    call rt_dev_end()
     ncalls = ncalls + 1
     if (ncalls <= 3 .or. mod(ncalls, 24) == 0) then
       ! failure counts as a device reduction (its result waits for the

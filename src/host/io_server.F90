@@ -44,7 +44,7 @@ module io_server
   integer, parameter, public :: IO_KIND_HIS = 1, IO_KIND_RST = 2
   integer, parameter :: CMD_OPEN = 1, CMD_PUT = 2, CMD_QUIT = 3
   integer, parameter :: TAG_CMD = 900, TAG_STR = 901, TAG_TIME = 902, TAG_DATA = 910
-  integer, parameter :: MAXV = 96, NAMELEN = 32, PATHLEN = 512   ! MARBL: 32 tracers + diagnostics
+  integer, parameter :: MAXV = 256, NAMELEN = 32, PATHLEN = 512   ! variables per record: up to ~240 tracers
   integer, parameter :: MAXW = 16                                 ! max writer ranks
   integer, parameter :: NHDR = 8 + 6 * MAXV
   integer, parameter :: NSET = 2
@@ -53,6 +53,7 @@ module io_server
     logical :: used = .false., sent = .false.
     integer :: fkind = 0, rec = 0, nfile = 0, nvars = 0, nfloat = 0
     integer :: seq = 0                       ! staging order (dispatch in this order)
+    integer :: tstep = 0                     ! model step (iic) of a restart record, for time_step
     logical :: dbl = .false.                 ! real(8) record (restart)
     real(rp) :: time = 0.0_rp
     character(len=PATHLEN) :: open_path = ''
@@ -153,11 +154,12 @@ contains
     endif
   end subroutine io_init
 
-  subroutine io_stage_begin(fkind, rec, nfile, time, open_path, dbl)
+  subroutine io_stage_begin(fkind, rec, nfile, time, open_path, dbl, tstep)
     integer, intent(in) :: fkind, rec, nfile
     real(rp), intent(in) :: time
     character(len=*), intent(in) :: open_path
     logical, intent(in), optional :: dbl
+    integer, intent(in), optional :: tstep
     integer :: idx
     logical :: is_dbl
     if (hcap == 0) error stop 'io_stage_begin: io_init not called'
@@ -187,6 +189,7 @@ contains
     pend(idx)%nfile = nfile
     pend(idx)%time = time
     pend(idx)%open_path = open_path
+    if (present(tstep)) pend(idx)%tstep = tstep
     cur = idx
   end subroutine io_stage_begin
 
@@ -546,6 +549,17 @@ contains
     pend(idx)%nreq = 0
   end subroutine wait_sends
 
+  subroutine put_time_step(ncid, r)
+    ! Restart records: time_step(1:6, rec) = (iic, rec, rec, 0, 0, 0), the CPU
+    ! model's layout; a reader takes ntstart = time_step(1) + 1 and checks
+    ! that the two records of an exact restart are one step apart.
+    integer, intent(in) :: ncid
+    type(rec_t), intent(in) :: r
+    if (r%fkind /= IO_KIND_RST .or. r%tstep <= 0) return
+    if (.not. nc_has_var(ncid, 'time_step')) return
+    call nc_put_ints_rec(ncid, 'time_step', (/r%tstep, r%rec, r%rec, 0, 0, 0/), r%rec)
+  end subroutine put_time_step
+
   subroutine pack_hdr(r, hdr)
     type(rec_t), intent(in) :: r
     integer, intent(out) :: hdr(NHDR)
@@ -555,6 +569,7 @@ contains
     hdr(2) = r%fkind
     hdr(3) = r%rec
     hdr(4) = r%nvars
+    hdr(5) = r%tstep
     hdr(6) = r%nfile
     hdr(7) = merge(1, 0, r%dbl)
     do iv = 1, r%nvars
@@ -655,6 +670,7 @@ contains
       ! owners write their variables independently and in parallel.
       call nc_set_par_access(ncid, .true.)
       call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
+      call put_time_step(ncid, r0)
       do iv = 1, r0%nvars
         if (r0%nrank(iv) == 2) then
           call nc_put_2d_rec_f(ncid, trim(r0%names(iv)), zero1, 1, 1, r0%rec, me_w + 1, 1)
@@ -666,6 +682,7 @@ contains
       call nc_set_par_access(ncid, .false.)
     else
       call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
+      call put_time_step(ncid, r0)
     endif
     call system_clock(cb, cr)
     t_ext = real(cb - ca) / real(cr)
@@ -758,6 +775,7 @@ contains
     real(8), intent(in) :: buf(*)
     integer :: iv, off
     call nc_put_1d_rec(ncid, 'ocean_time', r%time, r%rec)
+    call put_time_step(ncid, r)
     do iv = 1, r%nvars
       off = r%off(iv)
       if (r%nrank(iv) == 2) then
@@ -783,14 +801,15 @@ contains
     if (.not. allocated(dstage8)) allocate(dstage8(dcap8))
   end subroutine ensure_stage8
 
-  subroutine io_stage8_begin(fkind, rec, nfile, time, open_path)
+  subroutine io_stage8_begin(fkind, rec, nfile, time, open_path, tstep)
     integer, intent(in) :: fkind, rec, nfile
+    integer, intent(in), optional :: tstep
     real(rp), intent(in) :: time
     character(len=*), intent(in) :: open_path
     if (hcap8 == 0) error stop 'io_stage8_begin: io_init8 not called'
     if (hcap == 0) error stop 'io_stage8_begin: io_init not called'
     call ensure_stage8()
-    call io_stage_begin(fkind, rec, nfile, time, open_path, dbl=.true.)
+    call io_stage_begin(fkind, rec, nfile, time, open_path, dbl=.true., tstep=tstep)
     pend(cur)%dbl = .true.
   end subroutine io_stage8_begin
 
@@ -901,6 +920,7 @@ contains
     real(4), intent(in) :: buf(*)
     integer :: iv, off
     call nc_put_1d_rec(ncid, 'ocean_time', r%time, r%rec)
+    call put_time_step(ncid, r)
     do iv = 1, r%nvars
       off = r%off(iv)
       if (r%nrank(iv) == 2) then
@@ -950,6 +970,7 @@ contains
 #ifdef USE_MPI
     integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), src, comm, iv, off, n, b, k, ntot, nquit, ncompute, isl
     real :: trecv(NSLOT)
+    integer(8) :: c_start, c_end, rate_end
     character(len=PATHLEN) :: open_name(2)
     logical :: open_pending(2)
     integer :: c0, c1, c2, c3, rate
@@ -965,6 +986,7 @@ contains
     me_g = mod(me_w, wgroup_size)
     call MPI_Comm_split(comm_writers(), my_group, me_w, gcomm, ierr)
     if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Comm_split groups'
+    call system_clock(c_start)
     trecv = 0.0
     nquit = 0
     open_name = ''
@@ -1024,6 +1046,7 @@ contains
         r%fkind = hdr(2)
         r%rec = hdr(3)
         r%nvars = hdr(4)
+        r%tstep = hdr(5)
         r%nfile = hdr(6)
         call MPI_Recv(namebuf, NAMELEN * MAXV, MPI_CHARACTER, src, TAG_STR, comm, stat, ierr)
         call MPI_Recv(r%time, 1, MPI_DOUBLE_PRECISION, src, TAG_TIME, comm, stat, ierr)
@@ -1113,7 +1136,9 @@ contains
           if (ncid_open(k) >= 0) call nc_close(ncid_open(k))
           ncid_open(k) = -1
         enddo
-        write(*,'(a)') 'io_server: done'
+        call system_clock(c_end, rate_end)
+        write(*,'(a,i0,a,f10.2,a)') 'io_server: writer ', me_w, ' done  t = ', &
+             real(c_end - c_start, 8) / real(rate_end, 8), ' s since the server started'
         flush(6)
         exit
       case default

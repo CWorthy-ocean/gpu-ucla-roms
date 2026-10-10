@@ -36,7 +36,8 @@ override FFLAGS_GPU  += $(FFLAGS_MPI) $(NETCDF_FFLAGS)
 LIBS        ?= $(NETCDF_FLIBS)
 
 SRC_SHARED = src/shared/kinds.F90 src/shared/decomp.F90 src/shared/tile_balance.F90 src/shared/arch.F90 \
-             src/shared/comm.F90 src/shared/formulas.F90 src/shared/time_state.F90
+             src/shared/comm.F90 src/shared/formulas.F90 src/shared/time_state.F90 \
+             src/shared/run_timers.F90
 SRC_DEV    = src/device/gpu_state.F90 src/device/column_solve.F90 src/device/halo.F90 src/device/geom.F90 \
              src/device/obc.F90 src/device/step2d.F90 src/device/prsgrd.F90 \
              src/device/advect.F90 src/device/rho_eos.F90 src/device/uv_rhs.F90 \

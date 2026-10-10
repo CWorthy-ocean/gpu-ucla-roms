@@ -36,6 +36,7 @@ module comm_mod
   public :: comm_sendrecv_dev
   public :: comm_post_dev, comm_wait_dev
   public :: comm_min_real
+  public :: comm_reduce_maxsum
   public :: comm_gpu_direct
   public :: comm_exchange3
   public :: have_io_server
@@ -335,6 +336,22 @@ contains
     comm_min_real = x
 #endif
   end function comm_min_real
+
+  subroutine comm_reduce_maxsum(n, x, xmax, xsum)
+    ! Max and sum of x(1:n) over the compute ranks, on compute rank 0
+    ! (x itself without MPI).
+    integer, intent(in) :: n
+    real(8), intent(in) :: x(n)
+    real(8), intent(out) :: xmax(n), xsum(n)
+#ifdef USE_MPI
+    integer :: ierr
+    if (.not. ready) call init_comm()
+    call MPI_Reduce(x, xmax, n, MPI_DOUBLE_PRECISION, MPI_MAX, 0, compute_comm, ierr)
+    call MPI_Reduce(x, xsum, n, MPI_DOUBLE_PRECISION, MPI_SUM, 0, compute_comm, ierr)
+#else
+    xmax = x; xsum = x
+#endif
+  end subroutine comm_reduce_maxsum
 
   subroutine comm_wait_dev(req)
     integer, intent(inout) :: req(4)

@@ -11,6 +11,7 @@ module his_io
   use io_server, only: io_init8, io_stage8_begin, io_stage8_2d, io_stage8_3d, io_stage8_3d_pt, io_stage8_end
   use comm_mod, only: have_io_server
   use comm_mod, only: comm_rank, comm_size, compute_barrier
+  use run_timers, only: rt_tic, rt_toc, rt_mark_rst, RT_HIS, RT_RST
   use passive_mod, only: ntp, tp, wrt_passive, passive_name
   use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
                        marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
@@ -158,15 +159,24 @@ contains
     if (wrt_file_his) then
       output_time_his = output_time_his + dt
       if (output_time_his + 1.0e-8_rp >= output_period_his) then
+        call rt_tic(RT_HIS)
         call wrt_his(.false.)
+        call rt_toc(RT_HIS)
         output_time_his = 0.0_rp
       endif
     endif
     if (wrt_file_rst) then
+      ! Exact restart (CPU EXACT_RESTART): write the step before the restart
+      ! time as well as the restart step, two consecutive records in one
+      ! file (nrpf_rst = 2), so a restarted run takes the exact first step.
       output_time_rst = output_time_rst + dt
-      if (output_time_rst + 1.0e-8_rp >= output_period_rst) then
+      if (output_time_rst + 1.0e-8_rp >= output_period_rst .or. &
+          output_time_rst + dt + 1.0e-8_rp >= output_period_rst) then
+        call rt_mark_rst()
+        call rt_tic(RT_RST)
         call wrt_rst()
-        output_time_rst = 0.0_rp
+        call rt_toc(RT_RST)
+        if (output_time_rst + 1.0e-8_rp >= output_period_rst) output_time_rst = 0.0_rp
       endif
     endif
   end subroutine maybe_wrt_output
@@ -264,7 +274,7 @@ contains
       ! staged double-precision record: the server assembles the tiles and
       ! writes each variable once; the compute ranks continue.
       nz = decomp%nz; is = decomp%is; js = decomp%js
-      call io_stage8_begin(IO_KIND_RST, rec_rst, nfile_rst, twrite, open_rst)
+      call io_stage8_begin(IO_KIND_RST, rec_rst, nfile_rst, twrite, open_rst, tstep=iic)
       call io_stage8_2d('zeta', zeta(is, js, n2), ir0, ir1, jr0, jr1, ir0, jr0)
       call io_stage8_2d('ubar', ubar(is, js, n2), iu0, iu1, jr0, jr1, 0, jr0)
       call io_stage8_2d('vbar', vbar(is, js, n2), ir0, ir1, jv0, jv1, ir0, 0)
@@ -297,6 +307,7 @@ contains
     if (ir == comm_rank()) then
     call nc_open_write(fname_rst, ncid)
     call nc_put_1d_rec(ncid, 'ocean_time', twrite, rec_rst)
+    call nc_put_ints_rec(ncid, 'time_step', (/iic, rec_rst, rec_rst, 0, 0, 0/), rec_rst)
     call put_r2(ncid, 'zeta', zeta(:,:,n2), rec_rst)
     call put_u2(ncid, 'ubar', ubar(:,:,n2), rec_rst)
     call put_v2(ncid, 'vbar', vbar(:,:,n2), rec_rst)
@@ -370,7 +381,7 @@ contains
 
   subroutine create_rst_file(path)
     character(len=*), intent(in) :: path
-    integer :: itp, ncid, d_t, d_xi, d_eta, d_xiu, d_etav, d_s, id
+    integer :: itp, ncid, d_t, d_xi, d_eta, d_xiu, d_etav, d_s, d_aux, id
     call ensure_parent(path)
     call nc_create(trim(path), ncid)
     d_t = nc_def_dim(ncid, 'ocean_time', 0)
@@ -379,7 +390,9 @@ contains
     d_xiu = nc_def_dim(ncid, 'xi_u', gxi_u)
     d_etav = nc_def_dim(ncid, 'eta_v', geta_v)
     d_s = nc_def_dim(ncid, 's_rho', decomp%nz)
+    d_aux = nc_def_dim(ncid, 'auxil', 6)
     id = nc_def_var(ncid, 'ocean_time', (/d_t/))
+    id = nc_def_var_i(ncid, 'time_step', (/d_aux, d_t/))   ! as the CPU model: (iic, rec, nrec, 0, 0, 0)
     id = nc_def_var(ncid, 'zeta', (/d_xi, d_eta, d_t/))
     id = nc_def_var(ncid, 'ubar', (/d_xiu, d_eta, d_t/))
     id = nc_def_var(ncid, 'vbar', (/d_xi, d_etav, d_t/))

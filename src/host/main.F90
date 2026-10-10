@@ -12,6 +12,8 @@ program roms_gpu
   use passive_mod, only: passive_exchange_finish
   use halo_mod, only: hg_audit_report
   use frc_io, only: frc_prefetch_drain
+  use run_timers, only: rt_tic, rt_toc, rt_report, rt_nsteps, RT_LOOP, RT_OUTPUT, RT_FINAL, RT_INIT, &
+                        rt_steps_init, rt_step_begin, rt_step_end
   implicit none
 
   integer(ip) :: gnx, gny, nz, halo, npx, npy, rank
@@ -30,6 +32,7 @@ program roms_gpu
     stop
   endif
   call wall_stamp('start')
+  call rt_tic(RT_INIT)
   call select_device(comm_rank())
   call init_arch()
 
@@ -58,12 +61,25 @@ program roms_gpu
     write(*,'(a,2l2)') '  pot,bry tides = ', pot_tides, bry_tides
     call report_loaded_case()
     if (trim(mode) == 'run') then
+      call rt_toc(RT_INIT)
+      call rt_steps_init(max(ntimes, 1))
+      call rt_tic(RT_LOOP)
       do istep = 1, max(ntimes, 1)
         iic = ntstart + istep - 1
+        call rt_step_begin()
         call run_baroclinic_step()
+        call rt_tic(RT_OUTPUT)
         call maybe_wrt_output()
+        call rt_toc(RT_OUTPUT)
+        rt_nsteps = rt_nsteps + 1
+        call rt_step_end()
       enddo
+      call rt_toc(RT_LOOP)
+      call wall_stamp('loop done')
+      call rt_tic(RT_FINAL)
       call io_finalize()
+      call rt_toc(RT_FINAL)
+      call rt_report()
     endif
   else
   call init_decomp(gnx, gny, nz, halo, npx, npy, rank, .true., .true.)

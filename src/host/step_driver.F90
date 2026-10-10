@@ -24,6 +24,7 @@ module step_driver
   use frc_io, only: set_forces, frc_prefetch
   use bry_io, only: set_bry_all, dump_bry_north
   use tide_io, only: set_tides
+  use run_timers, only: rt_dev_collect
   use arch_mod, only: sync_arch
   implicit none
   private
@@ -212,6 +213,7 @@ contains
       write(*,'(a,es14.6)') 'step: max hbls = ', hblmax
     endif
     call step_mark('baroclinic step')
+    call rt_dev_collect()        ! the device is drained here
   end subroutine run_baroclinic_step
 
   subroutine run_barotropic_only()
