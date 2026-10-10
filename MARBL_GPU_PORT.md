@@ -48,7 +48,7 @@ domain before any tuning (255 registers, 3.3 kB stack per thread in K2).
 Cases: GPU `cases/GPU/namelist_roms_gpu_marbl.nml`; CPU reference and
 perturbed twin (initial T + 1e-6 degC pattern) in `cases/CPU_marbl`
 (same dycore sources as the matched CPU case, MARBL/NOX/NHY/PCO2AIR
-enabled). Evaluation `scratchpad/marbl_noise_floor_eval.py`: RMS over wet
+enabled). Evaluation `tools/marbl_noise_floor_eval.py`: RMS over wet
 points of (GPU - ref) and (twin - ref), ratio = GPU/twin.
 
 Result (first full run): every one of the 32 tracers stays inside the CPU
@@ -255,7 +255,7 @@ is why the earlier single-rank validation never caught them):
 
 How they were found: per-step history runs of both cases
 (`output_period_his = 900`, cases `4r1`/`4q1`) and
-`scratchpad/seam_map.py <rec>`, which counts differing columns per field
+`tools/seam_map.py <rec>` (development repository only), which counts differing columns per field
 by signed offset from the seams (file i = 257, j = 217 for MiniPac). The
 first record that differs, the fields in it and the offset pattern
 (e.g. hbls differing at W nx-1, nx and E 1 only; vbar zero at the
@@ -969,7 +969,7 @@ of which ~85 ms MARBL kernels) and ~35 ms around the forcing step.
 
 A read-only review ranked the remaining bit-identical work by measured
 kernel time. Four agents then each worked in their own copy of the tree on
-disjoint files, under a common brief (`scratchpad/AGENT_BRIEF.md`), while I
+disjoint files, under a common written brief, while I
 did the exchange and fast-loop items. A change was kept only if it passed
 four tests: MiniPac 1x1 and 2x2 4-step, Pac 4x2 4-step, and MiniPac 2x2
 3-day. The merged build was then retested on the full set.
@@ -1123,7 +1123,7 @@ stepping ~64 s + ~107 s after the last step (writer backlog plus shutdown).
 | A4: non-blocking part receives | No measurable gain. |
 | A5: fixed 24-stripe output directory | Worse: record 3 took 34 s put + 22 s sync. |
 
-**Write benchmark** (`scratchpad/iobench/wbench.f90`): netCDF-4 parallel,
+**Write benchmark** (a standalone Fortran program, not in the repository): netCDF-4 parallel,
 writers' pattern, 14 GB per file.
 
 | Case | Aggregate |
