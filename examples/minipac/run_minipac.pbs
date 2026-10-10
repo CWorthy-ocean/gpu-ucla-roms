@@ -1,0 +1,38 @@
+#!/bin/bash
+# roms_gpu example: MiniPac with MARBL, 2 x 2 tiles on one 4-GPU node.
+#
+# Submit with the layout-aware launcher, which sets the PBS select line and
+# NRANKS (4 GPU ranks + the writer ranks for this namelist) for you:
+#   tools/submit_gpu.sh examples/minipac/run_minipac.pbs
+# or qsub it directly with the defaults below (6 ranks = 4 GPU + 2 writers).
+#PBS -N minipac_gpu
+#PBS -A <your_project>
+#PBS -q <gpu_queue>
+#PBS -l walltime=00:15:00
+#PBS -l select=1:ncpus=64:mpiprocs=6:ngpus=4
+#PBS -j oe
+
+set -euo pipefail
+ulimit -s unlimited
+
+# ---- settings: edit for your system ----
+ROMS_GPU=/path/to/roms_gpu                        # this checkout
+CASE=/path/to/roms_gpu/examples/minipac           # this directory (needs input_data/, see README.md)
+NML=${CASE}/namelist_minipac_marbl.nml
+EXE=${EXE:-${ROMS_GPU}/build_gpu/roms_gpu_cuda}
+
+# Environment: the modules the model was built with (these are Derecho's).
+module --force purge
+module load ncarenv nvhpc cuda cray-mpich netcdf-mpi
+export LD_LIBRARY_PATH="$(nf-config --prefix)/lib:${NETCDF:-}/lib:${NETCDF:-}/lib64:${LD_LIBRARY_PATH:-}"
+# GPU-to-GPU halo exchange through CUDA-aware MPI (Cray MPICH; the build
+# links libmpi_gtl_cuda). With an MPI that is not CUDA-aware, leave this
+# unset: halos then go through pinned host memory.
+export MPICH_GPU_SUPPORT_ENABLED=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+cd "${CASE}"
+mkdir -p output
+# Ranks: np_xi x np_eta GPU ranks first, every extra rank is a writer.
+# numa_bind.sh pins each GPU rank to the CPU cores next to its GPU (optional).
+mpiexec -n ${NRANKS:-6} --cpu-bind none "${ROMS_GPU}/tools/numa_bind.sh" "${EXE}" run "${NML}"

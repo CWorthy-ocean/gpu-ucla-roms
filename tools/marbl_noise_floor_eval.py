@@ -27,8 +27,12 @@ import sys
 import netCDF4 as nc
 import numpy as np
 
-B = "/glade/derecho/scratch/bachman/roms_marbl_setup_assistant/cases/"
-grd = nc.Dataset(B + "MiniPac/input_data/PACMED12km_v2ni_grid.nc")
+# ---- settings: edit here, or set the environment variable ----
+CASES = os.environ.get("ROMS_GPU_CASES", "/path/to/cases")             # root of the case directories
+GRID = os.environ.get("ROMS_GPU_GRID", os.path.join(CASES, "MiniPac/input_data/PACMED12km_v2ni_grid.nc"))
+GPU_OUT = os.path.join(CASES, "GPU/output/minipac_gpu_marbl")          # GPU file prefix (before <tag>)
+CPU_OUT = os.path.join(CASES, "CPU_marbl/output/minipac_cpu_marbl")    # CPU file prefix (before <tag>)
+grd = nc.Dataset(GRID)
 mr = grd["mask_rho"][:] > 0.5
 S = (slice(1, -1), slice(1, -1))
 wet = mr[S]
@@ -84,8 +88,8 @@ class Source:
         return len(self.index.get(v, []))
 
 
-G = B + "GPU/output/minipac_gpu_marbl" + (TAG if GTAG is None else GTAG)
-C = B + "CPU_marbl/output/minipac_cpu_marbl" + TAG
+G = GPU_OUT + (TAG if GTAG is None else GTAG)
+C = CPU_OUT + TAG
 gpu = Source([G + "_his.nc", G + "_his_[0-9][0-9][0-9][0-9].nc"])
 ref = Source([C + "_bgc.*.nc", C + "_bgc_dia.*.nc", C + "_his.*.nc"])
 pert = Source([C + "_pert_bgc.*.nc", C + "_pert_bgc_dia.*.nc", C + "_pert_his.*.nc"])

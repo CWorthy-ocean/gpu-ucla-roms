@@ -3,14 +3,16 @@ the run for every MARBL tracer and surface diagnostic.
 
 usage: python marbl_his_sanity.py <his.nc> [surface-level-only]
 """
+import os
 import sys
 import netCDF4 as nc
 import numpy as np
 
 f = nc.Dataset(sys.argv[1])
 surf_only = len(sys.argv) > 2
-B = "/glade/derecho/scratch/bachman/roms_marbl_setup_assistant/cases/"
-grd = nc.Dataset(B + "MiniPac/input_data/PACMED12km_v2ni_grid.nc")
+# ---- settings: edit here, or set the environment variable ----
+GRID = os.environ.get("ROMS_GPU_GRID", "/path/to/grid.nc")   # the run's grid file (mask_rho)
+grd = nc.Dataset(GRID)
 wet = grd["mask_rho"][:] > 0.5
 tdim = 'ocean_time' if 'ocean_time' in f.dimensions else 'time'
 nrec = len(f.dimensions[tdim])

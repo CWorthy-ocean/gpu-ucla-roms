@@ -7,13 +7,18 @@ For each hour, RMS differences from the CPU reference day run of:
 and the ratio gpu/pert. A ratio near or below 1 means the GPU-CPU difference
 is no larger than what a tiny perturbation produces in the CPU model itself.
 """
+import os
 import sys
 
 import netCDF4 as nc
 import numpy as np
 
-B = "/glade/derecho/scratch/bachman/roms_marbl_setup_assistant/cases/"
-grd = nc.Dataset(B + "MiniPac/input_data/PACMED12km_v2ni_grid.nc")
+# ---- settings: edit here, or set the environment variable ----
+CASES = os.environ.get("ROMS_GPU_CASES", "/path/to/cases")    # root of the case directories
+GRID = os.environ.get("ROMS_GPU_GRID", os.path.join(CASES, "MiniPac/input_data/PACMED12km_v2ni_grid.nc"))
+CPU_DIR = os.path.join(CASES, "CPU/output")                    # CPU reference and perturbed day runs
+GPU_HIS = os.path.join(CASES, "GPU/output/minipac_gpu_day_his.nc")
+grd = nc.Dataset(GRID)
 S = (slice(1, -1), slice(1, -1))
 h = grd["h"][:][S]
 mr = grd["mask_rho"][:][S] > 0.5
@@ -22,14 +27,14 @@ deep = mr & (h > 2000)
 
 
 def cpu(root):
-    f1 = nc.Dataset(B + f"CPU/output/{root}_his.20100330000000.nc")
-    f2 = nc.Dataset(B + f"CPU/output/{root}_his.20100331000000.nc")
+    f1 = nc.Dataset(os.path.join(CPU_DIR, f"{root}_his.20100330000000.nc"))
+    f2 = nc.Dataset(os.path.join(CPU_DIR, f"{root}_his.20100331000000.nc"))
     return lambda v, n: (f1[v][n] if n < 24 else f2[v][0])
 
 
 ref = cpu("minipac_cpu_day")
 pert = cpu("minipac_cpu_day_pert")
-gd = nc.Dataset(B + "GPU/output/minipac_gpu_day_his.nc")
+gd = nc.Dataset(GPU_HIS)
 gpu = lambda v, n: gd[v][n]
 
 

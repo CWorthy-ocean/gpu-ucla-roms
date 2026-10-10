@@ -1,0 +1,150 @@
+! roms_gpu example: MiniPac (tropical Pacific, 512 x 432 x 100) with MARBL
+! (32 tracers, MARBL called hourly), 2 x 2 tiles on one 4-GPU node.
+! dt = 900 s, ntimes = 288 -> 3 days. 6-hourly history, restart at day 3.
+! Paths are relative to this file: put (or link) the MiniPac input files in
+! input_data/ (see README.md). inifile is a spun-up restart from the CPU
+! model; input_data/PACMED12km_v2ni_initial_conditions.nc starts from the
+! Jan 1 initial conditions instead.
+
+&param_settings
+    llm = 512
+    mmm = 432
+    nz = 100
+    np_xi = 2
+    np_eta = 2
+    nt_passive = 0
+    nt_bgc = 32
+    ntrc_bio = 0
+/
+
+&grid_settings
+    grdname = 'input_data/PACMED12km_v2ni_grid.nc'
+/
+
+&initial_conditions
+    inifile = 'input_data/minipac_rst.20100330000000.nc'
+/
+
+&s_coord
+    hc = 250.0
+    theta_b = 6.0
+    theta_s = 6.0
+/
+
+&time_stepping
+    dt = 900.0
+    ndtfast = 60
+    ninfo = 1
+    ntimes = 288
+/
+
+&rho0_settings
+    rho0 = 1000.0
+/
+
+&ubind_settings
+    ubind = 0.1
+/
+
+&bottom_drag_settings
+    rdrg = 0.0
+    rdrg2 = 0.001
+    zob = 0.01
+/
+
+&lateral_visc_settings
+    visc2 = 0.0
+/
+
+&v_sponge_settings
+    v_sponge = 1250.0
+/
+
+&vertical_mixing_settings
+    akt_bak = 0.0, 0.0
+    akv_bak = 0.0
+/
+
+&forcing_files
+    frcfiles = 'input_data/PACMED12km_v2ni_surface-restoring_clim.nc',
+               'input_data/PACMED12km_v2ni_surface-physics_200912.nc',
+               'input_data/PACMED12km_v2ni_surface-physics_201001.nc',
+               'input_data/PACMED12km_v2ni_surface-physics_201002.nc',
+               'input_data/PACMED12km_v2ni_surface-physics_201003.nc',
+               'input_data/PACMED12km_v2ni_surface-physics_201004.nc',
+               'input_data/PACMED12km_v2ni_surface-physics_201005.nc',
+               'input_data/PACMED12km_v2ni_surface-physics_201006.nc',
+               'input_data/PACMED12km_v2ni_surface-physics_201007.nc',
+               'input_data/PACMED12km_v2ni_boundary-physics_200912.nc',
+               'input_data/PACMED12km_v2ni_boundary-physics_201001.nc',
+               'input_data/PACMED12km_v2ni_boundary-physics_201002.nc',
+               'input_data/PACMED12km_v2ni_boundary-physics_201003.nc',
+               'input_data/PACMED12km_v2ni_boundary-physics_201004.nc',
+               'input_data/PACMED12km_v2ni_boundary-physics_201005.nc',
+               'input_data/PACMED12km_v2ni_boundary-physics_201006.nc',
+               'input_data/PACMED12km_v2ni_boundary-physics_201007.nc',
+               'input_data/PACMED12km_v2ni_tidal.nc',
+               'input_data/PACMED12km_v2ni_surface-bgc-unified_clim.nc',
+               'input_data/PACMED12km_v2ni_surface-bgc-mbl_co2_2009.nc',
+               'input_data/PACMED12km_v2ni_surface-bgc-mbl_co2_2010.nc',
+               'input_data/PACMED12km_v2ni_boundary-bgc-unified_clim.nc'
+/
+
+&surf_frc_settings
+    check_bulk_frc_units = .false.
+    interp_bulk_frc = .false.
+    interp_flux_frc = .true.
+/
+
+&tidal_frc_settings
+    ana_tides = .false.
+    bry_tides = .true.
+    ntides = 15
+    pot_tides = .true.
+/
+
+&simulation_name_settings
+    output_root_name = './output/minipac_marbl'
+    title = 'roms_gpu example: MiniPac 3 days with MARBL, 2x2 tiles on 4 GPUs'
+/
+
+&basic_output_settings
+    monthly_restarts = .false.
+    nrpf_avg = 1
+    nrpf_his = 100
+    output_period_avg = 604800.0
+    output_period_his = 21600.0
+    output_period_rst = 259200.0
+    wrt_file_avg = .false.
+    wrt_file_his = .true.
+    wrt_file_rst = .true.
+    wrt_z = .true.
+    wrt_ub = .true.
+    wrt_vb = .true.
+    wrt_u = .true.
+    wrt_v = .true.
+    wrt_r = .true.
+    wrt_o = .false.
+    wrt_w = .false.
+    wrt_akv = .true.
+    wrt_akt = .true.
+    wrt_aks = .false.
+    wrt_hbls = .true.
+    wrt_hbbl = .true.
+/
+
+&ts_output_settings
+    wrt_salt = .true.
+    wrt_temp = .true.
+    wrt_salt_dia = .false.
+    wrt_temp_dia = .false.
+/
+
+&marbl_biogeochemistry_settings
+    marbl_config_file = 'marbl_in'
+    marbl_timestep = 3600.0
+/
+
+&passive_tracers
+    write_passive = .true.
+/

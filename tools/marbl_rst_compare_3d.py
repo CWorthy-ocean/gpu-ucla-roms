@@ -1,16 +1,23 @@
 """Day-3 restart (double precision) noise-floor comparison: GPU vs CPU ref,
 with the CPU perturbed twin as the floor. Last time record of the CPU
 restarts (EXACT_RESTART writes two)."""
+import os
 import sys
 import netCDF4 as nc
 import numpy as np
 TAG = sys.argv[1] if len(sys.argv) > 1 else "3d"   # GPU run tag (minipac_gpu_marbl<TAG>_rst.nc)
-B = "/glade/derecho/scratch/bachman/roms_marbl_setup_assistant/cases/"
-grd = nc.Dataset(B + "MiniPac/input_data/PACMED12km_v2ni_grid.nc")
+# ---- settings: edit here, or set the environment variable ----
+CASES = os.environ.get("ROMS_GPU_CASES", "/path/to/cases")             # root of the case directories
+GRID = os.environ.get("ROMS_GPU_GRID", os.path.join(CASES, "MiniPac/input_data/PACMED12km_v2ni_grid.nc"))
+GPU_OUT = os.path.join(CASES, "GPU/output/minipac_gpu_marbl")          # GPU file prefix (before <tag>)
+CPU_OUT = os.path.join(CASES, "CPU_marbl/output/minipac_cpu_marbl")    # CPU file prefix (before <tag>)
+CPU_REF_RST = CPU_OUT + "3d_rst.20100402000000.nc"         # CPU reference restart at the comparison time
+CPU_PERT_RST = CPU_OUT + "3d_pert_rst.20100402000000.nc"   # CPU perturbed-twin restart
+grd = nc.Dataset(GRID)
 wet = (grd["mask_rho"][:] > 0.5)[1:-1, 1:-1]
-g = nc.Dataset(B + "GPU/output/minipac_gpu_marbl" + TAG + "_rst.nc")
-r = nc.Dataset(B + "CPU_marbl/output/minipac_cpu_marbl3d_rst.20100402000000.nc")
-p = nc.Dataset(B + "CPU_marbl/output/minipac_cpu_marbl3d_pert_rst.20100402000000.nc")
+g = nc.Dataset(GPU_OUT + TAG + "_rst.nc")
+r = nc.Dataset(CPU_REF_RST)
+p = nc.Dataset(CPU_PERT_RST)
 print("times gpu", float(g["ocean_time"][-1]), "cpu", np.asarray(r["ocean_time"][:]) if "ocean_time" in r.variables else [v for v in r.variables if "time" in v])
 
 def rms(d):

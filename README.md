@@ -1,10 +1,148 @@
 # roms_gpu
 
-CUDA Fortran ocean core with UCLA-ROMS numerics. New tree — not an `#ifdef` of `roms_bugfix`.
+A GPU version of the UCLA ROMS ocean model coupled to the MARBL
+biogeochemistry library, written in CUDA Fortran for NVIDIA GPUs. The time
+step follows CPU UCLA ROMS routine for routine, and the model reads the same
+namelists and input files.
 
-**v1 scope:** one rank ↔ one GPU ↔ one tile (CPU backend works without a GPU). Halo `deliver` is NBR_SELF on one rank and host-staged MPI when a neighbor rank is real. Loaded cases stay 1×1 until tiled NetCDF I/O exists. Working fields are a single allocation (managed under CUDA). BGC later. `nt` is already a parameter.
+- **On the GPU:** the whole baroclinic and barotropic time step (dynamics,
+  KPP mixing, tracer advection and mixing, tides, bulk surface forcing, open
+  boundaries), MARBL's surface fluxes and interior ecosystem, and generic
+  passive tracers. Model fields stay in GPU memory for the whole run.
+- **Many GPUs:** one MPI rank per GPU, tiles balanced by ocean cells and
+  memory, halo exchanges GPU to GPU with a CUDA-aware MPI. Separate writer
+  ranks write history and restart files while the GPUs keep stepping.
+  Restart files hold two records, so restarts are exact.
+- **Checked:** after 3 days, GPU minus CPU is within the CPU model's own
+  sensitivity to a 1e-6 degC initial temperature perturbation for every
+  MARBL tracer and diagnostic (MiniPac). Every optimization was checked to
+  reproduce the previous version bit for bit.
+- **Speed (Derecho):** Pacific domain with MARBL, 2 nodes of each kind: 21x
+  faster per time step than CPU ROMS-MARBL (8 A100s vs 256 AMD cores).
+- **Not yet on the GPU:** rivers and other point sources, CDR tracer surface
+  fluxes and air-sea gas exchange, output for nested child grids, closed
+  basins (one known boundary bug), averages and monthly restarts.
 
-## Numerics (frozen)
+## Getting started
+
+### Requirements
+
+- NVIDIA GPUs and the NVIDIA HPC SDK (`nvfortran`; developed with 25.9).
+- MPI with Fortran bindings. A CUDA-aware MPI is optional: it lets halo
+  exchanges go straight from GPU to GPU; otherwise they go through pinned
+  host memory.
+- NetCDF-C and NetCDF-Fortran built with parallel I/O (parallel HDF5);
+  `nf-config` and `nc-config` on the `PATH`.
+- Python 3 for `tools/gpu_layout.py` (standard library only); `numpy` and
+  `netCDF4` for the comparison tools.
+
+### Get the code
+
+MARBL is a git submodule:
+
+```
+git clone --recurse-submodules <repository-url> roms_gpu
+cd roms_gpu
+# or, in an existing clone:  git submodule update --init
+```
+
+### Build
+
+`make gpu` compiles MARBL's Fortran from the submodule together with the
+model and writes `build_gpu/roms_gpu_cuda`. The general form:
+
+```
+make gpu FC_GPU=nvfortran \
+  FFLAGS_GPU="-O2 -g -cuda -gpu=cc80 -DUSE_CUDA -DPASSIVE_FP64 -Mpreprocess -Mfree -Mnofma -Isrc/shared $(nf-config --fflags)" \
+  FFLAGS_MPI="-DUSE_MPI -I<MPI include directory>" \
+  LIBS="$(nf-config --flibs) -lnetcdf <MPI Fortran libraries> <rpath flags>"
+```
+
+- `-gpu=ccXX` selects the GPU architecture: `cc80` for A100, `cc90` for
+  H100 and H200, `cc100` for B200.
+- `-DPASSIVE_FP64` stores the MARBL and passive tracers in double precision,
+  the validated configuration. Single precision saves memory but moves the
+  carbonate saturation depths far outside the CPU noise floor.
+- `-Mnofma` turns off fused multiply-add, for reproducible rounding; it
+  costs no measurable speed.
+- Run one `make` at a time. After changing flags, start from a clean
+  `build_gpu/` (`make clean`): the objects do not depend on the flags.
+
+On NCAR's Derecho (Cray MPICH, which needs `libmpi_gtl_cuda` for GPU-to-GPU
+halo exchange):
+
+```
+module --force purge
+module load ncarenv nvhpc cuda cray-mpich netcdf-mpi
+NFF=$(nf-config --fflags); NCP=$(nc-config --prefix)
+GTL=/opt/cray/pe/mpich/8.1.32/gtl/lib
+make gpu FC_GPU=nvfortran \
+  FFLAGS_GPU="-O2 -g -cuda -gpu=cc80 -DUSE_CUDA -DPASSIVE_FP64 -Mpreprocess -Mfree -Mnofma -Isrc/shared ${NFF}" \
+  FFLAGS_MPI="-DUSE_MPI -I${CRAY_MPICH_DIR}/include" \
+  LIBS="$(nf-config --flibs) -L${NCP}/lib64 -lnetcdf -L${CRAY_MPICH_DIR}/lib -lmpifort -lmpi -L${GTL} -lmpi_gtl_cuda \
+        -Wl,-rpath,$(nf-config --prefix)/lib -Wl,-rpath,${CRAY_MPICH_DIR}/lib -Wl,-rpath,${NCP}/lib64 -Wl,-rpath,${GTL}"
+```
+
+### Run
+
+```
+mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
+```
+
+- **Ranks:** the first `np_xi x np_eta` ranks (from the namelist) each drive
+  one GPU; every extra rank is a writer. `python3 tools/gpu_layout.py
+  namelist.nml` prints the suggested numbers (compute ranks, writers, total,
+  and a PBS select line); `tools/submit_gpu.sh <job script>` does the same
+  and submits a PBS job with them.
+- **GPUs:** compute rank r uses GPU (r mod the number of visible GPUs), so
+  place ranks node by node and make all of a node's GPUs visible to every
+  rank. `tools/numa_bind.sh` (launch with `mpiexec --cpu-bind none ...
+  tools/numa_bind.sh <exe> run <namelist>`) pins each GPU rank to the CPU
+  cores next to its GPU.
+- **Environment:** set `MPICH_GPU_SUPPORT_ENABLED=1` to use GPU-to-GPU halo
+  exchange (CUDA-aware MPI required); leave it unset otherwise.
+- **Namelist:** the same groups and keys as UCLA ROMS, plus `np_xi` and
+  `np_eta` (GPU tiles), `nt_bgc` (32 with MARBL) and `nt_passive`. Paths are
+  relative to the namelist file.
+
+`examples/minipac/` is a complete small case (namelist, MARBL settings, PBS
+script): 3 days of MiniPac with MARBL on one 4-GPU node. The input data are
+not included; its README lists the files.
+
+### Check the results
+
+- **Same GPU and compiler as a reference run:** expect bit-for-bit
+  agreement. `tools/cmp_nc.py A.nc B.nc [--last]` compares two files variable
+  by variable.
+- **New hardware or compiler:** compare with CPU ROMS against the CPU model's
+  own noise floor: run CPU ROMS twice, once with the initial temperature
+  perturbed by 1e-6 degC, and use `tools/marbl_noise_floor_eval.py` (MARBL
+  tracers and diagnostics) or `tools/noise_floor_eval.py` (physics). GPU
+  minus CPU should be no larger than perturbed minus unperturbed CPU.
+- **Tools:** scripts that need file locations have a settings block at the
+  top; most can also be set with environment variables (`ROMS_GPU_CASES`,
+  `ROMS_GPU_OUTPUT`, `ROMS_GPU_GRID`, `ROMS_GPU_PREFIX`).
+- **Tests:** `tests/test_marbl_sflux.F90` and `tests/test_marbl_interior.F90`
+  check the GPU MARBL kernels column by column against unchanged MARBL
+  (`make build_gpu/test_marbl_sflux build_gpu/test_marbl_interior` with the
+  same flags as `make gpu`). The other tests exercise individual routines on
+  the CPU backend (`make tests`).
+
+## Layout
+
+```
+src/shared    kinds, decomposition, MPI layer, formulas (host + device), timers
+src/device    GPU state and kernels: halos, geometry, step2d, prsgrd, advection,
+              KPP, step3d, tracers, passive tracers, bulk forcing, MARBL kernels
+src/host      main, time loop (step_driver), namelist and NetCDF I/O, forcing
+              read-ahead, output writer ranks (io_server), MARBL driver
+tests         unit tests and the MARBL column tests
+tools         launcher, rank layout, NUMA binding, comparison and profiling scripts
+examples      a small runnable case (MiniPac with MARBL)
+MARBL         MARBL submodule
+```
+
+## Numerics
 
 - SM09 s-coordinate, Shchepetkin PGF
 - LF-AM3 predictor / corrector
@@ -14,71 +152,26 @@ CUDA Fortran ocean core with UCLA-ROMS numerics. New tree — not an `#ifdef` of
 - LMD94 interior Ri + KPP/BKPP/nonlocal (SMOOTH_RIG, INT_AT_RHO_POINTS, SMOOTH_HBL, Jwt=1)
 - no NHMG, no isoneutral, no splines, no LMD_DDMIX / LMD_CONVEC
 
-## Layout
-
-```
-src/shared    kinds, decomp, arch (CPU/GPU), formulas (host+device), time indices / weights
-src/device    gpu_state (one working copy), halo_fill, set_depth / set_HUV / set_HUV1 / omega, step2d, prsgrd, advect, LMD
-src/host      time loop (nfast on the host), namelist + NetCDF via host_buf, main
-tests         formulas, halo, set_depth, step2d, prsgrd, advect, rho_eos, lmd, io, dyn_core
-```
-
-One rank ↔ one GPU ↔ one tile. Arrays are always local `nx,ny` plus halo. Neighbors are `NBR_SELF` (periodic wrap on this rank), `NBR_NONE` (physical edge), or a real MPI rank. `deliver` host-stages the pack buffers and `MPI_Sendrecv`s them. CUDA graphs stay off when `comm_size > 1`. Tiled NetCDF I/O is not wired: a loaded case on more than one rank stops.
-
-## What is real vs stub
-
-| Real | Stub (`not_implemented`) |
-|---|---|
-| decomp, gpu_state, halo EW+NS+corners | |
-| SM09 `set_depth`, `set_HUV`, `set_HUV1`, `omega` | |
-| fused `step2d` (iif=1 PGF, rufrc strip, FB correction) | rivers (sparse hook `apply_volume_sources` is empty) |
-| Shchepetkin `prsgrd` (SPLIT_EOS) | |
-| horiz UP3 + vert C4/U3 fluxes (`FX`, `FE`, `Fz`) | |
-| SPLIT_EOS `rho_eos`, LF-AM3 `pre_step3d`, `step3d_t` | |
-| `step3d_uv1/2`, `visc3d` (UV_VIS2), `t3dmix` (TS_DIF2) | |
-| LMD `lmd_vmix` (interior Ri + KPP/BKPP/nonlocal) | |
-| namelist + grid/init + flux/bry NetCDF (`load`/`run`) | rivers |
-| history + restart write (`BASIC_OUTPUT_SETTINGS`) | averages, monthly restarts, true `w` |
-| Flather M2 + Chapman zeta + Orlanski M3/T | Specified OBC, sponge-tune |
-| COARE 3.0 bulk fluxes; SSH/UV/POT tides | analytical tides, QCORR/SFLX_CORR |
-| FB weights, thickness-aware faces, flux mismatch, VAR_RHO_2D PGF | |
-
-## Build
-
-```
-cd /glade/derecho/scratch/bachman/roms_gpu
-make              # gfortran tests + ./build/roms_gpu
-make run          # geom-only ideal box
-make gpu          # nvfortran -cuda (Derecho GPU nodes)
-```
-
-`./build/roms_gpu geom` runs set_depth / set_HUV / omega.
-`./build/roms_gpu baro` runs the fused barotropic loop on the ideal box.
-`./build/roms_gpu prsgrd` runs set_depth + Shchepetkin PGF.
-`./build/roms_gpu advect` runs horizontal UP3 + vertical C4/U3 fluxes.
-`./build/roms_gpu step` runs one baroclinic step of the dynamical core (LMD on).
-`./build/roms_gpu lmd` runs `set_depth` + `rho_eos` + `lmd_vmix` on the rest box.
-`./build/roms_gpu load path/to/namelist.nml` reads namelist + grid + init NetCDF (MiniPac layout: `xi_rho = LLm+2`).
-`./build/roms_gpu run path/to/namelist.nml` loads then takes `ntimes` baroclinic steps (flux or COARE bulk + Flather/Orlanski OBC + tides if those files are in `frcfiles`).
-History/restart: `&basic_output_settings` / `&ts_output_settings` (same keys as the CPU case). Files are `{output_root_name}_his.nc` and `{output_root_name}_rst.nc` (new file every `nrpf_his` / 2 records). A restart is loadable as `inifile`. No averages, no monthly calendar, no true `w`.
-Smoke: `./build/roms_gpu run build/standalone.nml` (flux). Bulk+tides: `./build/roms_gpu run build/standalone_bulk.nml`.
-
-Needs NetCDF-Fortran (`nf-config` on the PATH). Parallel HDF5 builds (conda npl) also need HDF5 and MPI on the link line; the Makefile adds them when those libs sit next to NetCDF. Paths in the namelist are relative to the namelist file. MiniPac's default `inifile` is a restart under `output_up3/`; `input_data/PACMED12km_v2ni_initial_conditions.nc` is the smaller IC.
-
-Halo pack/unpack and the interiors of `set_depth`, `rho_eos`, `prsgrd`, LMD (`swr_frac`, Ri, nu/mult/store), and `step2d` launch the same way: `!$cuf kernel do` over `(i,j)` on a single work stream. NBR_SELF deliver is a device copy; a real neighbor rank uses host-staged `MPI_Sendrecv`. `nfast` walks on the host and, on one rank, launches a CUDA graph of `{step2d, halo_fill}`. Kernels read a managed `fast` pack for time indices and FB weights. SMOOTH_RIG (per level) and the KPP column search stay on the host.
-
-## Next
-
-1. Tiled NetCDF I/O (so MiniPac can use `np_xi × np_eta`); rivers; BGC
-
 ## MARBL
 
-MARBL (git submodule `MARBL`, CWorthy-ocean/MARBL @ 6e6b2f7 = tag marbl0.45.0, the version the
-CPU model uses) runs on the GPU: MARBL's own sources are compiled as host
-code for settings/initialisation (`src/host/marbl_host.F90`), and the surface
-flux and interior tendency paths are ported to CUDA Fortran kernels
-(`src/device/marbl_sflux.F90`, `src/device/marbl_interior.F90`), driven from
-`src/host/marbl_step.F90`. The 32 MARBL tracers are the passive tracers in
-MARBL mode (build with `-DPASSIVE_FP64`). Validation, results and lessons:
-`MARBL_GPU_PORT.md`; how to build and run: `MARBL_RESUME.md`; cases:
-`cases/minipac`. Clone with `git clone --recurse-submodules`.
+MARBL (git submodule `MARBL`, CWorthy-ocean/MARBL @ 6e6b2f7 = marbl0.45.0,
+the version the CPU model uses) runs on the GPU: MARBL's own sources are
+compiled as host code for settings and initialisation
+(`src/host/marbl_host.F90`), and the surface flux and interior tendency paths
+are CUDA Fortran kernels (`src/device/marbl_sflux.F90`,
+`src/device/marbl_interior.F90`), driven from `src/host/marbl_step.F90`. The
+32 MARBL tracers are the passive tracers in MARBL mode. Design, validation
+and lessons: `MARBL_GPU_PORT.md`.
+
+## Development builds
+
+`make` builds the CPU backend (`gfortran`, `./build/roms_gpu`) and the unit
+tests, from the single-GPU development phase; `./build/roms_gpu geom | baro |
+prsgrd | advect | step | lmd` run single components on an ideal box.
+
+## License
+
+roms_gpu is derived from UCLA ROMS (https://github.com/CWorthy-ocean/ucla-roms)
+and is distributed under the GNU General Public License, version 3 (see
+`LICENSE`). MARBL is distributed under its own license
+(`MARBL/LICENSE.txt`).
