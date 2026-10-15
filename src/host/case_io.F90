@@ -16,7 +16,8 @@ module case_io
   use tile_balance, only: balance_cuts, uniform_cuts
   use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
   use formulas, only: rho0_eos => rho0
-  use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name
+  use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name, &
+       passive_hold
   use marbl_gpu, only: marbl_on, read_marbl_namelist, marbl_gpu_setup_tracers, marbl_gpu_init_forcing, &
                        marbl_gpu_load_state
   implicit none
@@ -596,6 +597,7 @@ contains
     call dump_vic('after load')
     if (.not. passive_loaded) call init_passive()
     if (marbl_on .and. .not. passive_loaded) error stop 'MARBL: initial file lacks the MARBL tracers'
+    call passive_hold(0_ip)   ! use_constant_Fe (no-op otherwise): Fe at its value from the start
     call init_forcing()
     call wall_stamp('forcing init')
     if (marbl_on) call marbl_gpu_init_forcing()

@@ -20,7 +20,11 @@ module passive_mod
   use time_state
   use passive_column_mod, only: passive_column_run, passive_horiz_run, passive_t3dmix_run
   use halo_mod, only: halo_fill_3d_tp, halo_tp_start, halo_tp_mid, halo_tp_finish, tp_overlap_on
+#ifdef USE_CUDA
+  use arch_mod, only: work_stream
+#endif
   implicit none
+#include "cuf_launch.inc"
   private
 
   integer(ip), public :: ntp = 0
@@ -36,6 +40,10 @@ module passive_mod
   character(len=32), allocatable, public :: passive_names(:)
   real(rp), WORK_ATTR public, allocatable :: tb_west(:,:,:), tb_east(:,:,:)    ! (js:je, nz, ntp)
   real(rp), WORK_ATTR public, allocatable :: tb_south(:,:,:), tb_north(:,:,:)  ! (is:ie, nz, ntp)
+  ! One passive tracer held at a constant value (marbl_gpu: use_constant_Fe):
+  ! hold_itr is its index (0: none), hold_value its value at wet points.
+  integer(ip), public :: hold_itr = 0
+  real(rp), public :: hold_value = 0.0_rp
 
   public :: read_passive_namelist
   public :: passive_exchange_mid, passive_exchange_finish
@@ -47,6 +55,7 @@ module passive_mod
   public :: passive_t3dbc
   public :: passive_name
   public :: set_passive_marbl
+  public :: passive_hold
 
 contains
 
@@ -203,6 +212,9 @@ contains
     ! (t3dmix for tp; one thread per tracer and cell).
     if (ntp <= 0) return
     call passive_t3dmix_run(tp, ntp, nrhs, nnew, dt)
+    ! A held tracer (use_constant_Fe) is reset after its last update of the
+    ! step, in every slot, before the exchange below sends it.
+    call passive_hold(0_ip)
     ! nnew is the next step's nstp: post the exchange now, the next step
     ! advances it (passive_exchange_mid) and the predictor completes it.
     if (tp_overlap_on(2)) then
@@ -211,6 +223,36 @@ contains
       call halo_fill_3d_tp(tp, ntp, nnew)
     endif
   end subroutine passive_t3dmix
+
+  subroutine passive_hold(slot)
+    ! Set tracer hold_itr to hold_value at every wet point (land 0, as the
+    ! CPU model's masked update leaves it) of every stored column: interior,
+    ! halo and physical-boundary columns, so no exchange is needed. Time
+    ! slot `slot`, or all three when slot is 0. No-op when hold_itr is 0.
+    integer(ip), intent(in) :: slot
+    integer(ip) :: i, j, k, c, s, s0, s1, itr, nz, is, ie, js, je
+    real(rp) :: v
+    if (hold_itr <= 0) return
+    itr = hold_itr; v = hold_value; nz = decomp%nz
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    s0 = slot; s1 = slot
+    if (slot == 0) then
+      s0 = 1; s1 = 3
+    endif
+    do s = s0, s1
+      CUF_DO2
+      do j = js, je
+        do i = is, ie
+          c = tpcol(i, j)
+          if (c > 0) then
+            do k = 1, nz
+              tp(itr, c, k, s) = real(v * rmask(i, j), pp)
+            enddo
+          endif
+        enddo
+      enddo
+    enddo
+  end subroutine passive_hold
 
   subroutine passive_exchange_mid()
     ! Advance a pending all-tracer exchange (east-west done, north-south

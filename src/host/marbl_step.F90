@@ -18,7 +18,8 @@ module marbl_gpu
   use nc_io
   use frc_io, only: init_bgc_forcing, set_bgc_forces, uwnd, vwnd, bgc_frc_on
   use run_timers, only: rt_dev_begin, rt_dev_end
-  use passive_mod, only: ntp, tp, set_passive_marbl, passive_marbl, passive_name
+  use passive_mod, only: ntp, tp, set_passive_marbl, passive_marbl, passive_name, &
+       passive_hold, hold_itr, hold_value
   use marbl_host
   use marbl_sflux_mod
   use marbl_interior_mod
@@ -35,6 +36,12 @@ module marbl_gpu
   real(rp), public :: marbl_timestep = 3600.0_rp
   integer(ip), public :: marbl_timestep_ratio = 1
   real(rp), public :: xco2_default = 284.7_rp       ! ppm when no xco2 forcing (CPU default)
+  ! Constant iron (CPU marbl_driver): with use_constant_Fe, MARBL's Fe is held
+  ! at constant_Fe_value (mmol/m3) at every wet point (passive_hold): after
+  ! the initial state is loaded, before each MARBL call and after each
+  ! step's lateral mixing.
+  logical, public :: use_constant_Fe = .false.
+  real(rp), public :: constant_Fe_value = 3.0e-3_rp
   integer(ip) :: ncalls = 0
   ! The saturation depths (zsatcalc/zsatarag) are read only by the history
   ! staging. A run that writes history stages its initial record before the
@@ -82,16 +89,22 @@ contains
     character(len=32) :: marbl_tracers_to_write(64)
     character(len=400) :: marbl_diagnostics_to_write(64)
     namelist /marbl_biogeochemistry_settings/ marbl_config_file, marbl_timestep, &
-         marbl_tracers_to_write, marbl_diagnostics_to_write
+         marbl_tracers_to_write, marbl_diagnostics_to_write, use_constant_Fe, constant_Fe_value
     marbl_on = (nt_bgc > 0)
     if (.not. marbl_on) return
     marbl_config_file = 'marbl_in'
     marbl_timestep = 3600.0_rp
     marbl_tracers_to_write = ''
     marbl_diagnostics_to_write = ''
+    use_constant_Fe = .false.
+    constant_Fe_value = 3.0e-3_rp
     rewind(unit)
     read(unit, nml=marbl_biogeochemistry_settings, iostat=ios)
     if (ios > 0) error stop 'marbl_biogeochemistry_settings: read error'
+    if (use_constant_Fe) then
+      if (constant_Fe_value < 0.0_rp) error stop 'use_constant_Fe: constant_Fe_value must be non-negative'
+      write(*,'(a,es12.5,a)') 'MARBL Fe held constant at ', constant_Fe_value, ' (use_constant_Fe)'
+    endif
     cfg = marbl_config_file
     if (cfg(1:1) /= '/') marbl_config_file = trim(nml_dir)//'/'//trim(cfg)
     tstep = marbl_timestep
@@ -103,9 +116,17 @@ contains
   ! names to the passive module and allocate the device arrays. Called
   ! after read_namelist (decomp, dt known), before alloc_passive.
   subroutine marbl_gpu_setup_tracers()
+    integer(ip) :: m
     if (.not. marbl_on) return
     call marbl_host_init(decomp%nz, trim(marbl_config_file), .true.)
     call set_passive_marbl(marbl_tracer_names)
+    if (use_constant_Fe) then
+      do m = 1, ntp
+        if (trim(passive_name(m)) == 'Fe') hold_itr = m
+      enddo
+      if (hold_itr == 0) error stop 'use_constant_Fe: MARBL has no tracer named Fe'
+      hold_value = constant_Fe_value
+    endif
     call set_marbl_par()
     call alloc_marbl_sflux(ntp)
     call alloc_marbl_interior(decomp%nz, ntp, .false.)
@@ -160,6 +181,9 @@ contains
     tfrc = frc_modtime()
     frc_slot = islot
     call set_bgc_forces(tfrc, sf_dust, sf_iron, sf_nox, sf_nhy, sf_xco2, sf_xco2_alt)
+    ! use_constant_Fe (no-op otherwise): MARBL computes with the constant iron;
+    ! the step's changes to Fe are undone after lateral mixing (passive_t3dmix)
+    call passive_hold(nn)
     call rt_dev_begin()     ! MARBL proper, as the CPU's marbldrv_column_physics timer
     ! wind speed squared (bulk winds on the device) and shortwave in W/m2
     CUF_DO2
