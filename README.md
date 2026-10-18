@@ -7,8 +7,10 @@ namelists and input files.
 
 - **On the GPU:** the whole baroclinic and barotropic time step (dynamics,
   KPP mixing, tracer advection and mixing, tides, bulk surface forcing,
-  rivers, open boundaries), MARBL's surface fluxes and interior ecosystem, and generic
-  passive tracers. Model fields stay in GPU memory for the whole run.
+  rivers, open boundaries), MARBL's surface fluxes and interior ecosystem, generic
+  passive tracers, the CDR_LITE tracers' transport and inputs, and
+  parameterized CDR releases (cdr_frc point and Gaussian sources). Model
+  fields stay in GPU memory for the whole run.
 - **Many GPUs:** one MPI rank per GPU, tiles balanced by ocean cells and
   memory, halo exchanges GPU to GPU with a CUDA-aware MPI. Separate writer
   ranks write history and restart files while the GPUs keep stepping.
@@ -23,7 +25,8 @@ namelists and input files.
 - **Speed (Derecho):** Pacific domain with MARBL, 2 nodes of each kind: 21x
   faster per time step than CPU ROMS-MARBL (8 A100s vs 256 AMD cores).
 - **Not yet on the GPU:** pipes (point sources), CDR tracer surface
-  fluxes and air-sea gas exchange, output for nested child grids, closed
+  fluxes and air-sea gas exchange, CDR volume sources, depth-profile and
+  3-D CDR forcing, the CDR output files, output for nested child grids, closed
   basins (one known boundary bug), averages and monthly restarts. A
   namelist that switches on a feature the GPU lacks stops the run at
   start-up with a list of the switches.

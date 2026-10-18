@@ -12,6 +12,7 @@ module case_io
   use bry_io, only: init_bry, set_bry_all
   use tide_io, only: read_tide_namelist, init_tides, set_tides
   use river_io, only: read_river_namelist, init_rivers
+  use cdr_io, only: read_cdr_namelist, init_cdr
   use his_io, only: read_output_namelist, set_output_root, init_output
   use comm_mod, only: comm_rank, comm_size, comm_min_real
   use tile_balance, only: balance_cuts, uniform_cuts
@@ -167,6 +168,7 @@ contains
     call read_passive_namelist(unit, nt_passive)
     call read_marbl_namelist(unit, nml_dir, nt_bgc)
     call read_river_namelist(unit)
+    call read_cdr_namelist(unit)
     case_ntp_est = max(ntp, nt_bgc) + ncdr
 
     rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios)
@@ -635,6 +637,8 @@ contains
     ! before close_frc_cache: it scans the forcing files' open handles
     call init_rivers(case_grdname)
     call wall_stamp('river init')
+    call init_cdr(case_grdname)       ! CDR releases (passive list and columns final)
+    call wall_stamp('cdr init')
     call close_frc_cache()
     frc_slot = 0
     call set_forces()

@@ -21,6 +21,7 @@ module passive_mod
   use passive_column_mod, only: passive_column_run, passive_horiz_run, passive_t3dmix_run
   use halo_mod, only: halo_fill_3d_tp, halo_tp_start, halo_tp_mid, halo_tp_finish, tp_overlap_on
   use rivers_mod, only: river_on, rivers_tp, RIV_PRE, RIV_COR
+  use cdr_src_mod, only: cdr_on, cdr_apply_tp
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
 #endif
@@ -292,6 +293,9 @@ contains
     call halo_tp_finish(tp, ntp)
     call passive_horiz_run(tp, ntp, 2_ip, nrhs, nnew, nnew, nnew, 0.0_rp, 0.0_rp, dt_in)
     if (river_on) call rivers_tp(tp, ntp, RIV_COR, nnew, dt_in)
+    ! CDR releases: the CPU adds them in the corrector after the horizontal
+    ! advection (and the river flux it contains), before the vertical pass
+    if (cdr_on) call cdr_apply_tp(tp, ntp, nnew, dt_in)
     call passive_column_run(tp, ntp, nrhs, nnew, dt_in, 0_ip, .false., passive_mirror)
     call passive_t3dbc()
     ! No exchange of slot nnew here: MARBL and t3dmix read it at the point

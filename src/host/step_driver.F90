@@ -23,6 +23,7 @@ module step_driver
   use lmd_mod, only: lmd_vmix
   use frc_io, only: set_forces, frc_prefetch
   use river_io, only: set_rivers
+  use cdr_io, only: set_cdr
   use bry_io, only: set_bry_all, dump_bry_north
   use tide_io, only: set_tides
   use run_timers, only: rt_dev_collect
@@ -138,6 +139,7 @@ contains
     frc_slot = 1
     call set_forces()
     call set_rivers(1)                    ! river data at n+1/2 (fast loop, corrector)
+    call set_cdr()                        ! CDR release fluxes at n+1/2 (corrector)
     call dump_swflx_b('after corr set_forces')
     call lmd_vmix(nrhs)
     ! Boundary data and tidal harmonics for n+1 (CPU main.F90 since

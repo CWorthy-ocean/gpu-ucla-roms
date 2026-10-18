@@ -1482,6 +1482,99 @@ back on nothing, and the physics is bit-identical to riv7. That includes the
 chaotic temperature hotspot at hour 72 (see "Validation against the CPU
 noise floor" above).
 
+### CDR releases on the GPU (step 3: parameterized cdr_frc)
+
+- **Scope.** The CPU's parameterized releases (cdr_frc_settings with
+  cdr_source and cdr_forcing_parameterized, without cdr_volume):
+  cdr_ncdr_parm releases, each a location, depth and horizontal/vertical
+  scale (cdr_lon/lat/dep/hsc/vsc), with a flux in mmol/s per record and
+  tracer in cdr_trcflx (the CPU's tracer order). They go into MARBL and
+  CDR_LITE tracers alike. Volume releases, depth profiles and 3-D forcing
+  stop at start-up (read_cdr_namelist and the feature check). As on the CPU
+  (check_no_ts_flux), a nonzero temperature or salinity flux stops the run.
+- **Placement (src/host/cdr_io.F90, once at start-up).** The CPU's
+  algorithm on the global grid: haversine distance from every cell, land at
+  1e8 m with cdr_relocate_to_wet_pts, the nearest cell the first minimum.
+  hsc = 0 gives a point release, otherwise exp(-(d/hsc)^2) on wet cells
+  above 1e-3. vsc = 0 puts the release on the level nearest -dep, otherwise
+  a Gaussian in z times Hz/(vsc*sqrt(pi)). Both use the rest-state grid
+  (zeta = 0) in the CPU's expressions. Each release is normalized by its sum
+  over the domain, summed in the CPU's order. Rank 0 prints each release's
+  nearest cell; the distances are the CPU's to the last digit.
+- **Time.** The records are taken at the corrector's forcing time (n+1/2)
+  with the CPU's bracket rule. Weights are c1 = (t2-t)/(t2-t1),
+  c2 = (t-t1)/(t2-t1), or the earlier record held without
+  cdr_time_interpolation.
+- **Device (src/device/cdr_src.F90).** Each tile lists its release cells,
+  with each cell's profiles in release order (CSR), plus two flux records.
+  The corrector adds dt*pm*pn*w(k)*flux to the thickness-weighted tracer
+  after the horizontal pass and the rivers, release by release, as the
+  CPU's cidx loop does.
+
+**Optimization.** The CPU adds to every tracer at every level of a release
+cell. Where a tracer's flux is 0 in both records, or a level's weight is 0
+in all of a cell's profiles, the addition is an exact zero. cdr3 therefore
+visits only the active tracers (nonzero flux in either record, rebuilt when
+a record loads) and each cell's range of nonzero levels. One thread handles
+each (tracer, cell) pair and one of 4 chunks of levels, with the pairs
+across the warp. With the 8 test releases, compute rank 2 has 16,014
+release cells:
+
+| version | cdr_apply_tp per call (rank 2) | layout |
+|---|---|---|
+| cdr2 | 2116 us | one thread per (level, cell, tracer), all 38 tracers; 61.5M threads |
+| cdr3 | 296 us | active tracers (7 of 38) x cells, 4 level chunks; 448k threads |
+
+cdr3 reads and writes about 55% of the memory bandwidth bound, as rivers_tp
+does. Over 3 days, the median step is 58.6 ms with releases (cdr3) against
+59.0 ms without (cdr1). The difference is within node-to-node noise, so the
+releases cost about 0.5% of a step.
+
+**Test (gen_cdr.py rel; tools/make_release_test.py).** Eight releases on
+Iceland0 that cover the CPU's paths: point and single-level releases, a deep
+release (200 m), two tracers in one release, two releases on the same cells
+and tracer, and three records (8400.5, 8402.5, 9131 days, scales 1, 2 and
+0.5), so a 3-day run crosses a record change. The releases go into DIC,
+ALK and five CDR_LITE tracers, on top of the lite_io transport test.
+
+- **Every step (12 steps, with and without time interpolation).** Physics
+  and tracers are within one float32 unit, as in the transport test. The
+  release signal (with releases minus without, tools/rel_signal.py) matches
+  the CPU's. For ALK, a signal of 7.2 mmol/m3 differs by 2.4e-4, one float32
+  unit of ALK (~2300). For the CDR tracers it differs by 1-2 units of
+  their values.
+- **Three days (cpu_rel_ref, the 1e-6 degC twin cpu_rel_pert, gpu_rel).**
+  GPU/twin ratios at hour 72 are 0.92-0.99 for the six CDR tracers, 0.989
+  for DIC and 0.983 for ALK. The release zone (within 3*hsc + 50 km of a
+  release, at least 100 km; compare.py --release) gives the same. The
+  physics and MARBL ratios are identical to the transport test's, hotspot
+  included, since the releases feed back on nothing.
+- **Release response (tools/rel_signal3d.py).** The GPU's error in the
+  release signal, (gpu_rel - gpu_lite) - (cpu_rel_ref - cpu_lite_ref), is
+  compared with the twin pair's. The CPU writes double and the GPU float32,
+  so 'f32 floor' is the CPU signal formed from float32-rounded fields, the
+  smallest error float32 can show. Zone RMS:
+
+  | tracer | hour | signal | GPU error | twin error | f32 floor |
+  |---|---|---|---|---|---|
+  | DIC | 6 | 0.21 | 2.22e-5 | 7.6e-8 | 2.22e-5 |
+  | DIC | 72 | 0.80 | 3.75e-5 | 4.22e-5 | 3.17e-5 |
+  | ALK | 6 | 0.20 | 1.84e-5 | 2.0e-7 | 1.84e-5 |
+  | ALK | 72 | 0.45 | 2.86e-5 | 1.63e-5 | 2.39e-5 |
+  | CDR_OAE_ALK1 | 72 | 0.11 | 1.1e-7 | 1.3e-7 | 4.1e-9 |
+  | CDR_DOR_DIC2 | 6 | 0.012 | 2.83e-8 | 7.3e-9 | 2.83e-8 |
+  | CDR_DOR_DIC2 | 72 | 0.19 | 3.4e-6 | 2.4e-6 | 3.6e-8 |
+
+  Wherever the GPU error is larger than the twin's (DIC and ALK through hour
+  48, two CDR tracers at hour 6, the ALT_CO2 tracers), it equals the
+  float32 floor. The GPU therefore reproduces the release response to the
+  rounding of its history. Otherwise it is within the twin's spread, and
+  the derived pH, pCO2SURF, FG_CO2 and CO3 signal errors are at most 0.63
+  of it.
+- **Regression.** With no releases, cdr2 is bit-identical to cdr1 (MiniPac
+  smoke; Iceland0 lite_io). cdr3 is bit-identical to cdr2 (rel and relni
+  over 12 steps, and the 3-day rel run, which crosses a record change).
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

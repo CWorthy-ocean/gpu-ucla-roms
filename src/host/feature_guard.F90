@@ -37,7 +37,12 @@ contains
     if (is_true('river_frc_settings', 'river_source')) &
       call need_off('river_frc_settings', 'river_analytical', 'analytical river forcing')
     call need_off('pipe_frc_settings', 'pipe_source', 'pipe (point source) forcing')
-    call need_off('cdr_frc_settings', 'cdr_source', 'CDR forcing')
+    if (is_true('cdr_frc_settings', 'cdr_source')) then
+      ! parameterized tracer-flux releases are on the GPU; the other modes not yet
+      call need_off('cdr_frc_settings', 'cdr_volume', 'CDR volume releases (cdr_volume)')
+      call need_off('cdr_frc_settings', 'cdr_forcing_depth_profiles', 'CDR depth-profile forcing')
+      call need_off('cdr_frc_settings', 'cdr_forcing_3d', 'CDR 3D forcing')
+    endif
     call need_off('cdr_output_settings', 'do_cdr_output', 'CDR output')
     call need_off('cdr_lite_output_settings', 'do_cdr_lite_output', 'CDR_LITE tracer output')
     call need_off('cdr_tracer_output_settings', 'do_cdr_tracer_output', 'CDR tracer output')
