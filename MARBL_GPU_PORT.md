@@ -1209,6 +1209,187 @@ history (small nrpf_his, e.g. 1-5) so consecutive records go to different
 groups, and add groups (`--groups 3` or 4 in the layout tool). A single
 history file can only be written as fast as one file allows.
 
+## Feature check and rivers (2026-10-16)
+
+### Stop on CPU features the GPU does not have
+
+The GPU reads only the namelist groups it knows. Before this change, a CPU
+namelist that switched on, say, CDR forcing ran without it and without a
+warning. `src/host/feature_guard.F90` now scans the namelist text on every
+rank before the writer split.
+
+- **Stops:** a switch that is on for a feature the GPU lacks stops all ranks
+  with `error stop`, and world rank 0 lists the switches. These are pipes,
+  CDR forcing and the four CDR outputs, analytical rivers, analytical tides,
+  upscale, extract_data, z-slices, particles, random-point output, forcing
+  and surface-flux output, averages (physical and BGC), monthly restarts,
+  and `wrt_w` with history on.
+- **Warnings only:** diag_uv, diag_trc, ub_tune, wrt_sponge and calc_pflx.
+  These act on the CPU only with a cpp key the GPU cannot see, or they only
+  add nesting fields to the restart.
+- **Checked:** all 475 GPU namelists in the case directories pass. MiniPac
+  output is byte-identical with the check in place.
+
+### Rivers
+
+UCLA `river_frc`: a river cell is a land cell with river_index > 0. Each of
+its faces to an ocean cell carries river_fraction / (number of such faces)
+of the river's volume flux. The CPU model treats these faces in five
+places, and the GPU repeats its expressions there:
+
+| CPU routine | what the river face gets | GPU |
+|---|---|---|
+| step2d | ubar/vbar(knew) = flux·2/(dn·(Dnew(a)+Dnew(b))), DU/DV_avg1 = flux, every fast step | fused into step2d_mid's last kernel; `rivers_ubar` for faces within 2 cells of a physical edge |
+| pre_step3d | u/v(nnew) = q·frac/(dn·riv_depth), before u3dbc | `rivers_uv(RIV_PRE)` |
+| step3d_uv2 | u/v(nnew) as above, before the exchange | `rivers_uv(RIV_COR)` |
+| tracer advection, predictor and corrector | FX = riv_trc·½(Hz(a)+Hz(b))·q·frac/riv_depth | `rivers_ts` (T, S), `rivers_tp` (passive) |
+| set_HUV, couple2, get_init | river faces count as wet (umask + riv_umask) | same masks |
+
+- **Time interpolation.** River values are at time n in the predictor and
+  at n+1/2 in the fast loop and the corrector, with the CPU's set_frc_data
+  weights. `river_io` reads two records only when the bracket moves on
+  (daily), so the per-step cost is kernels only.
+- **Masks and restarts.** riv_umask/riv_vmask come from the initial file,
+  as in the CPU model, and the restart writes them back.
+- **Tracer flux.** The time-stepping kernels mask face fluxes with umask,
+  which is 0 on a river face. So rivers_ts/_tp add the river-flux
+  divergence to the ocean cell next to each face after the horizontal
+  pass. Each thread handles one (level, ocean cell) and sums the cell's
+  faces in a fixed order. There are no atomics, so every run and every
+  tiling gives the same result.
+- **Tiles.** Faces are listed over cells 0..nx+1 of each tile, as the CPU
+  does after its halo-index fix (cb137a9b), so a river cell in a tile's
+  halo still feeds the tile's ocean cells next to it.
+
+**Optimization** (nsys, per time step; the rivers' kernel time and the
+fast-loop override's extra time):
+
+| version | Iceland0 rank 3 (1033 river cells in the domain) | MiniPac rank 2 (2181 river cells on the tile) | change |
+|---|---|---|---|
+| riv1 | 0.93 ms | | separate kernels; river tracers one thread per tracer |
+| riv4 | 0.10 ms passive + 3.3 us per fast step | | override fused into step2d_mid; geometry shared with the passive kernel; river init through the cached forcing handles (it had cost 7 s) |
+| riv6/7 | 0.38 ms | 0.85 ms (passive 0.62) | flux q*frac formed once per step for the fast loop and the corrector |
+| riv10 (final) | 0.20 ms (0.45% of the step) | 0.50 ms (passive 0.27) | passive river kernel with 4 level chunks per thread |
+
+- **Fused override.** step2d_mid's last kernel has a river copy, 96
+  registers against 74, which runs only on tiles with river faces away from
+  the edges. It costs 1.1 us per fast step. Runs without rivers use the
+  plain copy and are untouched.
+- **Passive kernel.** One thread per (cell, tracer, chunk of levels). The
+  river tracer, sign and q/dep of each face are the same at every level, so
+  they load once per chunk. MiniPac rivers_tp (nz = 100) per call: 309 us
+  with a thread per level, 144 us with chunks of 10 levels, 137 us with 25
+  (the final 4 chunks), 158 us with 100. The FP64 tracer read and write is
+  then at about 55% of memory bandwidth.
+- **T/S kernel.** The same chunking made rivers_ts slower (105 us against
+  64 us per call): with two tracers there is too little work per thread to
+  cover the serial level loop. It stays one thread per (level, cell).
+- **Step time.** MiniPac 2x2, warm forcing cache: 64.47 ms per plain step
+  with rivers against 64.30 ms without (riv10, same job). Part of the
+  river work lands on ranks that wait for others anyway.
+- **A false alarm.** River runs once looked 14 ms per step slower. The
+  river run had gone first in its job and read the forcing files cold
+  (prefetch reads 8.6 s in total against 0.3 s warm). With the order
+  swapped, the extra time follows whichever run goes first.
+
+Every optimization reproduced the previous version bit for bit. River
+runs are bit-identical on 2x2, 1x1 and 4x1 tiles. A river restart is
+bit-exact, except for DU_avg_bak on land, which comes from the land-velocity
+bug below.
+
+### Two cold-start bugs (found on Iceland0, fixed)
+
+MiniPac and Pac start from exact CPU restarts, so these never showed
+before. Iceland0 starts from an initial file.
+
+1. **Land velocities.** The loaded u, v, ubar and vbar were not multiplied
+   by umask + riv_umask, as the CPU get_init does. The Iceland0 initial
+   file has nonzero ubar on every land face.
+2. **Barotropic fluxes.** When the run is not an exact restart, the CPU's
+   set_depth (iic = 0) forms DU_avg1/DV_avg1 from the initial ubar and
+   zeta. The GPU left them 0, which gave 5 cm of zeta difference across the
+   domain after one step. The fix is `init_barotropic_fluxes` in case_io.
+
+### CPU commit 69a23382 ported
+
+CPU commit 69a23382 (2026-10-08, "Changes to model results") came after
+the GPU's validation build (the 2026-10-03 CPU). It changes results: on
+MiniPac, zeta differs by 3.7 cm RMS after three days between the two CPU
+builds. The GPU now has its three changes:
+
+- t3dbc and passive_t3dbc use the interior tracer at nstp on all four sides
+  (east and north had used nnew);
+- the corrector's boundary data and the boundary tidal harmonics are at
+  n+1 (frc_slot 2, `set_tides(1.0)`), while the tidal potential stays at
+  n+1/2;
+- the KPP 1-2-1 vertical smoothing works from unsmoothed neighbours, and
+  the background is added once.
+
+### Validation against the CPU noise floor
+
+Reference: the CPU builds CMP/bld5_sflx_marbl (Iceland0) and
+bld5_nosflx_marbl (MiniPac), which include 69a23382. GPU: riv7. riv8 and
+riv10 reproduce it bit for bit.
+
+**Per step** (history every step, `cases/RIV/dbg_cmp.py`). Iceland0 with
+and without rivers, 7-11 steps: every physics field and every MARBL tracer
+differs from the CPU by at most one float32 unit (relative 6e-8, worst
+6.9e-8). MiniPac without rivers, 8 steps with 2 MARBL calls: the same on
+every boundary row and ring and, for the large values, everywhere. Larger
+relative differences occur only at tiny tracer values, where large terms
+cancel, and in one column where a mixing instability grows from step 5.
+
+**Three days, against CPU twins** (1e-6 degC random initial temperature
+perturbation). Hour 6: GPU-CPU is 2-60% of twin-CPU for every field. By
+hour 24-72 both saturate near 1. A second twin (seed 7) gives the CPU's own
+spread, and the twin-2/twin-1 ratios at the last hour reach 1.3-1.4 (Fe,
+Lig, zeta and PH in the river zone). Distances from the GPU to each of the
+three CPU members, against the largest CPU-to-CPU distance:
+
+| case, hour | physics, most tracers | outside the CPU spread |
+|---|---|---|
+| MiniPac, no rivers, 24 | 0.09-1.14 | none |
+| MiniPac, no rivers, 72 | 0.70-1.12 | diatChl/C/P/Si 1.08-1.27 |
+| MiniPac, rivers, 66 | 0.27-1.14 | diatoms 1.17-1.39, DOC/DON/DOP 1.18-1.33, O2 1.21-1.34 |
+| Iceland0, rivers, 72 | 0.65-1.12 | temp 2.2, PH/pCO2SURF 1.5 |
+
+The excesses are local, and none is reproducible from a common state:
+
+- **Iceland0 temperature.** One 5 m column at -2 C next to river 107 (j366,
+  i280) warmed by 0.27 K in the GPU run from hour 55. Continued from one
+  CPU restart at hour 48, the GPU, the CPU and a CPU twin follow the same
+  path there (-1.913 C at hour 60 in all three), and the GPU's PH
+  difference stays below the twin's (2.0e-6 against 3.4e-6 RMS).
+- **MiniPac diatoms.** Most of the excess is one interior cluster (j268-273,
+  i232-237). The rest sits on the open boundaries, where the GPU's
+  difference is 5-8 times the twins'. The boundary rows agree to one
+  float32 unit step by step. A velocity sign change at a boundary point
+  switches between radiating the interior value and nudging to the
+  climatology. That moves diatoms, whose climatology differs from the
+  interior, but not temperature. GPU round-off enters at the boundary on
+  every step, whereas the twins' seed starts in the interior.
+- **The seed matters, the biogeochemistry alone is not chaotic.** A CPU twin
+  with every MARBL tracer multiplied by (1 +- 1e-7) stays within 1e-7 of
+  the reference after three days (diatC RMS 5e-7 against 9e-3 for the
+  temperature twin). Tracer divergence comes from the physics.
+
+**MiniPac river 4.** River 4 delivers 10,080 m3/s into one 12 km cell.
+Both models drive salinity there below zero by hour 72 (CPU -1.136, GPU
+-1.137 at the surface), and MARBL's carbonate solver then fails. Both CPU
+river twins stopped there. The riv7 GPU run counted the failures and ran
+on; since riv11 the GPU stops too, on the same cell. MiniPac river
+comparisons therefore stop at hour 66.
+
+**Output difference.** Before the first MARBL call of a cold start
+(Iceland0: the first hour), the GPU writes 0 for the MARBL surface
+diagnostics; the CPU writes the initial-state values.
+
+
+MiniPac's river test file (`cases/RIV/input/MiniPac_river.nc`) is cut from
+the Pac river file, with tracer concentrations capped. The Pac file has
+DIC and ALK up to 2e7 mmol/m3, which MARBL's carbonate solver cannot
+handle.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;
@@ -1243,5 +1424,13 @@ history file can only be written as fast as one file allows.
   (production, remineralisation, fluxes per PFT) are not written.
 - Performance: K2 register pressure, carbonate solver cost, the 128
   per-step boundary fills for the tracers (could move to the hourly call).
+- Carbonate solver failures (no pH bracket, or no convergence) stop the
+  run, as MARBL's error does on the CPU (since 2026-10-16; before, the GPU
+  counted them and ran on). After every MARBL call a device reduction
+  counts sf_err/it_err (no measurable cost on MiniPac); a failing rank
+  lists up to 10 columns (global i, j, surface T, S, DIC, ALK, PO4, SiO3,
+  the column's lowest salinity) and calls comm_abort (MPI_Abort on the
+  world communicator). MiniPac with rivers stops at iic 13760 on the cell
+  (366, 99) where the perturbed CPU run stopped.
 - Not ported (not used by MiniPac): ciso, abio_dic, Lig_cnt = 2, restoring,
   O2/remin scale-factor forcings, ladjust_bury_coeff, PAR subcolumns > 1.

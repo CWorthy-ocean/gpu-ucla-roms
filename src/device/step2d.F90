@@ -18,6 +18,7 @@ module step2d_mod
   use halo_mod
   use formulas
   use obc, only: zetabc, uv2dbc, uv2dbc_corners
+  use rivers_mod, only: river_on, rivers_ubar, rf_flx, riv_ufc, riv_vfc, nrf_s2df
   use comm_mod, only: comm_size
   use arch_mod, only: sync_arch, on_gpu, graph_is_ready, graph_begin, &
                       graph_end, graph_launch
@@ -175,6 +176,7 @@ contains
     ! stay before accumulate_boundary_avg1, which step2d_tail now queues
     ! behind the exchange pack.)
     call apply_volume_sources()
+    if (river_on) call rivers_ubar(knew)     ! CPU step2d: after u2dbc/v2dbc (no river face is a boundary face)
     call run_device_section(3)
     if (fast_is_last_h) call set_depth()
   end subroutine step2d_with_halo
@@ -187,6 +189,7 @@ contains
     call host_zeta_obc()
     call step2d_mid()                        ! exchanges zeta(knew) before its halo PGF terms
     call host_uv_obc(.true.)
+    if (river_on) call rivers_ubar(knew)
     call halo_fill_uv_n(ubar, vbar)          ! every fast step, as the CPU step2d exchange
     if (fast_is_last_h) then
       call step2d_last_zeta()
@@ -339,8 +342,9 @@ contains
     integer(ip) :: i, j, ks, kn, kb, ko, nx, ny, is, ie, js, je, ju0, ju1, iv0, iv1
     integer(ip) :: i_u_lo, i_u_hi, j_v_lo, j_v_hi, ir0, ir1, jr0, jr1, lim
     integer(ip) :: iz_lo, iz_hi, jz_lo, jz_hi
-    real(rp) :: cff, cff1, DUnew, DVnew, zk, z_old, term
-    logical :: first
+    real(rp) :: cff, cff1, DUnew, DVnew, zk, z_old, term, flux
+    integer(ip) :: fr
+    logical :: first, rv_on
 
     nx = decomp%nx
     ny = decomp%ny
@@ -464,6 +468,54 @@ contains
       call apply_pgf(.true.)
     endif
 
+    ! River faces away from the physical edges (rivers_mod RIV_S2DF): the
+    ! CPU's override (ubar = river_flux*2/(dn_u*(Dnew(i-1)+Dnew(i))),
+    ! DU_avg1 = river_flux) right after the update, in the same thread;
+    ! rivers_ubar does the faces next to an edge after the open-boundary code.
+    ! Two copies of the kernel: the river version uses ~30 more registers,
+    ! so tiles without such faces (and runs without rivers) keep the plain one.
+    rv_on = river_on
+    if (rv_on) rv_on = (nrf_s2df > 0)
+    if (rv_on) then
+    CUF_DO2
+    do j = 1, ny + 1
+      do i = 1, nx + 1
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
+        ks = fast%kstp
+        kn = fast%knew
+        cff = fast%half_dt
+        cff1 = fast%half_w1
+        if (j <= ny .and. i >= i_u_lo .and. i <= i_u_hi) then
+          DUnew = ((DUon(i, j) + DUon(i - 1, j)) * ubar(i, j, ks) + &
+                   cff * (pm(i, j) + pm(i - 1, j)) * (pn(i, j) + pn(i - 1, j)) * &
+                   (rubar(i, j) + rufrc(i, j)))
+          DUnew = apply_mask(DUnew, umask(i, j))
+          ubar(i, j, kn) = DUnew / max(Dnew(i, j) + Dnew(i - 1, j), 1.0e-30_rp)
+          DU_avg1(i, j) = DU_avg1(i, j) + cff1 * dn_u(i, j) * DUnew
+          fr = riv_ufc(i, j)
+          if (fr > 0) then
+            flux = rf_flx(fr)                 ! river_flux of the face, this step
+            ubar(i, j, kn) = flux * 2.0_rp / (dn_u(i, j) * (Dnew(i - 1, j) + Dnew(i, j)))
+            DU_avg1(i, j) = flux
+          endif
+        endif
+        if (i <= nx .and. j >= j_v_lo .and. j <= j_v_hi) then
+          DVnew = ((DUon(i, j) + DUon(i, j - 1)) * vbar(i, j, ks) + &
+                   cff * (pm(i, j) + pm(i, j - 1)) * (pn(i, j) + pn(i, j - 1)) * &
+                   (rvbar(i, j) + rvfrc(i, j)))
+          DVnew = apply_mask(DVnew, vmask(i, j))
+          vbar(i, j, kn) = DVnew / max(Dnew(i, j) + Dnew(i, j - 1), 1.0e-30_rp)
+          DV_avg1(i, j) = DV_avg1(i, j) + cff1 * dm_v(i, j) * DVnew
+          fr = riv_vfc(i, j)
+          if (fr > 0) then
+            flux = rf_flx(fr)
+            vbar(i, j, kn) = flux * 2.0_rp / (dm_v(i, j) * (Dnew(i, j - 1) + Dnew(i, j)))
+            DV_avg1(i, j) = flux
+          endif
+        endif
+      enddo
+    enddo
+    else
     CUF_DO2
     do j = 1, ny + 1
       do i = 1, nx + 1
@@ -490,6 +542,7 @@ contains
         endif
       enddo
     enddo
+    endif
   end subroutine step2d_mid
 
   subroutine host_begin_fast_averages()

@@ -13,6 +13,7 @@ module step3d_uv_mod
   use halo_mod
   use uv_rhs
   use obc, only: u3dbc, v3dbc
+  use rivers_mod, only: river_on, rivers_uv, RIV_COR
   use arch_mod, only: sync_arch
   use geom, only: dump_rufrc_build, dump_rv3d
   implicit none
@@ -709,14 +710,16 @@ contains
     ! Second coupling over the extended physical range, then mass fluxes.
     ! CPU builds Flx from u,v AFTER subtracting the barotropic mismatch.
     ! One device thread per column; col_dc holds the column's Hz*dn, then
-    ! its fluxes.
+    ! its fluxes. River faces (umask = 0, riv_umask = 1) are coupled as
+    ! the CPU does on every face: ubar = DU_avg1/D and the flux correction,
+    ! with u(nnew) masked to 0 (rivers_uv sets it afterwards).
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
     do j = j_ur0, j_ur1
       do i = 1, i_ur1
         if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
-        if (umask(i, j) > 0.5_rp) then
+        if (umask(i, j) + riv_umask(i, j) > 0.5_rp) then
           Dcol = 0.0_rp
           uint = 0.0_rp
           do k = 1, nz
@@ -730,7 +733,7 @@ contains
           flx_int = 0.0_rp
           do k = 1, nz
             hz_dn = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k)) * dn_u(i, j)
-            u_k = u(i, j, k, n_new) - mis_u
+            u_k = apply_mask((u(i, j, k, n_new) - mis_u), (umask(i, j)))
             u(i, j, k, n_new) = u_k
             flx_k = FLUX_DELTA * FlxU(i, j, k) + FLUX_EPSIL * hz_dn * &
                     (u(i, j, k, n_stp) + u_k)
@@ -761,7 +764,7 @@ contains
     do j = 1, j_vr1
       do i = i_vr0, i_vr1
         if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
-        if (vmask(i, j) > 0.5_rp) then
+        if (vmask(i, j) + riv_vmask(i, j) > 0.5_rp) then
           Dcol = 0.0_rp
           uint = 0.0_rp
           do k = 1, nz
@@ -775,7 +778,7 @@ contains
           flx_int = 0.0_rp
           do k = 1, nz
             hz_dn = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k)) * dm_v(i, j)
-            u_k = v(i, j, k, n_new) - mis_u
+            u_k = apply_mask((v(i, j, k, n_new) - mis_u), (vmask(i, j)))
             v(i, j, k, n_new) = u_k
             flx_k = FLUX_DELTA * FlxV(i, j, k) + FLUX_EPSIL * hz_dn * &
                     (v(i, j, k, n_stp) + u_k)
@@ -809,6 +812,7 @@ contains
     endif
 
     call dump_uv2_b('after couple2')
+    if (river_on) call rivers_uv(RIV_COR)    ! CPU step3d_uv2: river faces before the exchange
     call hg_begin()
     call hg_add(F_U, nnew)
     call hg_add(F_V, nnew)

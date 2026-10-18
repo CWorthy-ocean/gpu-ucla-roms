@@ -36,6 +36,10 @@ module gpu_state
   real(rp), WORK_ATTR public, allocatable :: dn_u(:,:), dm_v(:,:)
   real(rp), WORK_ATTR public, allocatable :: dm_r(:,:), dn_r(:,:)
   real(rp), WORK_ATTR public, allocatable :: rmask(:,:), umask(:,:), vmask(:,:)
+  ! River faces (UCLA riv_umask/riv_vmask): 1 on faces between a river cell
+  ! and the ocean, where the CPU model leaves the velocity and mass flux
+  ! unmasked although umask/vmask are 0. Zero without rivers.
+  real(rp), WORK_ATTR public, allocatable :: riv_umask(:,:), riv_vmask(:,:)
   real(rp), WORK_ATTR public, allocatable :: f(:,:)
   real(rp), WORK_ATTR public, allocatable :: lonr(:,:), latr(:,:), angler(:,:)
   real(rp), WORK_ATTR public, allocatable :: swflx(:,:)
@@ -449,6 +453,7 @@ contains
     allocate(dn_u(is:ie,js:je), dm_v(is:ie,js:je))
     allocate(dm_r(is:ie,js:je), dn_r(is:ie,js:je))
     allocate(rmask(is:ie,js:je), umask(is:ie,js:je), vmask(is:ie,js:je))
+    allocate(riv_umask(is:ie,js:je), riv_vmask(is:ie,js:je))
     allocate(f(is:ie,js:je), lonr(is:ie,js:je), latr(is:ie,js:je), angler(is:ie,js:je))
     allocate(swflx(is:ie,js:je), tair(is:ie,js:je))
     allocate(pmask(is:ie,js:je), dm_p(is:ie,js:je), dn_p(is:ie,js:je))
@@ -513,6 +518,7 @@ contains
     Hz = 0.0_rp; z_r = 0.0_rp; z_w = 0.0_rp
     FlxU = 0.0_rp; FlxV = 0.0_rp; We = 0.0_rp; Wi = 0.0_rp
     rmask = 1.0_rp; umask = 1.0_rp; vmask = 1.0_rp; pmask = 1.0_rp
+    riv_umask = 0.0_rp; riv_vmask = 0.0_rp
     lonr = 0.0_rp; latr = 0.0_rp; angler = 0.0_rp
     swflx = 0.0_rp; tair = 0.0_rp
     Akv = 0.0_rp; Akt = 0.0_rp
@@ -538,6 +544,7 @@ contains
     if (allocated(Hz)) deallocate(Hz, Hz_u, Hz_v, z_r, z_w)
     if (allocated(FlxU)) deallocate(FlxU, FlxV, We, Wi)
     if (allocated(h)) deallocate(h, hinv, pm, pn, dn_u, dm_v, dm_r, dn_r)
+    if (allocated(riv_umask)) deallocate(riv_umask, riv_vmask)
     if (allocated(rmask)) deallocate(rmask, umask, vmask, f, lonr, latr, angler, swflx, tair, &
                                     pmask, dm_p, dn_p, dm_u, dn_v, pmon_u, pnom_v, dndx, dmde, &
                                     Akv, Akt, visc2_r, visc2_p, diff2, &

@@ -29,6 +29,7 @@ module comm_mod
 
   public :: init_comm
   public :: finalize_comm
+  public :: comm_abort
   public :: comm_rank
   public :: comm_size
   public :: comm_exchange2
@@ -162,6 +163,18 @@ contains
     io_rank_w = -1
     io_rank_flag = .false.
   end subroutine finalize_comm
+
+  subroutine comm_abort(code)
+    ! Stops every rank, compute and writer, after an error on this one (an
+    ! error stop on one rank alone may leave the others waiting).
+    integer, intent(in) :: code
+#ifdef USE_MPI
+    integer :: ierr
+    flush(6)
+    call MPI_Abort(MPI_COMM_WORLD, code, ierr)
+#endif
+    error stop code
+  end subroutine comm_abort
 
   integer function comm_world_size()
     comm_world_size = world_size

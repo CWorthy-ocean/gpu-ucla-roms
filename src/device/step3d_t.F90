@@ -13,6 +13,7 @@ module step3d_t_mod
   use obc, only: t3dbc
   use pre_step3d_mod, only: ncol_probe, icol_probe, jcol_probe
   use passive_mod, only: ntp, passive_corrector
+  use rivers_mod, only: river_on, rivers_ts, RIV_COR
   implicit none
   private
   public :: step3d_t
@@ -37,6 +38,9 @@ contains
     fused = fuse_tracers(nrhs, n_new, n_new)
     lim = dry_lim(G_TRC)
     if (fused) call cor_tracers_fused(nrhs, n_new, dt_loc)
+    ! River faces: their flux was masked by the advection; add it before the
+    ! forcing and the implicit solve (all tracers here, per tracer below).
+    if (fused .and. river_on) call rivers_ts(RIV_COR, n_new, dt_loc, 1_ip, nt)
     do itrc = 1, nt
       if (.not. fused) then
       if (itrc == itemp) call dump_cor_col('cor in', 1)
@@ -68,6 +72,7 @@ contains
         enddo
       enddo
       if (itrc == itemp) call dump_cor_col('cor vadv', 3)
+      if (river_on) call rivers_ts(RIV_COR, n_new, dt_loc, itrc, itrc)
       endif
 
       if (itrc == itemp) then

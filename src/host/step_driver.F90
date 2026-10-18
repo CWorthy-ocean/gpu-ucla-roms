@@ -22,6 +22,7 @@ module step_driver
   use passive_mod, only: ntp, passive_t3dmix, passive_exchange_mid
   use lmd_mod, only: lmd_vmix
   use frc_io, only: set_forces, frc_prefetch
+  use river_io, only: set_rivers
   use bry_io, only: set_bry_all, dump_bry_north
   use tide_io, only: set_tides
   use run_timers, only: rt_dev_collect
@@ -77,6 +78,7 @@ contains
     ! --- predictor (nrhs = n, nnew = 3) ---
     frc_slot = 0
     call set_forces()
+    call set_rivers(0)                    ! river data at time n (predictor)
     call dump_swflx_b('after pred set_forces')
     call step_mark('set_forces')
     frc_slot = 1
@@ -135,11 +137,14 @@ contains
     call rho_eos(nrhs, 2)
     frc_slot = 1
     call set_forces()
+    call set_rivers(1)                    ! river data at n+1/2 (fast loop, corrector)
     call dump_swflx_b('after corr set_forces')
     call lmd_vmix(nrhs)
-    frc_slot = 3
+    ! Boundary data and tidal harmonics for n+1 (CPU main.F90 since
+    ! 69a23382; before it read n+3/2); the tidal potential stays at n+1/2.
+    frc_slot = 2
     call set_bry_all()
-    call set_tides()
+    call set_tides(1.0_rp)
     call dump_bry_north('after tide', frc_modtime())
     call step_mark('corrector forces')
     call dump_vic('before uv1')

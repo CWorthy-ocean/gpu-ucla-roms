@@ -108,7 +108,7 @@ contains
         if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         do k = 1, nz
           Hz_u(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i - 1, j, k))
-          FlxU(i, j, k) = apply_mask(Hz_u(i, j, k) * dn_u(i, j) * u(i, j, k, n_rhs), umask(i, j))
+          FlxU(i, j, k) = apply_mask(Hz_u(i, j, k) * dn_u(i, j) * u(i, j, k, n_rhs), umask(i, j) + riv_umask(i, j))
         enddo
       enddo
     enddo
@@ -120,7 +120,7 @@ contains
         if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
         do k = 1, nz
           Hz_v(i, j, k) = 0.5_rp * (Hz(i, j, k) + Hz(i, j - 1, k))
-          FlxV(i, j, k) = apply_mask(Hz_v(i, j, k) * dm_v(i, j) * v(i, j, k, n_rhs), vmask(i, j))
+          FlxV(i, j, k) = apply_mask(Hz_v(i, j, k) * dm_v(i, j) * v(i, j, k, n_rhs), vmask(i, j) + riv_vmask(i, j))
         enddo
       enddo
     enddo

@@ -13,6 +13,7 @@ module his_io
   use comm_mod, only: comm_rank, comm_size, compute_barrier
   use run_timers, only: rt_tic, rt_toc, rt_mark_rst, RT_HIS, RT_RST
   use passive_mod, only: ntp, tp, wrt_passive, passive_name
+  use rivers_mod, only: river_on
   use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
                        marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
   implicit none
@@ -296,6 +297,10 @@ contains
       call io_stage8_2d('DV_avg_bak', DV_avg_bak(is, js), ir0, ir1, jv0, jv1, ir0, 0)
       call io_stage8_2d('rufrc', rufrc_bak(is, js, max(nstp, 1)), iu0, iu1, jr0, jr1, 0, jr0)
       call io_stage8_2d('rvfrc', rvfrc_bak(is, js, max(nstp, 1)), ir0, ir1, jv0, jv1, ir0, 0)
+      if (river_on) then   ! river faces for the next run's initial masks (CPU wrt_rst)
+        call io_stage8_2d('riv_umask', riv_umask(is, js), iu0, iu1, jr0, jr1, 0, jr0)
+        call io_stage8_2d('riv_vmask', riv_vmask(is, js), ir0, ir1, jv0, jv1, ir0, 0)
+      endif
       call io_stage8_end()
       call wall_stamp('restart staged')
       if (comm_rank() == 0) write(*,'(a,es14.6,a,i0,a,i0)') 'staged restart t = ', twrite, &
@@ -329,6 +334,10 @@ contains
     call put_v2(ncid, 'DV_avg_bak', DV_avg_bak, rec_rst)
     call put_u2(ncid, 'rufrc', rufrc_bak(:,:,max(nstp,1)), rec_rst)
     call put_v2(ncid, 'rvfrc', rvfrc_bak(:,:,max(nstp,1)), rec_rst)
+    if (river_on) then
+      call put_u2(ncid, 'riv_umask', riv_umask, rec_rst)
+      call put_v2(ncid, 'riv_vmask', riv_vmask, rec_rst)
+    endif
     call nc_close(ncid)
     endif
     call compute_barrier()
@@ -418,6 +427,10 @@ contains
     id = nc_def_var(ncid, 'DV_avg_bak', (/d_xi, d_etav, d_t/))
     id = nc_def_var(ncid, 'rufrc', (/d_xiu, d_eta, d_t/))
     id = nc_def_var(ncid, 'rvfrc', (/d_xi, d_etav, d_t/))
+    if (river_on) then
+      id = nc_def_var(ncid, 'riv_umask', (/d_xiu, d_eta, d_t/))
+      id = nc_def_var(ncid, 'riv_vmask', (/d_xi, d_etav, d_t/))
+    endif
     call nc_put_att_text(ncid, '', 'title', output_title)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
     call nc_enddef(ncid)

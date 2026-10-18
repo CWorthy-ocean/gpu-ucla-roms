@@ -115,7 +115,7 @@ contains
     integer(ip), intent(in) :: tind
     integer(ip) :: i, j, k, nx, ny, nz, tid, lim
     real(rp) :: cff, dudz, dvdz, nu, mult
-    real(rp) :: akv_loc, akt_t, akt_s
+    real(rp) :: akv_loc, akt_t, akt_s, pv, pt, ps, tv, tt, ts
 
     nx = decomp%nx
     ny = decomp%ny
@@ -146,21 +146,31 @@ contains
           wrk3d(i, j, k) = wrk3d(i, j, k) * mult
           wrk3e(i, j, k) = wrk3e(i, j, k) * mult
         enddo
-        col_wc(i, j, nz) = col_wc(i, j, nz - 1) + akv_loc
-        wrk3d(i, j, nz) = wrk3d(i, j, nz - 1) + akt_t
-        wrk3e(i, j, nz) = wrk3e(i, j, nz - 1) + akt_s
-        col_wc(i, j, 0)  = col_wc(i, j, 1) + akv_loc
-        wrk3d(i, j, 0)  = wrk3d(i, j, 1) + akt_t
-        wrk3e(i, j, 0)  = wrk3e(i, j, 1) + akt_s
-        ! Sequential in k, matching lmd_vmix_tile (uses already-smoothed k-1).
+        ! As lmd_vmix_tile since 69a23382: pads without the background,
+        ! smoothing from unsmoothed neighbours, the background added once.
+        col_wc(i, j, nz) = col_wc(i, j, nz - 1)
+        wrk3d(i, j, nz) = wrk3d(i, j, nz - 1)
+        wrk3e(i, j, nz) = wrk3e(i, j, nz - 1)
+        col_wc(i, j, 0)  = col_wc(i, j, 1)
+        wrk3d(i, j, 0)  = wrk3d(i, j, 1)
+        wrk3e(i, j, 0)  = wrk3e(i, j, 1)
+        pv = col_wc(i, j, 0); pt = wrk3d(i, j, 0); ps = wrk3e(i, j, 0)
         do k = 1, nz - 1
-          col_wc(i, j, k) = 0.5_rp * col_wc(i, j, k) + 0.25_rp * col_wc(i, j, k - 1) + &
+          tv = col_wc(i, j, k); tt = wrk3d(i, j, k); ts = wrk3e(i, j, k)
+          col_wc(i, j, k) = 0.5_rp * tv + 0.25_rp * pv + &
                         0.25_rp * col_wc(i, j, k + 1) + akv_loc
-          wrk3d(i, j, k) = 0.5_rp * wrk3d(i, j, k) + 0.25_rp * wrk3d(i, j, k - 1) + &
+          wrk3d(i, j, k) = 0.5_rp * tt + 0.25_rp * pt + &
                         0.25_rp * wrk3d(i, j, k + 1) + akt_t
-          wrk3e(i, j, k) = 0.5_rp * wrk3e(i, j, k) + 0.25_rp * wrk3e(i, j, k - 1) + &
+          wrk3e(i, j, k) = 0.5_rp * ts + 0.25_rp * ps + &
                         0.25_rp * wrk3e(i, j, k + 1) + akt_s
+          pv = tv; pt = tt; ps = ts
         enddo
+        col_wc(i, j, nz) = col_wc(i, j, nz) + akv_loc
+        wrk3d(i, j, nz) = wrk3d(i, j, nz) + akt_t
+        wrk3e(i, j, nz) = wrk3e(i, j, nz) + akt_s
+        col_wc(i, j, 0) = col_wc(i, j, 0) + akv_loc
+        wrk3d(i, j, 0) = wrk3d(i, j, 0) + akt_t
+        wrk3e(i, j, 0) = wrk3e(i, j, 0) + akt_s
       enddo
     enddo
     call sync_arch()
@@ -576,15 +586,21 @@ contains
             cv_n = cv_n * mult
             ct_n = ct_n * mult
           endif
+          ! 1-2-1 smoothing from unsmoothed neighbours, the pads (k = 0, nz)
+          ! unsmoothed without the background, the background added once
+          ! (CPU lmd_vmix since 69a23382; before, each level used the already
+          ! smoothed k-1 and the padded background, ~1.33x the background).
+          ! pv/pt/ps: the unsmoothed value at k-1.
           if (k == 0) then
             kv = cv_n + akv_loc
             kt = ct_n + akt_t
             ks = ct_n + akt_s
+            pv = cv_n; pt = ct_n; ps = ct_n
           else if (k < nz) then
             if (k < nz - 1) then
               nv = cv_n; nt = ct_n; ns = ct_n
             else
-              nv = cv_c + akv_loc; nt = ct_c + akt_t; ns = ct_c + akt_s
+              nv = cv_c; nt = ct_c; ns = ct_c
             endif
             kv = 0.5_rp * cv_c + 0.25_rp * pv + &
                  0.25_rp * nv + akv_loc
@@ -592,12 +608,12 @@ contains
                  0.25_rp * nt + akt_t
             ks = 0.5_rp * ct_c + 0.25_rp * ps + &
                  0.25_rp * ns + akt_s
+            pv = cv_c; pt = ct_c; ps = ct_c
           else
             kv = cv_c + akv_loc
             kt = ct_c + akt_t
             ks = ct_c + akt_s
           endif
-          pv = kv; pt = kt; ps = ks
           cv_c = cv_n; ct_c = ct_n
 
           ! surface BL profile

@@ -17,6 +17,7 @@ module pre_step3d_mod
   use uv_rhs
   use passive_mod, only: ntp, tp, passive_predictor, passive_t3dbc
   use obc, only: u3dbc, v3dbc, t3dbc
+  use rivers_mod, only: river_on, rivers_ts, rivers_uv, RIV_PRE
   implicit none
   private
   public :: pre_step3d
@@ -97,6 +98,9 @@ contains
       enddo
     enddo
     endif
+    ! River faces: the horizontal pass masked their flux; add the river
+    ! flux (all tracers) before the vertical pass.
+    if (river_on) call rivers_ts(RIV_PRE, n_new, dtau, 1_ip, nt)
     call dump_pre_col('pre horiz', 2, indx)
 
     call dump_rv_pred('after prsgrd')
@@ -397,6 +401,7 @@ contains
 
     endif
     call dump_vn3('after pred impl')
+    if (river_on) call rivers_uv(RIV_PRE)    ! CPU pre_step3d: river faces, then u3dbc/v3dbc
     call u3dbc()
     call v3dbc()
     call dump_vn3('after v3dbc')

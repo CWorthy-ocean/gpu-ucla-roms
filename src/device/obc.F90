@@ -1031,7 +1031,7 @@ contains
             endif
             t(nx + 1, j, k, nn, it) = (1.0_rp - cx) * (t(nx + 1, j, k, ns, it) &
                  - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) &
-                 + cx * (t(nx, j, k, nn, it) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
+                 + cx * (t(nx, j, k, ns, it) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
             t(nx + 1, j, k, nn, it) = ((1.0_rp - cext) * t(nx + 1, j, k, nn, it) + &
                  cext * t_east(j, k, it)) * rmask(nx + 1, j)
           enddo
@@ -1097,7 +1097,7 @@ contains
             endif
             t(i, ny + 1, k, nn, it) = (1.0_rp - cx) * (t(i, ny + 1, k, ns, it) &
                  - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) &
-                 + cx * (t(i, ny, k, nn, it) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
+                 + cx * (t(i, ny, k, ns, it) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
             t(i, ny + 1, k, nn, it) = ((1.0_rp - cext) * t(i, ny + 1, k, nn, it) + &
                  cext * t_north(i, k, it)) * rmask(i, ny + 1)
           enddo

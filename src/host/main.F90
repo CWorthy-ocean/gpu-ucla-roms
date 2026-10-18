@@ -12,6 +12,7 @@ program roms_gpu
   use passive_mod, only: passive_exchange_finish
   use halo_mod, only: hg_audit_report
   use frc_io, only: frc_prefetch_drain
+  use feature_guard, only: check_namelist_features
   use run_timers, only: rt_tic, rt_toc, rt_report, rt_nsteps, RT_LOOP, RT_OUTPUT, RT_FINAL, RT_INIT, &
                         rt_steps_init, rt_step_begin, rt_step_end
   implicit none
@@ -25,6 +26,12 @@ program roms_gpu
   mode = 'geom'
   if (command_argument_count() >= 1) call get_command_argument(1, mode)
   call init_comm()
+  if (trim(mode) == 'load' .or. trim(mode) == 'run') then
+    ! Every rank, writers included, so that all stop together.
+    nml_path = 'namelist.nml'
+    if (command_argument_count() >= 2) call get_command_argument(2, nml_path)
+    call check_namelist_features(nml_path)
+  endif
   if (is_io_rank()) then
     ! Output server: no GPU context, no model state. Serves until QUIT.
     call io_server_run()

@@ -175,7 +175,7 @@ contains
     dtm = marbl_timestep
     rc = rho0_case * Cp
     ! forcing at the corrector's set_forces time (CPU: '1/2 fwd', n+dt/2);
-    ! by now the step driver has moved frc_slot on to the n+3/2 boundary time.
+    ! by now the step driver has moved frc_slot on to the n+1 boundary time.
     islot = frc_slot
     frc_slot = 1
     tfrc = frc_modtime()
@@ -210,22 +210,77 @@ contains
     call marbl_interior_compute(ntp, nz, nn, 3_ip, tp, nt, t, z_r, z_w, Hz, rmask, sf_dust, dtm, .false.)
     call rt_dev_end()
     ncalls = ncalls + 1
-    if (ncalls <= 3 .or. mod(ncalls, 24) == 0) then
-      ! failure counts as a device reduction (its result waits for the
-      ! kernels before it), so the managed sf_err/it_err stay on the device
-      nsf = 0; nit = 0
-      CUF_DO2
-      do j = 1, ny
-        do i = 1, nx
-          if (sf_err(i, j) /= 0) nsf = nsf + 1
-          nit = nit + it_err(i, j)
-        enddo
+    ! Carbonate solver failures (no pH bracket, or no convergence) are
+    ! MARBL errors, and the CPU model aborts on them; so does this one,
+    ! after every call. The counts are a device reduction (its result waits
+    ! for the kernels before it), so the managed sf_err/it_err stay on the
+    ! device. MiniPac MARBL steps took the same time with and without it.
+    nsf = 0; nit = 0
+    CUF_DO2
+    do j = 1, ny
+      do i = 1, nx
+        if (sf_err(i, j) /= 0) nsf = nsf + 1
+        nit = nit + it_err(i, j)
       enddo
-      write(*,'(a,i0,a,i0,a,i0,a,i0)') 'MARBL call ', ncalls, ' at iic ', iic, &
-           '  surface solver failures ', nsf, &
-           '  interior solver failures ', nit
+    enddo
+    if (nsf + nit > 0) call solver_abort(nsf, nit, nn)
+    if (ncalls <= 3 .or. mod(ncalls, 24) == 0) then
+      write(*,'(a,i0,a,i0,a)') 'MARBL call ', ncalls, ' at iic ', iic, '  carbonate solver: no failures'
     endif
   end subroutine marbl_gpu_step
+
+  subroutine solver_abort(nsf, nit, nn)
+    ! MARBL's carbonate solver failed on this tile: list the first columns
+    ! (global i, j, their failures, surface inputs and the column's lowest
+    ! salinity, as the CPU's MARBL error lists dic, ta, pt, sit, temp and
+    ! salt) and stop every rank.
+    use comm_mod, only: comm_rank, comm_abort
+    integer(ip), intent(in) :: nsf, nit, nn
+    integer(ip) :: i, j, k, m, c, n, nz
+    integer(ip) :: idic, ialk, ipo4, isio3
+    real(rp) :: smin, v(4)
+#ifdef USE_CUDA
+    integer :: istat
+    istat = cudaDeviceSynchronize()    ! the managed arrays are read on the host
+#endif
+    nz = decomp%nz
+    idic = 0; ialk = 0; ipo4 = 0; isio3 = 0
+    do m = 1, ntp
+      select case (trim(passive_name(m)))
+      case ('DIC'); idic = m
+      case ('ALK'); ialk = m
+      case ('PO4'); ipo4 = m
+      case ('SiO3'); isio3 = m
+      end select
+    enddo
+    write(*,'(a,i0,a,i0,a,i0,a,i0,a)') 'MARBL ERROR: carbonate solver failed on rank ', comm_rank(), &
+         ' at iic ', iic, ' (', nsf, ' surface columns, ', nit, ' interior points; no pH bracket or no convergence)'
+    write(*,'(a)') '   global i     j  surf  intr      temp      salt   min salt       DIC       ALK       PO4      SiO3'
+    n = 0
+    do j = 1, decomp%ny
+      do i = 1, decomp%nx
+        if (sf_err(i, j) == 0 .and. it_err(i, j) == 0) cycle
+        n = n + 1
+        if (n > 10) exit
+        smin = huge(smin)
+        do k = 1, nz
+          smin = min(smin, t(i, j, k, nn, isalt))
+        enddo
+        v = 0.0_rp
+        c = tpcol_h(i, j)
+        if (c > 0) then
+          if (idic > 0) v(1) = real(tp(idic, c, nz, nn), rp)
+          if (ialk > 0) v(2) = real(tp(ialk, c, nz, nn), rp)
+          if (ipo4 > 0) v(3) = real(tp(ipo4, c, nz, nn), rp)
+          if (isio3 > 0) v(4) = real(tp(isio3, c, nz, nn), rp)
+        endif
+        write(*,'(3x,2i6,2i6,7es10.2)') decomp%i0 + i - 1, decomp%j0 + j - 1, sf_err(i, j), it_err(i, j), &
+             t(i, j, nz, nn, itemp), t(i, j, nz, nn, isalt), smin, v
+      enddo
+      if (n > 10) exit
+    enddo
+    call comm_abort(1)
+  end subroutine solver_abort
 
   ! Debug: NaN census of the surface-flux inputs/outputs after the first
   ! call, plus one sample point.

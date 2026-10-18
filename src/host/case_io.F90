@@ -11,6 +11,7 @@ module case_io
   use frc_io, only: read_forcing_namelist, init_forcing, set_forces, close_frc_cache
   use bry_io, only: init_bry, set_bry_all
   use tide_io, only: read_tide_namelist, init_tides, set_tides
+  use river_io, only: read_river_namelist, init_rivers
   use his_io, only: read_output_namelist, set_output_root, init_output
   use comm_mod, only: comm_rank, comm_size, comm_min_real
   use tile_balance, only: balance_cuts, uniform_cuts
@@ -146,6 +147,7 @@ contains
     call read_output_namelist(unit)
     call read_passive_namelist(unit, nt_passive)
     call read_marbl_namelist(unit, nml_dir, nt_bgc)
+    call read_river_namelist(unit)
     case_ntp_est = max(ntp, nt_bgc)
 
     rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios)
@@ -580,6 +582,7 @@ contains
     endif
     call load_init_records(ncid, i0, j0, nxi, neta, xi_u, eta_v)
     call nc_close(ncid)
+    call mask_loaded_velocities()
     call wall_stamp('initial state read')
 
     call sanitize_land()
@@ -590,6 +593,7 @@ contains
     ! Slot 2 is n-1 only when both records were restored; otherwise copy
     ! the current state into the AB/AM slots.
     call copy_initial_slots(.not. case_have_prev)
+    if (.not. case_exact_restart) call init_barotropic_fluxes()
     knew = 1
     nstp = 1
     nrhs = 1
@@ -605,8 +609,13 @@ contains
     call init_bry()
     call wall_stamp('boundary init')
     call init_tides()
-    call close_frc_cache()
     call wall_stamp('tide init')
+    ! after the initial state: the river faces add to riv_umask/riv_vmask
+    ! as read from the initial file (CPU: get_init, then calc_river_flux);
+    ! before close_frc_cache: it scans the forcing files' open handles
+    call init_rivers(case_grdname)
+    call wall_stamp('river init')
+    call close_frc_cache()
     frc_slot = 0
     call set_forces()
     call set_bry_all()
@@ -765,6 +774,21 @@ contains
     if (nc_has_var(ncid, 'hbbl')) then
       call pr_store_2d(ncid, 'hbbl', hbbl(decomp%is, decomp%js), i0, j0, nxi, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
     endif
+    ! River masks (CPU get_init: needed for exact restarts). Absent: 0.
+    ! Clamped to [0, 1] as the CPU does (fill values on land), not masked
+    ! with umask/vmask: river faces have umask = 0.
+    if (nc_has_var(ncid, 'riv_umask')) then
+      call pr_store_2d(ncid, 'riv_umask', riv_umask(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
+      if (pr_taking()) then
+        where (riv_umask /= riv_umask .or. riv_umask < 0.0_rp .or. riv_umask > 1.0_rp) riv_umask = 0.0_rp
+      endif
+    endif
+    if (nc_has_var(ncid, 'riv_vmask')) then
+      call pr_store_2d(ncid, 'riv_vmask', riv_vmask(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
+      if (pr_taking()) then
+        where (riv_vmask /= riv_vmask .or. riv_vmask < 0.0_rp .or. riv_vmask > 1.0_rp) riv_vmask = 0.0_rp
+      endif
+    endif
   end subroutine load_2d_record
 
   subroutine load_3d_record(ncid, rec, tindx, i0, j0, nxi, neta, xi_u, eta_v)
@@ -799,12 +823,13 @@ contains
     call pr_store_2d(ncid, 'DV_avg2', DV_avg2(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
     call pr_store_2d(ncid, 'DU_avg_bak', DU_avg_bak(decomp%is, decomp%js), i0+1, j0, xi_u, neta, rec, i0f=tile_fi0, j0f=tile_fj0)
     call pr_store_2d(ncid, 'DV_avg_bak', DV_avg_bak(decomp%is, decomp%js), i0, j0+1, nxi, eta_v, rec, i0f=tile_fi0, j0f=tile_fj0)
-    DU_avg1 = DU_avg1 * umask
-    DV_avg1 = DV_avg1 * vmask
-    DU_avg2 = DU_avg2 * umask
-    DV_avg2 = DV_avg2 * vmask
-    DU_avg_bak = DU_avg_bak * umask
-    DV_avg_bak = DV_avg_bak * vmask
+    ! CPU get_init: zero true land but keep river faces (umask = 0, riv_umask = 1)
+    DU_avg1 = DU_avg1 * (umask + riv_umask)
+    DV_avg1 = DV_avg1 * (vmask + riv_vmask)
+    DU_avg2 = DU_avg2 * (umask + riv_umask)
+    DV_avg2 = DV_avg2 * (vmask + riv_vmask)
+    DU_avg_bak = DU_avg_bak * (umask + riv_umask)
+    DV_avg_bak = DV_avg_bak * (vmask + riv_vmask)
   end subroutine load_coupling_fields
 
   subroutine load_rufrc_slot(ncid, rec, tindx, i0, j0, nxi, neta, xi_u, eta_v)
@@ -857,6 +882,61 @@ contains
       nxi = int(decomp%nx); neta = int(decomp%ny)
     endif
   end subroutine infer_layout
+
+  subroutine init_barotropic_fluxes()
+    ! CPU set_depth with iic == 0, which main.F90 calls after get_init on
+    ! every start that is not an exact restart (get_init leaves iic = 1 only
+    ! after a successful exact restart): the fast-time-averaged barotropic
+    ! fluxes from the initial state,
+    !   DU_avg1 = 0.5*(h(i-1)+h(i)+zeta(i)+zeta(i-1))*dn_u*ubar,
+    ! which the first step's predictor coupling uses as its target. Without
+    ! it a cold start couples to zero transport.
+    integer(ip) :: i, j, is, ie, js, je
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = js, je
+      do i = is, ie
+        if (i > is) DU_avg1(i, j) = 0.5_rp * (h(i - 1, j) + h(i, j) + zeta(i, j, 1) + &
+                                    zeta(i - 1, j, 1)) * dn_u(i, j) * (ubar(i, j, 1))
+        if (j > js) DV_avg1(i, j) = 0.5_rp * (h(i, j) + h(i, j - 1) + zeta(i, j, 1) + &
+                                    zeta(i, j - 1, 1)) * dm_v(i, j) * (vbar(i, j, 1))
+      enddo
+    enddo
+  end subroutine init_barotropic_fluxes
+
+  subroutine mask_loaded_velocities()
+    ! CPU get_init: the loaded ubar/vbar (slot 1) and u/v (slots 1 and 2)
+    ! times (umask + riv_umask) / (vmask + riv_vmask): zero on land, kept on
+    ! river faces. Initial files may hold nonzero velocities on land
+    ! (Iceland0: every land face), which the CPU never sees.
+    integer(ip) :: i, j, k, n, is, ie, js, je, nz
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    nz = decomp%nz
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = js, je
+      do i = is, ie
+        ubar(i, j, 1) = ubar(i, j, 1) * (umask(i, j) + riv_umask(i, j))
+        vbar(i, j, 1) = vbar(i, j, 1) * (vmask(i, j) + riv_vmask(i, j))
+      enddo
+    enddo
+#ifdef USE_CUDA
+    !$cuf kernel do(3) <<<*,*>>>
+#endif
+    do k = 1, nz
+      do j = js, je
+        do i = is, ie
+          do n = 1, 2
+            u(i, j, k, n) = u(i, j, k, n) * (umask(i, j) + riv_umask(i, j))
+            v(i, j, k, n) = v(i, j, k, n) * (vmask(i, j) + riv_vmask(i, j))
+          enddo
+        enddo
+      enddo
+    enddo
+  end subroutine mask_loaded_velocities
 
   subroutine sanitize_land()
     ! Elementwise on the device: the state may already be on the GPU (the

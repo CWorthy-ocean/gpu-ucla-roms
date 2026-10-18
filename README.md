@@ -6,22 +6,27 @@ step follows CPU UCLA ROMS routine for routine, and the model reads the same
 namelists and input files.
 
 - **On the GPU:** the whole baroclinic and barotropic time step (dynamics,
-  KPP mixing, tracer advection and mixing, tides, bulk surface forcing, open
-  boundaries), MARBL's surface fluxes and interior ecosystem, and generic
+  KPP mixing, tracer advection and mixing, tides, bulk surface forcing,
+  rivers, open boundaries), MARBL's surface fluxes and interior ecosystem, and generic
   passive tracers. Model fields stay in GPU memory for the whole run.
 - **Many GPUs:** one MPI rank per GPU, tiles balanced by ocean cells and
   memory, halo exchanges GPU to GPU with a CUDA-aware MPI. Separate writer
   ranks write history and restart files while the GPUs keep stepping.
   Restart files hold two records, so restarts are exact.
-- **Checked:** after 3 days, GPU minus CPU is within the CPU model's own
-  sensitivity to a 1e-6 degC initial temperature perturbation for every
-  MARBL tracer and diagnostic (MiniPac). Every optimization was checked to
-  reproduce the previous version bit for bit.
+- **Checked:** step by step, GPU minus CPU is at most one float32 unit in
+  every physics field and MARBL tracer (Iceland0 with and without rivers,
+  MiniPac). After 3 days it is within the CPU model's own sensitivity to a
+  1e-6 degC initial temperature perturbation, apart from local events (one
+  column, open-boundary inflow switches) that do not recur from a common
+  state. Every optimization was checked to reproduce the previous version
+  bit for bit.
 - **Speed (Derecho):** Pacific domain with MARBL, 2 nodes of each kind: 21x
   faster per time step than CPU ROMS-MARBL (8 A100s vs 256 AMD cores).
-- **Not yet on the GPU:** rivers and other point sources, CDR tracer surface
+- **Not yet on the GPU:** pipes (point sources), CDR tracer surface
   fluxes and air-sea gas exchange, output for nested child grids, closed
-  basins (one known boundary bug), averages and monthly restarts.
+  basins (one known boundary bug), averages and monthly restarts. A
+  namelist that switches on a feature the GPU lacks stops the run at
+  start-up with a list of the switches.
 
 ## Getting started
 

@@ -20,6 +20,7 @@ module passive_mod
   use time_state
   use passive_column_mod, only: passive_column_run, passive_horiz_run, passive_t3dmix_run
   use halo_mod, only: halo_fill_3d_tp, halo_tp_start, halo_tp_mid, halo_tp_finish, tp_overlap_on
+  use rivers_mod, only: river_on, rivers_tp, RIV_PRE, RIV_COR
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
 #endif
@@ -186,6 +187,7 @@ contains
     ! halo before that (t3dbc reads slot nstp).
     call halo_tp_finish(tp, ntp)
     call passive_horiz_run(tp, ntp, 1_ip, nrhs, n_stp, n_new, indx, cf_stp, cf_bak, dtau)
+    if (river_on) call rivers_tp(tp, ntp, RIV_PRE, n_new, dtau)   ! river faces, before the column pass
     call passive_column_run(tp, ntp, nrhs, n_new, dtau, 1_ip, .true., passive_mirror)
   end subroutine passive_predictor
 
@@ -200,6 +202,7 @@ contains
     ! boundary update, completed here
     call halo_tp_finish(tp, ntp)
     call passive_horiz_run(tp, ntp, 2_ip, nrhs, nnew, nnew, nnew, 0.0_rp, 0.0_rp, dt_in)
+    if (river_on) call rivers_tp(tp, ntp, RIV_COR, nnew, dt_in)
     call passive_column_run(tp, ntp, nrhs, nnew, dt_in, 0_ip, .false., passive_mirror)
     call passive_t3dbc()
     ! No exchange of slot nnew here: MARBL and t3dmix read it at the point
@@ -352,7 +355,7 @@ contains
               endif
               tn = (1.0_rp - cx) * (real(tp(itr, tpcol(nx + 1, j), k, ns), rp) &
                    - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) &
-                   + cx * (real(tp(itr, tpcol(nx, j), k, nn), rp) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
+                   + cx * (real(tp(itr, tpcol(nx, j), k, ns), rp) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_east(j, k, isalt)
               if (mbry) text = tb_east(j, k, itr)
@@ -438,7 +441,7 @@ contains
               endif
               tn = (1.0_rp - cx) * (real(tp(itr, tpcol(i, ny + 1), k, ns), rp) &
                    - max(cy, 0.0_rp) * g1c - min(cy, 0.0_rp) * g1p) &
-                   + cx * (real(tp(itr, tpcol(i, ny), k, nn), rp) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
+                   + cx * (real(tp(itr, tpcol(i, ny), k, ns), rp) - max(cy, 0.0_rp) * g0c - min(cy, 0.0_rp) * g0p)
               text = 0.0_rp
               if (mir .and. itr == 1) text = t_north(i, k, isalt)
               if (mbry) text = tb_north(i, k, itr)

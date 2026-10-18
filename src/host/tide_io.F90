@@ -33,7 +33,8 @@ module tide_io
   real(rp), WORK_ATTR allocatable :: utide_r(:,:,:), utide_i(:,:,:)
   real(rp), WORK_ATTR allocatable :: vtide_r(:,:,:), vtide_i(:,:,:)
   real(rp), WORK_ATTR allocatable :: ptide_r(:,:,:), ptide_i(:,:,:)
-  real(rp), WORK_ATTR allocatable :: tide_c(:), tide_s(:)   ! per-step cos/sin per constituent
+  real(rp), WORK_ATTR allocatable :: tide_c(:), tide_s(:)   ! per-step cos/sin per constituent (boundary)
+  real(rp), WORK_ATTR allocatable :: tide_cp(:), tide_sp(:) ! the same for the potential (always n+1/2)
 
   public :: read_tide_namelist
   public :: init_tides
@@ -96,7 +97,7 @@ contains
     if (ntides < 1) ntides = nrec
     ntides = min(ntides, max(nrec, 1))
     allocate(ftide(ntides))
-    allocate(tide_c(ntides), tide_s(ntides))
+    allocate(tide_c(ntides), tide_s(ntides), tide_cp(ntides), tide_sp(ntides))
     call nc_get_1d(ncid, 'omega', ftide)
     if (bry_tides) then
       allocate(ztide_r(is:ie,js:je,ntides), ztide_i(is:ie,js:je,ntides))
@@ -137,13 +138,22 @@ contains
     write(*,'(a,i0,a,2l2)') 'tides: n = ', ntides, '  pot,bry =', pot_tides, bry_tides
   end subroutine init_tides
 
-  subroutine set_tides()
+  subroutine set_tides(bry_phase)
     ! One small device kernel per constituent and target (c, s are
     ! kernel arguments), in the same order as the host loops it replaces.
+    ! bry_phase (units of dt, default 0.5): the boundary harmonics are at
+    ! time + bry_phase*dt; the potential is always at n+1/2, where prsgrd
+    ! uses it (CPU tides.F90 since 69a23382: the corrector's boundary update
+    ! is at n+1). The coefficients are host-written managed arrays; the
+    ! corrector call overwrites the predictor's only after set_depth's
+    ! device sync, so the predictor's kernels have used them by then.
+    real(rp), intent(in), optional :: bry_phase
     integer(ip) :: it, i, j, nx, ny, ip, is, ie, js, je, n
-    real(rp) :: omT, c, s, z0, v0, zw, ze, uw, ue, vw, ve
+    real(rp) :: omT, omTp, c, s, z0, v0, zw, ze, uw, ue, vw, ve, bphase
     logical :: want_dump
     if (.not. tides_ready) return
+    bphase = 0.5_rp
+    if (present(bry_phase)) bphase = bry_phase
     nx = decomp%nx; ny = decomp%ny
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     ip = iprb_pt(1)
@@ -158,9 +168,12 @@ contains
     ! bit); one kernel per target sums the constituents in the same order
     ! as the per-constituent kernels it replaces (same rounded products).
     do it = 1, ntides
-      omT = ftide(it) * (time + 0.5_rp * dt)
+      omT = ftide(it) * (time + bphase * dt)
+      omTp = ftide(it) * (time + 0.5_rp * dt)
       tide_c(it) = cos(omT)
       tide_s(it) = sin(omT)
+      tide_cp(it) = cos(omTp)
+      tide_sp(it) = sin(omTp)
     enddo
     n = ntides
     if (bry_tides) then
@@ -214,7 +227,7 @@ contains
           ! CPU tides.F90 writes ptide unmasked; prsgrd uses it on land.
           zw = 0.0_rp
           do it = 1, n
-            zw = zw + TMUL(ptide_r(i, j, it), tide_c(it)) - TMUL(ptide_i(i, j, it), tide_s(it))
+            zw = zw + TMUL(ptide_r(i, j, it), tide_cp(it)) - TMUL(ptide_i(i, j, it), tide_sp(it))
           enddo
           ptide(i, j) = zw
         enddo
