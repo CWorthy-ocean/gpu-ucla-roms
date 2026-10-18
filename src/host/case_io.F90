@@ -15,6 +15,7 @@ module case_io
   use cdr_io, only: read_cdr_namelist, init_cdr
   use cdr_lite_io, only: read_cdr_lite_namelist, init_cdr_lite
   use cdr_lite_out, only: read_cdr_lite_output_namelist, set_cdr_lite_output_root, init_cdr_lite_output
+  use cdr_gas_out, only: read_cdr_gas_output_namelist, set_cdr_gas_output_root, init_cdr_gas_output
   use his_io, only: read_output_namelist, set_output_root, init_output
   use comm_mod, only: comm_rank, comm_size, comm_min_real
   use tile_balance, only: balance_cuts, uniform_cuts
@@ -155,6 +156,7 @@ contains
     call read_cdr_namelist(unit)
     call read_cdr_lite_namelist(unit)
     call read_cdr_lite_output_namelist(unit)
+    call read_cdr_gas_output_namelist(unit)
     case_ntp_est = max(ntp, nt_bgc) + ncdr
 
     rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios)
@@ -181,6 +183,7 @@ contains
     case_title = trim(title)
     case_output_root = resolve_path(nml_dir, output_root_name)
     call set_cdr_lite_output_root(case_output_root)
+    call set_cdr_gas_output_root(case_output_root)
     theta_s = theta_s_in
     theta_b = theta_b_in
     hc = hc_in
@@ -636,6 +639,7 @@ contains
     call set_output_root(case_output_root, case_title)
     call init_output()
     call init_cdr_lite_output()       ! after the history/restart staging is sized
+    call init_cdr_gas_output()        ! writes its start (bracket) record
     call wall_stamp('output init')
   end subroutine load_case
 

@@ -5,21 +5,27 @@ module cdr_lite_io
   ! surface fluxes at the corrector's forcing time (cdr_lite_mod). As the
   ! CPU, the carbonate sensitivities ddic_dco2/ddic_dalk must be in the
   ! forcing files; <name>_flx of a DIC tracer may be absent (0).
-  ! Not on the GPU yet: cdr_online_carbonate_sensitivity (stops at start-up).
+  ! cdr_online_carbonate_sensitivity: beta/eta computed every corrector from
+  ! the predicted ALT_CO2 surface state (carb_sens_mod, the CPU's
+  ! set_online_carbonate_sensitivity) instead of read; the ddic files are
+  ! then not needed.
   use kinds
   use decomp_mod, only: decomp
   use gpu_state
   use time_state
   use comm_mod, only: comm_rank
-  use passive_mod, only: ntp, tp, n_oae, n_dor, ncdr, cdr0, passive_name
+  use passive_mod, only: ntp, tp, n_oae, n_dor, ncdr, cdr0, passive_name, ntp_base
+  use carb_sens_mod, only: cs_surface
   use cdr_lite_mod
   use frc_io, only: init_cdr_lite_forcing, set_cdr_lite_forces, uwnd, vwnd
   implicit none
   private
-  public :: read_cdr_lite_namelist, init_cdr_lite, set_cdr_lite
+  public :: read_cdr_lite_namelist, init_cdr_lite, set_cdr_lite, alt_co2_tracers
 
   logical :: cdr_online_carbonate_sensitivity = .false.
   namelist /cdr_lite_settings/ cdr_online_carbonate_sensitivity
+  integer(ip) :: ialk = 0, idic = 0, ipo4 = 0, isio3 = 0      ! ALT_CO2 system (online)
+  integer :: ir0, ir1, jr0, jr1
 
 contains
 
@@ -42,8 +48,15 @@ contains
       call cdrl_ensure()
       return
     endif
-    if (cdr_online_carbonate_sensitivity) &
-      error stop 'init_cdr_lite: cdr_online_carbonate_sensitivity is not on the GPU model yet'
+    if (cdr_online_carbonate_sensitivity) then
+      call alt_co2_tracers(ialk, idic, ipo4, isio3)
+      if (ialk == 0 .or. idic == 0 .or. ipo4 == 0 .or. isio3 == 0) &
+        error stop 'init_cdr_lite: cdr_online_carbonate_sensitivity needs the MARBL tracers PO4, SiO3, '// &
+                   'ALK_ALT_CO2 and DIC_ALT_CO2'
+      ! interior and physical boundary points (the gas flux uses both)
+      ir0 = merge(0, 1, decomp%edge_w); ir1 = merge(decomp%nx + 1, decomp%nx, decomp%edge_e)
+      jr0 = merge(0, 1, decomp%edge_s); jr1 = merge(decomp%ny + 1, decomp%ny, decomp%edge_n)
+    endif
     nd = n_oae + n_dor
     allocate(dic(max(nd, 1)), alk(max(nd, 1)), names(max(nd, 1)), hf(max(nd, 1)))
     do m = 1, n_oae
@@ -56,8 +69,8 @@ contains
     do m = 1, nd
       names(m) = passive_name(dic(m))
     enddo
-    call init_cdr_lite_forcing(int(nd), names, hd, ha, hf)
-    if (.not. (hd .and. ha)) then
+    call init_cdr_lite_forcing(int(nd), names, .not. cdr_online_carbonate_sensitivity, hd, ha, hf)
+    if (.not. cdr_online_carbonate_sensitivity .and. .not. (hd .and. ha)) then
       write(*,'(a,2l2)') 'init_cdr_lite: ddic_dco2, ddic_dalk found =', hd, ha
       error stop 'init_cdr_lite: CDR_LITE needs ddic_dco2 and ddic_dalk in the forcing files'
     endif
@@ -67,6 +80,7 @@ contains
              ')  _flx found =', hf(m)
       enddo
       if (.not. allocated(uwnd)) write(*,'(a)') 'cdr_lite: no bulk winds, k_gas = 0'
+      if (cdr_online_carbonate_sensitivity) write(*,'(a)') 'cdr_lite: carbonate sensitivities computed online (ALT_CO2)'
     endif
     deallocate(dic, alk, names, hf)
   end subroutine init_cdr_lite
@@ -78,11 +92,29 @@ contains
     if (.not. cdrl_on) return
     tneed = frc_modtime()
     call set_cdr_lite_forces(tneed, int(cdrl_nd), cdrl_ddco2, cdrl_ddalk, cdrl_flx)
+    if (cdr_online_carbonate_sensitivity) &
+      call cs_surface(tp, ntp, nrhs, ialk, idic, ipo4, isio3, int(ir0, ip), int(ir1, ip), int(jr0, ip), int(jr1, ip), &
+                      cdrl_ddco2, cdrl_ddalk)
     if (allocated(uwnd)) then
       call cdrl_sflx(tp, ntp, nrhs, uwnd, vwnd, .true.)
     else
       call cdrl_sflx(tp, ntp, nrhs, cdrl_ddco2, cdrl_ddco2, .false.)
     endif
   end subroutine set_cdr_lite
+
+  subroutine alt_co2_tracers(ia, id, ipo, isi)
+    ! Passive indices of ALK_ALT_CO2, DIC_ALT_CO2, PO4 and SiO3 (0: absent).
+    integer(ip), intent(out) :: ia, id, ipo, isi
+    integer(ip) :: m
+    ia = 0; id = 0; ipo = 0; isi = 0
+    do m = 1, ntp_base
+      select case (trim(passive_name(m)))
+      case ('ALK_ALT_CO2'); ia = m
+      case ('DIC_ALT_CO2'); id = m
+      case ('PO4'); ipo = m
+      case ('SiO3'); isi = m
+      end select
+    enddo
+  end subroutine alt_co2_tracers
 
 end module cdr_lite_io

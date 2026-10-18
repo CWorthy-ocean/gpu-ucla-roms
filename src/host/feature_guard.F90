@@ -45,7 +45,8 @@ contains
     endif
     call need_off('cdr_output_settings', 'do_cdr_output', 'CDR output')
     call need_off('cdr_tracer_output_settings', 'do_cdr_tracer_output', 'CDR tracer output')
-    call need_off('cdr_gas_exch_output_settings', 'do_cdr_gas_exch_output', 'CDR gas-exchange output')
+    if (is_true('cdr_gas_exch_output_settings', 'do_cdr_gas_exch_output')) &
+      call need_off('cdr_gas_exch_output_settings', 'cdr_gas_monthly_averages', 'monthly CDR gas-exchange averages')
     if (is_true('cdr_lite_output_settings', 'do_cdr_lite_output')) &
       call need_off('cdr_lite_output_settings', 'cdr_lite_monthly_averages', 'monthly CDR_LITE averages')
     call need_off('upscale_settings', 'do_upscale', 'upscaling output')

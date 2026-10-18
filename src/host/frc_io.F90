@@ -1182,15 +1182,19 @@ contains
   ! CDR_time; absent everywhere = 0, as the CPU's allow_missing). Records
   ! are cataloged in the CPU's file order (bind_series cpu_order); NaN in
   ! the sensitivities stays NaN (no gas exchange there, as on the CPU).
-  subroutine init_cdr_lite_forcing(nd, names, have_dco2, have_dalk, have_flx)
+  subroutine init_cdr_lite_forcing(nd, names, with_ddic, have_dco2, have_dalk, have_flx)
+    ! with_ddic false (online sensitivities): the ddic series are not bound.
     integer,          intent(in)  :: nd
     character(len=*), intent(in)  :: names(:)
+    logical,          intent(in)  :: with_ddic
     logical,          intent(out) :: have_dco2, have_dalk, have_flx(:)
     integer :: d
     have_dco2 = .false.; have_dalk = .false.; have_flx = .false.
     if (case_nfrc < 1) return
-    call bind_series(s_ddco2, 'ddic_dco2', 'ddic_dco2_time', 'r', cpu_order=.true.)
-    call bind_series(s_ddalk, 'ddic_dalk', 'ddic_dalk_time', 'r', cpu_order=.true.)
+    if (with_ddic) then
+      call bind_series(s_ddco2, 'ddic_dco2', 'ddic_dco2_time', 'r', cpu_order=.true.)
+      call bind_series(s_ddalk, 'ddic_dalk', 'ddic_dalk_time', 'r', cpu_order=.true.)
+    endif
     have_dco2 = s_ddco2%ready; have_dalk = s_ddalk%ready
     if (allocated(s_cflx)) deallocate(s_cflx)
     allocate(s_cflx(max(nd, 1)))

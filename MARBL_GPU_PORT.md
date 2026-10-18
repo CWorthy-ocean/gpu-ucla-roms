@@ -1705,6 +1705,73 @@ and the nonzero DIC _flx of Iceland0_cdr_surface_flx_test.nc.
   build is bit-identical to cdr3. MiniPac without CDR is bit-identical to
   cdr2, which covers the io_server changes.
 
+### CDR gas-exchange output and online carbonate sensitivities (step 5)
+
+**Carbonate sensitivities (src/device/carb_sens.F90).** A transliteration
+of the CPU's carbonate_sensitivity.F90 (compute_surface_beta_eta), with the
+same arithmetic per cell. It computes beta = dDIC/dCO2 and eta = dDIC/dALK
+of the ALT_CO2 surface state:
+
+- **Constants and solve.** Lueker et al. (2000) K1/K2 on the total scale,
+  the rest the MARBL set. The pH solve is a safeguarded Newton-Raphson in
+  pH 2-13, with a relative test (1e-10) and a residual check.
+- **Buffer factor.** The Humphreys et al. (2018) isocapnic quotient.
+- **Failures.** Land, the MARBL floors and failed solves give 0.
+- **Kernel.** An explicit global kernel with one thread per point; device
+  helpers take arguments by reference. A CUF kernel cannot pass its
+  loop-local scalars to a device subroutine (S-0528, device attribute
+  mismatch). 133 registers, no spill.
+- **Online.** cdr_online_carbonate_sensitivity (cdr_lite_io) computes beta
+  and eta after the corrector's set_forces, from the predicted state
+  (slot nrhs), over the interior and physical boundary points, in place of
+  the ddic files. As on the CPU, the files are then neither read nor
+  needed.
+
+**Output (src/host/cdr_gas_out.F90).** The CPU's cdr_gas_exch_output, with
+&cdr_gas_exch_output_settings:
+
+- **Files.** <root>_cdrgas.nc, _cdrgas_0002.nc and so on, in double, with
+  the CPU's dimensions, variables and attributes. The long names differ
+  with wrt_cdr_gas_avg, as on the CPU.
+- **Records.** An instantaneous bracket record at the start, from the
+  initial state. Every output_period_cdr_gas a record follows: either
+  instantaneous, or the window means beta = n/sum(1/beta) and eta =
+  sum(eta/beta)/sum(1/beta) over the steps with a valid solve, stamped at
+  the middle of the window. A bracket record at the end follows unless
+  the last record is already there. Bracket records do not count toward
+  nrpf_cdr_gas.
+- **Record times.** ocean_time, ddic_dco2_time = ddic_dalk_time (the
+  forcing time in days), and avg_begin_time/avg_end_time with averages.
+  The files can therefore force a later run as ddic files.
+- **Writer.** A fourth io_server kind (IO_KIND_CDRGAS). The record's time
+  message now carries four doubles (time, the averaging window, the
+  forcing time), with flags in hdr(8).
+- **Not on the GPU yet:** cdr_gas_monthly_averages, which stops at
+  start-up.
+
+**Validation (12 steps, a record every 240 s, 4 per file; gen_cdr.py gas
+--lite-out --gas-out [--inst] [--online]).**
+
+- **Structure.** Instantaneous, averaged and online runs give the CPU's
+  records: the same count, the same file split, and the bracket records
+  at both ends. Variables, attributes and every time variable are
+  identical.
+- **Values.** beta agrees to 1.5e-10 relative and eta to 1.2e-11, already
+  in the start record from the identical initial state. That is the
+  solver's relative tolerance plus libm differences.
+- **Online sensitivities.** The CDR_LITE tracers and gas fluxes agree with
+  the CPU as closely as with file sensitivities (tracers 8e-8, FG 2e-7).
+- **Regression.** With neither feature on, the build reproduces cdr4h bit
+  for bit (Iceland0 CDR_LITE output, MiniPac).
+- **Three days, online (cpu_onl_ref, the 1e-6 degC twin cpu_onl_pert,
+  gpu_onl; _cdrgas every 6 h).** GPU/twin ratios at hour 72 are 0.93-0.99
+  for the four DIC tracers (zone 0.95-1.00), 0.96 for ddic_dco2 and 1.02
+  for ddic_dalk (zone 1.01 and 1.03); at hour 6 they are 0.10 and 0.58.
+  The physics and MARBL ratios are identical to the earlier tests,
+  hotspot included.
+- **Cost.** The 3-day online run with instantaneous _cdrgas output has a
+  median step of 59.6 ms, against 58.7 ms with file sensitivities.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

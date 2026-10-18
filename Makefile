@@ -38,7 +38,7 @@ LIBS        ?= $(NETCDF_FLIBS)
 SRC_SHARED = src/shared/kinds.F90 src/shared/decomp.F90 src/shared/tile_balance.F90 src/shared/arch.F90 \
              src/shared/comm.F90 src/shared/formulas.F90 src/shared/time_state.F90 \
              src/shared/run_timers.F90
-SRC_DEV    = src/device/gpu_state.F90 src/device/column_solve.F90 src/device/halo.F90 src/device/rivers.F90 src/device/cdr_src.F90 src/device/cdr_lite.F90 \
+SRC_DEV    = src/device/gpu_state.F90 src/device/column_solve.F90 src/device/halo.F90 src/device/rivers.F90 src/device/cdr_src.F90 src/device/cdr_lite.F90 src/device/carb_sens.F90 \
              src/device/geom.F90 src/device/obc.F90 src/device/step2d.F90 src/device/prsgrd.F90 \
              src/device/advect.F90 src/device/rho_eos.F90 src/device/uv_rhs.F90 \
              src/device/passive_column.F90 src/device/passive.F90 \
@@ -47,7 +47,7 @@ SRC_DEV    = src/device/gpu_state.F90 src/device/column_solve.F90 src/device/hal
              src/device/bulk_coare.F90
 SRC_HOST   = src/host/step_driver.F90 src/host/feature_guard.F90
 SRC_IO     = src/host/nc_io.F90 src/host/host_buf.F90 src/host/par_read.F90 src/host/frc_io.F90 \
-             src/host/river_io.F90 src/host/cdr_io.F90 src/host/cdr_lite_io.F90 src/host/bry_io.F90 src/host/tide_io.F90 src/host/io_server.F90 src/host/marbl_step.F90 src/host/his_io.F90 src/host/cdr_lite_out.F90 \
+             src/host/river_io.F90 src/host/cdr_io.F90 src/host/cdr_lite_io.F90 src/host/bry_io.F90 src/host/tide_io.F90 src/host/io_server.F90 src/host/marbl_step.F90 src/host/his_io.F90 src/host/cdr_lite_out.F90 src/host/cdr_gas_out.F90 \
              src/host/case_io.F90
 MODDIR     = build
 GPUDIR     = build_gpu

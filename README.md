@@ -9,8 +9,9 @@ namelists and input files.
   KPP mixing, tracer advection and mixing, tides, bulk surface forcing,
   rivers, open boundaries), MARBL's surface fluxes and interior ecosystem, generic
   passive tracers, the CDR_LITE tracers (transport, inputs, air-sea gas
-  exchange and surface fluxes, the cdr_lite output file), and
-  parameterized CDR releases (cdr_frc point and Gaussian sources). Model
+  exchange with file or online carbonate sensitivities, surface fluxes, the
+  cdr_lite and cdr_gas_exch output files), and parameterized CDR releases
+  (cdr_frc point and Gaussian sources). Model
   fields stay in GPU memory for the whole run.
 - **Many GPUs:** one MPI rank per GPU, tiles balanced by ocean cells and
   memory, halo exchanges GPU to GPU with a CUDA-aware MPI. Separate writer
@@ -26,8 +27,7 @@ namelists and input files.
 - **Speed (Derecho):** Pacific domain with MARBL, 2 nodes of each kind: 21x
   faster per time step than CPU ROMS-MARBL (8 A100s vs 256 AMD cores).
 - **Not yet on the GPU:** pipes (point sources), CDR volume sources,
-  depth-profile and 3-D CDR forcing, online carbonate sensitivities for
-  CDR_LITE, the cdr and cdr_gas_exch output files, monthly CDR_LITE
+  depth-profile and 3-D CDR forcing, the cdr output file, monthly CDR
   averages, output for nested child grids, closed basins (one known
   boundary bug), averaged history files (_avg) and monthly restarts. A
   namelist that switches on a feature the GPU lacks stops the run at

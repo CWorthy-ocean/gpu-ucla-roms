@@ -43,9 +43,11 @@ module io_server
   private
 
   ! IO_KIND_CDR: the CDR_LITE output file (_cdrtrc, double; its records
-  ! may carry avg_begin_time / avg_end_time)
-  integer, parameter, public :: IO_KIND_HIS = 1, IO_KIND_RST = 2, IO_KIND_CDR = 3
-  integer, parameter :: NKIND = 3
+  ! may carry avg_begin_time / avg_end_time). IO_KIND_CDRGAS: the CDR
+  ! gas-exchange output (_cdrgas, double; records also carry the forcing
+  ! time of ddic_dco2_time / ddic_dalk_time).
+  integer, parameter, public :: IO_KIND_HIS = 1, IO_KIND_RST = 2, IO_KIND_CDR = 3, IO_KIND_CDRGAS = 4
+  integer, parameter :: NKIND = 4
   integer, parameter :: CMD_OPEN = 1, CMD_PUT = 2, CMD_QUIT = 3
   integer, parameter :: TAG_CMD = 900, TAG_STR = 901, TAG_TIME = 902, TAG_DATA = 910
   integer, parameter :: MAXV = 256, NAMELEN = 32, PATHLEN = 512   ! variables per record: up to ~240 tracers
@@ -62,7 +64,9 @@ module io_server
     real(rp) :: time = 0.0_rp
     logical :: has_tavg = .false.            ! avg_begin_time, avg_end_time in tavg
     real(rp) :: tavg(2) = 0.0_rp
-    real(8) :: tmsg(3) = 0.0d0               ! time and tavg, sent together
+    logical :: has_tforce = .false.          ! ddic_dco2_time, ddic_dalk_time = tforce [days]
+    real(rp) :: tforce = 0.0_rp
+    real(8) :: tmsg(4) = 0.0d0               ! time, tavg and tforce, sent together
     character(len=PATHLEN) :: open_path = ''
     character(len=NAMELEN) :: names(MAXV) = ''
     integer :: n1(MAXV) = 0, n2(MAXV) = 0, n3(MAXV) = 0, nrank(MAXV) = 0, off(MAXV) = 0
@@ -161,13 +165,13 @@ contains
     endif
   end subroutine io_init
 
-  subroutine io_stage_begin(fkind, rec, nfile, time, open_path, dbl, tstep, tavg)
+  subroutine io_stage_begin(fkind, rec, nfile, time, open_path, dbl, tstep, tavg, tforce)
     integer, intent(in) :: fkind, rec, nfile
     real(rp), intent(in) :: time
     character(len=*), intent(in) :: open_path
     logical, intent(in), optional :: dbl
     integer, intent(in), optional :: tstep
-    real(rp), intent(in), optional :: tavg(2)
+    real(rp), intent(in), optional :: tavg(2), tforce
     integer :: idx
     logical :: is_dbl
     if (hcap == 0) error stop 'io_stage_begin: io_init not called'
@@ -201,6 +205,10 @@ contains
     if (present(tavg)) then
       pend(idx)%has_tavg = .true.
       pend(idx)%tavg = tavg
+    endif
+    if (present(tforce)) then
+      pend(idx)%has_tforce = .true.
+      pend(idx)%tforce = tforce
     endif
     cur = idx
   end subroutine io_stage_begin
@@ -489,7 +497,7 @@ contains
     integer, intent(in) :: fkind, nfile
     integer :: koff
     koff = fkind - 1
-    if (fkind == IO_KIND_CDR .and. wgroups < 3) koff = 1
+    if (fkind >= IO_KIND_CDR .and. wgroups < 3) koff = 1
     file_group = mod(max(nfile, 1) - 1 + koff, wgroups)
   end function file_group
 
@@ -579,12 +587,18 @@ contains
   end subroutine put_time_step
 
   subroutine put_avg_times(ncid, r)
-    ! Averaging records (CDR_LITE output): avg_begin_time, avg_end_time.
+    ! Averaging records (CDR output): avg_begin_time, avg_end_time; CDR
+    ! gas-exchange records: the forcing time ddic_dco2_time, ddic_dalk_time.
     integer, intent(in) :: ncid
     type(rec_t), intent(in) :: r
-    if (.not. r%has_tavg) return
-    if (nc_has_var(ncid, 'avg_begin_time')) call nc_put_1d_rec(ncid, 'avg_begin_time', r%tavg(1), r%rec)
-    if (nc_has_var(ncid, 'avg_end_time')) call nc_put_1d_rec(ncid, 'avg_end_time', r%tavg(2), r%rec)
+    if (r%has_tavg) then
+      if (nc_has_var(ncid, 'avg_begin_time')) call nc_put_1d_rec(ncid, 'avg_begin_time', r%tavg(1), r%rec)
+      if (nc_has_var(ncid, 'avg_end_time')) call nc_put_1d_rec(ncid, 'avg_end_time', r%tavg(2), r%rec)
+    endif
+    if (r%has_tforce) then
+      if (nc_has_var(ncid, 'ddic_dco2_time')) call nc_put_1d_rec(ncid, 'ddic_dco2_time', r%tforce, r%rec)
+      if (nc_has_var(ncid, 'ddic_dalk_time')) call nc_put_1d_rec(ncid, 'ddic_dalk_time', r%tforce, r%rec)
+    endif
   end subroutine put_avg_times
 
   subroutine pack_hdr(r, hdr)
@@ -599,7 +613,7 @@ contains
     hdr(5) = r%tstep
     hdr(6) = r%nfile
     hdr(7) = merge(1, 0, r%dbl)
-    hdr(8) = merge(1, 0, r%has_tavg)
+    hdr(8) = merge(1, 0, r%has_tavg) + merge(2, 0, r%has_tforce)
     do iv = 1, r%nvars
       b = 8 + 6 * (iv - 1)
       hdr(b + 1) = r%n1(iv)
@@ -664,8 +678,9 @@ contains
       nr = nr + 1
       call MPI_Isend(pend(idx)%namebuf, NAMELEN * MAXV, MPI_CHARACTER, dest, TAG_STR, comm, pend(idx)%reqs(nr), ierr)
       nr = nr + 1
-      pend(idx)%tmsg = (/real(pend(idx)%time, 8), real(pend(idx)%tavg(1), 8), real(pend(idx)%tavg(2), 8)/)
-      call MPI_Isend(pend(idx)%tmsg, 3, MPI_DOUBLE_PRECISION, dest, TAG_TIME, comm, pend(idx)%reqs(nr), ierr)
+      pend(idx)%tmsg = (/real(pend(idx)%time, 8), real(pend(idx)%tavg(1), 8), real(pend(idx)%tavg(2), 8), &
+                         real(pend(idx)%tforce, 8)/)
+      call MPI_Isend(pend(idx)%tmsg, 4, MPI_DOUBLE_PRECISION, dest, TAG_TIME, comm, pend(idx)%reqs(nr), ierr)
     enddo
     pend(idx)%nreq = nr
 #else
@@ -838,16 +853,16 @@ contains
     if (.not. allocated(dstage8)) allocate(dstage8(dcap8))
   end subroutine ensure_stage8
 
-  subroutine io_stage8_begin(fkind, rec, nfile, time, open_path, tstep, tavg)
+  subroutine io_stage8_begin(fkind, rec, nfile, time, open_path, tstep, tavg, tforce)
     integer, intent(in) :: fkind, rec, nfile
     integer, intent(in), optional :: tstep
     real(rp), intent(in) :: time
     character(len=*), intent(in) :: open_path
-    real(rp), intent(in), optional :: tavg(2)
+    real(rp), intent(in), optional :: tavg(2), tforce
     if (hcap8 == 0) error stop 'io_stage8_begin: io_init8 not called'
     if (hcap == 0) error stop 'io_stage8_begin: io_init not called'
     call ensure_stage8()
-    call io_stage_begin(fkind, rec, nfile, time, open_path, dbl=.true., tstep=tstep, tavg=tavg)
+    call io_stage_begin(fkind, rec, nfile, time, open_path, dbl=.true., tstep=tstep, tavg=tavg, tforce=tforce)
     pend(cur)%dbl = .true.
   end subroutine io_stage8_begin
 
@@ -1000,6 +1015,9 @@ contains
     elseif (r%fkind == IO_KIND_CDR) then
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote cdr_lite t = ', r%time, &
            '  rec = ', r%rec, '  file ', r%nfile
+    elseif (r%fkind == IO_KIND_CDRGAS) then
+      write(*,'(a,es14.6,a,i0,a,i0)') 'wrote cdr_gas t = ', r%time, &
+           '  rec = ', r%rec, '  file ', r%nfile
     else
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote restart t = ', r%time, &
            '  rec = ', r%rec, '  file ', r%nfile
@@ -1091,10 +1109,12 @@ contains
         r%tstep = hdr(5)
         r%nfile = hdr(6)
         call MPI_Recv(namebuf, NAMELEN * MAXV, MPI_CHARACTER, src, TAG_STR, comm, stat, ierr)
-        call MPI_Recv(r%tmsg, 3, MPI_DOUBLE_PRECISION, src, TAG_TIME, comm, stat, ierr)
+        call MPI_Recv(r%tmsg, 4, MPI_DOUBLE_PRECISION, src, TAG_TIME, comm, stat, ierr)
         r%time = r%tmsg(1)
-        r%has_tavg = (hdr(8) == 1)
+        r%has_tavg = (iand(hdr(8), 1) /= 0)
+        r%has_tforce = (iand(hdr(8), 2) /= 0)
         r%tavg = r%tmsg(2:3)
+        r%tforce = r%tmsg(4)
         ntot = 0
         do iv = 1, r%nvars
           b = 8 + 6 * (iv - 1)
