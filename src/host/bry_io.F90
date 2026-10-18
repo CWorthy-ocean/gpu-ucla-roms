@@ -14,7 +14,7 @@ module bry_io
   use gpu_state
   use time_state
   use frc_io, only: case_frcfiles, case_nfrc, cyc_bracket, frc_file_ncid, cached_times, frc_run_ncid_path
-  use passive_mod, only: ntp, passive_marbl, passive_name, tb_west, tb_east, tb_south, tb_north
+  use passive_mod, only: ntp, passive_bry, passive_name, tb_west, tb_east, tb_south, tb_north
   use nc_io
   use arch_mod, only: sync_arch
 #ifdef USE_CUDA
@@ -89,7 +89,7 @@ contains
     obc_north = ser_zn%ready .or. ser_vbn%ready
     have_bry = obc_west .or. obc_east .or. obc_south .or. obc_north
     if (have_bry) write(*,'(a,4l2)') 'OBC W E S N =', obc_west, obc_east, obc_south, obc_north
-    if (have_bry .and. passive_marbl .and. ntp > 0) then
+    if (have_bry .and. passive_bry .and. ntp > 0) then
       allocate(ser_tbw(ntp), ser_tbe(ntp), ser_tbs(ntp), ser_tbn(ntp))
       nmiss = 0
       do m = 1, ntp
@@ -100,7 +100,7 @@ contains
         if (.not. (ser_tbw(m)%ready .or. ser_tbe(m)%ready .or. ser_tbs(m)%ready .or. ser_tbn(m)%ready)) &
              nmiss = nmiss + 1
       enddo
-      write(*,'(a,i0,a,i0,a)') 'MARBL boundary data bound for ', ntp - nmiss, ' of ', ntp, &
+      write(*,'(a,i0,a,i0,a)') 'passive (MARBL, CDR_LITE) boundary data bound for ', ntp - nmiss, ' of ', ntp, &
            ' tracers (missing ones use 0 on inflow)'
     endif
   end subroutine init_bry
@@ -142,7 +142,7 @@ contains
     call fillzi(ser_ss, tneed, t_south(is, 1, isalt), nz)
     call fillzi(ser_tn, tneed, t_north(is, 1, itemp), nz)
     call fillzi(ser_sn, tneed, t_north(is, 1, isalt), nz)
-    if (passive_marbl .and. allocated(ser_tbw)) then
+    if (passive_bry .and. allocated(ser_tbw)) then
       do m = 1, ntp
         call fillzj(ser_tbw(m), tneed, tb_west(js, 1, m), nz)
         call fillzj(ser_tbe(m), tneed, tb_east(js, 1, m), nz)

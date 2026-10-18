@@ -38,6 +38,7 @@ module rivers_mod
   implicit none
   private
   public :: river_on, rivers_set_lists, rivers_set_record, rivers_copy_upper, rivers_set_weights
+  public :: rivers_set_map
   public :: rivers_ubar, rivers_uv, rivers_ts, rivers_tp
   public :: RIV_S2D, RIV_PRE, RIV_COR, RIV_S2DF
   ! for the fast-step override fused into step2d_mid's ubar/vbar kernel
@@ -75,6 +76,10 @@ module rivers_mod
   integer(ip), device, allocatable :: rc_i(:), rc_j(:), rc_col(:), rc_n(:), rc_f(:,:)
   real(rp),    device, allocatable :: rc_sg(:,:)
   real(rp),    device, allocatable :: rv_vol(:,:), rv_trc(:,:,:)
+  ! row of rv_trc for passive tracer itp: its index in the river file's
+  ! tracer axis (the CPU's tracer order), or the extra zero row for a
+  ! CDR_LITE tracer the file does not carry (see river_io)
+  integer(ip), device, allocatable :: rv_map(:)
 #else
   integer(ip), allocatable :: riv_ufc(:,:), riv_vfc(:,:)
   real(rp),    allocatable :: rf_flx(:), rg_h(:,:,:), rg_v(:,:)
@@ -84,6 +89,7 @@ module rivers_mod
   integer(ip), allocatable :: rc_i(:), rc_j(:), rc_col(:), rc_n(:), rc_f(:,:)
   real(rp),    allocatable :: rc_sg(:,:)
   real(rp),    allocatable :: rv_vol(:,:), rv_trc(:,:,:)
+  integer(ip), allocatable :: rv_map(:)
 #endif
 
 contains
@@ -142,6 +148,14 @@ contains
     rv_trc = 0.0_rp
     river_on = .true.
   end subroutine rivers_set_lists
+
+  subroutine rivers_set_map(map)
+    ! rv_trc row of each passive tracer (river_io).
+    integer(ip), intent(in) :: map(:)
+    if (allocated(rv_map)) deallocate(rv_map)
+    allocate(rv_map(max(size(map), 1)))
+    if (size(map) > 0) rv_map(1:size(map)) = map
+  end subroutine rivers_set_map
 
   subroutine rivers_set_record(slot, vol, trc)
     ! One record of this tile's rivers into slot 1 or 2. The device is
@@ -360,7 +374,7 @@ contains
 
   subroutine rivers_tp(tp, ntr, sbit, n_new, dtp)
     ! As rivers_ts for the passive tracers in their column storage; passive
-    ! tracer itr is tracer nt + itr of the river data (the CPU's order).
+    ! tracer itr takes row rv_map(itr) of the river data (the CPU's order).
     ! One thread per (cell, tracer, chunk of levels), the tracers
     ! across the warp, so tp and rv_trc are read and written contiguously.
     ! Everything but the layer thickness is the same at every level: the
@@ -373,12 +387,12 @@ contains
     integer,     intent(in) :: sbit
     integer(ip), intent(in) :: n_new
     real(rp),    intent(in) :: dtp
-    integer(ip) :: c, k, kb, ic, jc, itr, n, nz, nn, col, off, nta, nm, r, kch, nkb, k0, k1
+    integer(ip) :: c, k, kb, ic, jc, itr, n, nz, nn, col, nta, nm, r, kch, nkb, k0, k1, rw
     real(rp) :: c1, c2, dtl, dtpp, s
     real(rp) :: t1, t2, t3, t4, g1, g2, g3, g4, v1, v2, v3, v4
     if (nrc == 0 .or. ntr <= 0) return
     if (geo_stage /= sbit) error stop 'rivers_tp: no face geometry for this stage (rivers_ts runs first)'
-    n = nrc; nz = decomp%nz; nn = n_new; dtl = dtp; off = nt; nta = ntr
+    n = nrc; nz = decomp%nz; nn = n_new; dtl = dtp; nta = ntr
     kch = (nz + RIV_NKB - 1) / RIV_NKB; nkb = (nz + kch - 1) / kch
     if (sbit == RIV_PRE) then
       c1 = w_pre(1); c2 = w_pre(2)
@@ -396,25 +410,26 @@ contains
           ic = rc_i(c); jc = rc_j(c)
           dtpp = dtl * pm(ic, jc) * pn(ic, jc)
           nm = rc_n(c)
+          rw = rv_map(itr)
           r = rc_r(1, c)
-          t1 = (c1 * rv_trc(off + itr, r, 1) + c2 * rv_trc(off + itr, r, 2)) * 0.5_rp
+          t1 = (c1 * rv_trc(rw, r, 1) + c2 * rv_trc(rw, r, 2)) * 0.5_rp
           g1 = rc_sg(1, c); v1 = rg_v(1, c)
           t2 = 0.0_rp; g2 = 0.0_rp; v2 = 0.0_rp
           t3 = 0.0_rp; g3 = 0.0_rp; v3 = 0.0_rp
           t4 = 0.0_rp; g4 = 0.0_rp; v4 = 0.0_rp
           if (nm >= 2) then
             r = rc_r(2, c)
-            t2 = (c1 * rv_trc(off + itr, r, 1) + c2 * rv_trc(off + itr, r, 2)) * 0.5_rp
+            t2 = (c1 * rv_trc(rw, r, 1) + c2 * rv_trc(rw, r, 2)) * 0.5_rp
             g2 = rc_sg(2, c); v2 = rg_v(2, c)
           endif
           if (nm >= 3) then
             r = rc_r(3, c)
-            t3 = (c1 * rv_trc(off + itr, r, 1) + c2 * rv_trc(off + itr, r, 2)) * 0.5_rp
+            t3 = (c1 * rv_trc(rw, r, 1) + c2 * rv_trc(rw, r, 2)) * 0.5_rp
             g3 = rc_sg(3, c); v3 = rg_v(3, c)
           endif
           if (nm >= 4) then
             r = rc_r(4, c)
-            t4 = (c1 * rv_trc(off + itr, r, 1) + c2 * rv_trc(off + itr, r, 2)) * 0.5_rp
+            t4 = (c1 * rv_trc(rw, r, 1) + c2 * rv_trc(rw, r, 2)) * 0.5_rp
             g4 = rc_sg(4, c); v4 = rg_v(4, c)
           endif
           k0 = (kb - 1) * kch + 1; k1 = min(kb * kch, nz)

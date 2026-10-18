@@ -22,7 +22,7 @@ module river_io
   use time_state
   use nc_io
   use frc_io, only: case_frcfiles, case_nfrc, frc_file_ncid
-  use passive_mod, only: ntp
+  use passive_mod, only: ntp, ncdr, cpu_tracer_index
   use rivers_mod
   use comm_mod, only: comm_rank
   use arch_mod, only: sync_arch
@@ -73,7 +73,9 @@ contains
     character(len=*), intent(in) :: grdname
     integer :: i, j, k, nx, ny, nf, nc, m, ifile, ncid, varid, ierr, ntr_model, nrec, l
     integer :: nfmax, rfile, gi, gj, ir
-    logical :: have_sep
+    logical :: have_sep, riv_cdr
+    integer(ip) :: itp
+    integer(ip), allocatable :: rmap(:)
     real(rp) :: faces, uflx, frac
     real(rp), allocatable :: ridx_r(:,:), rfrc(:,:), rflx(:,:), rm(:,:), tloc(:)
     integer, allocatable :: ridx(:,:), loc_of(:)
@@ -149,14 +151,19 @@ contains
       what = 'river_flux'
     endif
 
-    ! --- dims of the river variables; river_tracer must hold every tracer
+    ! --- dims of the river variables. As the CPU (init_river_trc_map),
+    ! river_tracer holds every tracer in the CPU's order, or every tracer
+    ! but the CDR_LITE block, whose tracers then get concentration 0.
     call river_dims(fncid(rfile), nriver_f, ntr_f)
     ntr_model = int(nt + ntp)
-    if (ntr_f /= ntr_model) then
-      write(*,'(a,i0,a,i0,a)') 'init_rivers: ntracers = ', ntr_f, ' in the river forcing file, but the model has ', &
-           ntr_model, ' tracers (T, S and the passive tracers); CDR_LITE tracers are not on the GPU model'
+    riv_cdr = (ntr_f == ntr_model)
+    if (.not. riv_cdr .and. (ncdr == 0 .or. ntr_f /= ntr_model - int(ncdr))) then
+      write(*,'(a,i0,a,i0,a,i0,a)') 'init_rivers: ntracers = ', ntr_f, ' in the river forcing file, but must be ', &
+           ntr_model, ' (all tracers) or ', ntr_model - int(ncdr), ' (all tracers but the CDR_LITE block)'
       error stop 'init_rivers'
     endif
+    if (.not. riv_cdr .and. comm_rank() == 0) write(*,'(a,i0,a)') &
+         'init_rivers: river_tracer has no CDR_LITE tracers; ', ncdr, ' CDR_LITE tracers get river concentration 0'
     maxidx = maxval(ridx)
     if (maxidx > nriver_f) then
       write(*,'(a,i0,a,i0)') 'init_rivers: river index ', maxidx, ' exceeds the nriver dimension ', nriver_f
@@ -276,10 +283,19 @@ contains
     enddo
     call sort_catalog()
     it1 = 0; it2 = 0
-    allocate(vol_g(nriver_f), trc_g(nriver_f, ntr_f), vol_l(max(nloc, 1)), trc_l(ntr_f, max(nloc, 1)))
+    ! trc_l row ntr_f + 1 stays 0: the row of CDR_LITE tracers the file lacks
+    allocate(vol_g(nriver_f), trc_g(nriver_f, ntr_f), vol_l(max(nloc, 1)), trc_l(ntr_f + 1, max(nloc, 1)))
+    trc_l = 0.0_rp
 
     call rivers_set_lists(int(nf, ip), fi, fj, ft, fr, fs, ffrac, int(nc, ip), ci, cj, ccol, cn, cf, csg, &
-                          nloc, int(ntr_f, ip))
+                          nloc, int(ntr_f + 1, ip))
+    allocate(rmap(max(ntp, 1_ip)))
+    do itp = 1, ntp
+      rmap(itp) = cpu_tracer_index(itp, riv_cdr)
+      if (rmap(itp) == 0) rmap(itp) = int(ntr_f + 1, ip)
+    enddo
+    call rivers_set_map(rmap(1:ntp))
+    deallocate(rmap)
     write(*,'(a,i0,a,i0,a,i0,a,i0,a,i0,a,a,a,i0,a)') 'rivers: rank ', comm_rank(), '  faces ', nf, &
          '  cells ', nc, '  rivers ', nloc, '  fast-loop faces next to an edge ', nrf_s2d, &
          '  (', trim(what), ', ', ncat, ' records)'

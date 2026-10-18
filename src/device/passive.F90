@@ -39,6 +39,20 @@ module passive_mod
   ! boundary data below instead of 0). Set by marbl_gpu before alloc_passive.
   logical, public :: passive_marbl = .false.
   character(len=32), allocatable, public :: passive_names(:)
+  ! CDR_LITE tracers (param_settings nt_cdr_oae ALK/DIC pairs, nt_cdr_dor
+  ! DIC): linear ALK/DIC anomalies that MARBL does not see. They follow the
+  ! MARBL (or generic) tracers in tp, at tp indices cdr0+1 .. cdr0+ncdr, in
+  ! the CPU's order within the block (CDR_OAE_ALK1, CDR_OAE_DIC1, ...,
+  ! CDR_DOR_DIC1, ...). The CPU orders all tracers T, S, generic passives,
+  ! CDR_LITE, MARBL; tp keeps MARBL first so the MARBL kernels address their
+  ! tracers as 1 .. ntp_base. Inputs indexed by the CPU's order (the river
+  ! tracer axis) map through cpu_tracer_index.
+  integer(ip), public :: n_oae = 0, n_dor = 0, ncdr = 0, cdr0 = 0
+  integer(ip), public :: ntp_base = 0      ! MARBL or generic tracers, before the CDR_LITE block
+  integer(ip) :: n_generic = 0             ! generic passives (before MARBL in the CPU's order)
+  ! external boundary values from the boundary data (MARBL and CDR_LITE
+  ! tracers; missing ones are 0), else 0 (generic tracers)
+  logical, public :: passive_bry = .false.
   real(rp), WORK_ATTR public, allocatable :: tb_west(:,:,:), tb_east(:,:,:)    ! (js:je, nz, ntp)
   real(rp), WORK_ATTR public, allocatable :: tb_south(:,:,:), tb_north(:,:,:)  ! (is:ie, nz, ntp)
   ! One passive tracer held at a constant value (marbl_gpu: use_constant_Fe):
@@ -56,6 +70,7 @@ module passive_mod
   public :: passive_t3dbc
   public :: passive_name
   public :: set_passive_marbl
+  public :: set_cdr_lite, passive_finish_list, cpu_tracer_index
   public :: passive_hold
 
 contains
@@ -88,28 +103,102 @@ contains
   function passive_name(itp) result(name)
     integer(ip), intent(in) :: itp
     character(len=32) :: name
-    if (passive_marbl) then
+    if (allocated(passive_names)) then
       name = trim(passive_names(itp))
     else
       write(name, '(a,i2.2)') 'tp', itp
     endif
   end function passive_name
 
+  subroutine set_cdr_lite(noae, ndor)
+    ! CDR_LITE tracer counts from param_settings, before the tracer list is
+    ! built (set_passive_marbl or passive_finish_list).
+    integer(ip), intent(in) :: noae, ndor
+    if (noae < 0 .or. ndor < 0) error stop 'param_settings: nt_cdr_oae and nt_cdr_dor must be >= 0'
+    n_oae = noae; n_dor = ndor
+    ncdr = 2 * n_oae + n_dor
+  end subroutine set_cdr_lite
+
   subroutine set_passive_marbl(names)
     character(len=*), intent(in) :: names(:)
+    character(len=32), allocatable :: base(:)
     integer(ip) :: m
-    ntp = size(names)
-    if (allocated(passive_names)) deallocate(passive_names)
-    allocate(passive_names(ntp))
-    do m = 1, ntp
-      passive_names(m) = trim(names(m))
+    allocate(base(size(names)))
+    do m = 1, size(names)
+      base(m) = trim(names(m))
     enddo
     passive_marbl = .true.
     passive_mirror = .false.
     passive_init = 'zero'
-    write(*,'(a,i0,a,i0,a)') 'passive tracers: MARBL mode, ', ntp, ' tracers (', &
-         int(storage_size(1.0_pp)), '-bit storage)'
+    n_generic = 0
+    call append_cdr_lite(base)
+    write(*,'(a,i0,a,i0,a,i0,a)') 'passive tracers: MARBL mode, ', ntp_base, ' MARBL + ', ncdr, &
+         ' CDR_LITE tracers (', int(storage_size(1.0_pp)), '-bit storage)'
   end subroutine set_passive_marbl
+
+  subroutine passive_finish_list()
+    ! Without MARBL: append the CDR_LITE tracers to the generic passives
+    ! (named tpNN). A no-op in MARBL mode (set_passive_marbl did it) and
+    ! when there are no CDR_LITE tracers.
+    character(len=32), allocatable :: base(:)
+    integer(ip) :: m
+    if (passive_marbl) return
+    n_generic = ntp
+    if (ncdr == 0) then
+      ntp_base = ntp; cdr0 = ntp        ! generic tracers only, named tpNN
+      return
+    endif
+    if (passive_mirror) error stop 'passive_init = mirror_salt cannot be combined with CDR_LITE tracers'
+    allocate(base(n_generic))
+    do m = 1, n_generic
+      write(base(m), '(a,i2.2)') 'tp', m
+    enddo
+    call append_cdr_lite(base)
+    write(*,'(a,i0,a,i0,a,i0,a)') 'passive tracers: ', n_generic, ' generic + ', ncdr, &
+         ' CDR_LITE tracers (', int(storage_size(1.0_pp)), '-bit storage)'
+  end subroutine passive_finish_list
+
+  subroutine append_cdr_lite(base)
+    ! tp = base tracers (MARBL or generic), then the CDR_LITE block.
+    character(len=32), intent(in) :: base(:)
+    integer(ip) :: m, n
+    character(len=8) :: num
+    ntp_base = size(base)
+    cdr0 = ntp_base
+    ntp = ntp_base + ncdr
+    if (allocated(passive_names)) deallocate(passive_names)
+    allocate(passive_names(ntp))
+    do m = 1, ntp_base
+      passive_names(m) = base(m)
+    enddo
+    do n = 1, n_oae
+      write(num, '(i0)') n
+      passive_names(cdr0 + 2 * n - 1) = 'CDR_OAE_ALK' // trim(num)
+      passive_names(cdr0 + 2 * n) = 'CDR_OAE_DIC' // trim(num)
+    enddo
+    do n = 1, n_dor
+      write(num, '(i0)') n
+      passive_names(cdr0 + 2 * n_oae + n) = 'CDR_DOR_DIC' // trim(num)
+    enddo
+    passive_bry = passive_marbl .or. ncdr > 0
+  end subroutine append_cdr_lite
+
+  integer(ip) function cpu_tracer_index(itp, with_cdr) result(k)
+    ! The CPU's tracer index (T = 1, S = 2, generic passives, CDR_LITE, MARBL)
+    ! of tp tracer itp. with_cdr = .false.: the index in an axis that omits
+    ! the CDR_LITE block (as a river file may); 0 for a CDR_LITE tracer then.
+    integer(ip), intent(in) :: itp
+    logical, intent(in) :: with_cdr
+    integer(ip) :: nc
+    nc = merge(ncdr, 0_ip, with_cdr)
+    if (itp > cdr0) then
+      k = merge(2 + n_generic + (itp - cdr0), 0_ip, with_cdr)
+    elseif (passive_marbl) then
+      k = 2 + n_generic + nc + itp
+    else
+      k = 2 + itp
+    endif
+  end function cpu_tracer_index
 
   subroutine alloc_passive()
     integer(ip) :: is, ie, js, je, nz
@@ -119,7 +208,7 @@ contains
     if (.not. allocated(tpcol_h)) error stop 'alloc_passive: build_tp_columns first'
     allocate(tp(ntp, 0:ntpcol, nz, 3))
     tp = 0.0_pp
-    if (passive_marbl) then
+    if (passive_bry) then
       if (allocated(tb_west)) deallocate(tb_west, tb_east, tb_south, tb_north)
       allocate(tb_west(js:je, nz, ntp), tb_east(js:je, nz, ntp))
       allocate(tb_south(is:ie, nz, ntp), tb_north(is:ie, nz, ntp))
@@ -284,7 +373,7 @@ contains
     ilo = decomp%is; ihi = decomp%ie
     jlo = decomp%js; jhi = decomp%je
     mir = passive_mirror
-    mbry = passive_marbl
+    mbry = passive_bry
     if (nnew == 3) then
       dtw = 0.5_rp * dt
     else

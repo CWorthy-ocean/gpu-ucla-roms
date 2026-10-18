@@ -18,7 +18,7 @@ module case_io
   use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
   use formulas, only: rho0_eos => rho0
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name, &
-       passive_hold
+       passive_hold, set_cdr_lite, passive_finish_list, ncdr
   use marbl_gpu, only: marbl_on, read_marbl_namelist, marbl_gpu_setup_tracers, marbl_gpu_init_forcing, &
                        marbl_gpu_load_state
   implicit none
@@ -78,7 +78,9 @@ contains
     integer :: unit, ios
     character(len=512) :: msg, nml_dir
 
-    integer(ip) :: llm, mmm, nz, n, np_xi, np_eta, nt_passive, nt_bgc, ntrc_bio
+    integer(ip) :: llm, mmm, nz, n, np_xi, np_eta, nt_passive, nt_bgc, ntrc_bio, nt_cdr_oae, nt_cdr_dor
+    character(len=8) :: envv
+    integer :: envs
     integer(ip) :: nsub_x, nsub_e, ndtfast_in, ntimes_in, ninfo, nrrec
     real(rp) :: dt_in, theta_s_in, theta_b_in, hc_in
     real(rp) :: zob_in, rdrg_in, rdrg2_in, visc2_in, akv_bak_in, rho0_in
@@ -86,7 +88,7 @@ contains
     character(len=512) :: grdname, inifile, ininame, title, output_root_name
 
     namelist /param_settings/ np_xi, np_eta, nsub_x, nsub_e, llm, mmm, nz, n, &
-                              nt_passive, nt_bgc, ntrc_bio
+                              nt_passive, nt_bgc, ntrc_bio, nt_cdr_oae, nt_cdr_dor
     namelist /grid_settings/ grdname
     namelist /initial_conditions/ inifile, ininame, nrrec
     namelist /simulation_name_settings/ output_root_name, title
@@ -96,7 +98,7 @@ contains
 
     llm = 32; mmm = 32; nz = 0; n = 0
     np_xi = 1; np_eta = 1; nsub_x = 1; nsub_e = 1
-    nt_passive = 0; nt_bgc = 0; ntrc_bio = 0; nrrec = -1
+    nt_passive = 0; nt_bgc = 0; ntrc_bio = 0; nt_cdr_oae = 0; nt_cdr_dor = 0; nrrec = -1
     ininame = ''
     dt_in = 100.0_rp; ndtfast_in = 60; ntimes_in = 1; ninfo = 1
     theta_s_in = 6.0_rp; theta_b_in = 6.0_rp; hc_in = 250.0_rp
@@ -118,6 +120,23 @@ contains
     if (ios /= 0) then
       write(*,*) 'PARAM_SETTINGS: ', trim(msg)
       error stop 'read_namelist'
+    endif
+    call set_cdr_lite(nt_cdr_oae, nt_cdr_dor)
+    if (ncdr > 0) then
+      ! The CDR_LITE tracers are transported (and read from the initial,
+      ! boundary and river data), but their surface forcing is not on the GPU
+      ! yet: the linearized air-sea CO2 exchange of the DIC tracers and the
+      ! <tracer>_flx surface fluxes. The CPU applies both whenever the build
+      ! has CDR_LITE (ddic_dco2 > 0, a _flx in the forcing files), so stop
+      ! unless a test with them switched off asks to go on.
+      call get_environment_variable('ROMS_GPU_CDR_LITE_TRANSPORT_ONLY', envv, status=envs)
+      if (envs /= 0 .or. trim(envv) /= '1') then
+        write(*,'(a,i0,a)') 'read_namelist: ', ncdr, ' CDR_LITE tracers (nt_cdr_oae, nt_cdr_dor), but their '// &
+             'surface forcing (gas exchange, <tracer>_flx) is not on the GPU yet'
+        error stop 'read_namelist: CDR_LITE surface forcing not on the GPU'
+      endif
+      write(*,'(a,i0,a)') 'read_namelist: ', ncdr, ' CDR_LITE tracers, transport only '// &
+           '(ROMS_GPU_CDR_LITE_TRANSPORT_ONLY=1: no gas exchange, no _flx surface flux)'
     endif
 
     rewind(unit); read(unit, nml=grid_settings, iostat=ios, iomsg=msg)
@@ -148,7 +167,7 @@ contains
     call read_passive_namelist(unit, nt_passive)
     call read_marbl_namelist(unit, nml_dir, nt_bgc)
     call read_river_namelist(unit)
-    case_ntp_est = max(ntp, nt_bgc)
+    case_ntp_est = max(ntp, nt_bgc) + ncdr
 
     rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios)
     call read_tile_settings(unit)   ! optional group; before the unit is closed
@@ -497,6 +516,7 @@ contains
     call read_namelist(nml_path)
     call alloc_state(nt)
     if (marbl_on) call marbl_gpu_setup_tracers()
+    call passive_finish_list()          ! without MARBL: generic + CDR_LITE tracers
 
     call nc_open_read(case_grdname, ncid)
     xi_rho = nc_dim_len(ncid, 'xi_rho')
@@ -803,9 +823,14 @@ contains
       if (nc_has_var(ncid, trim(passive_name(1)))) then
         ! Gather all tracers in host memory in tp's (tracer, i, j, k) order and
         ! store them with one sweep: per-tracer stores into the managed array
-        ! walk every page ntp times.
+        ! walk every page ntp times. A tracer the file lacks stays 0, as in
+        ! the CPU model (e.g. CDR_LITE tracers in a file without them).
         do itp = 1, ntp
-          if (.not. nc_has_var(ncid, trim(passive_name(itp)))) exit
+          if (.not. nc_has_var(ncid, trim(passive_name(itp)))) then
+            if (pr_taking() .and. tindx == 1 .and. comm_rank() == 0) &
+                 write(*,'(a,a,a)') '  --- ', trim(passive_name(itp)), ' not in initial file: 0'
+            cycle
+          endif
           call pr_store_3d_pt(ncid, trim(passive_name(itp)), tp(1, 0, 1, tindx), ntp, itp, &
                               i0, j0, nxi, neta, decomp%nz, rec, i0f=tile_fi0, j0f=tile_fj0)
         enddo

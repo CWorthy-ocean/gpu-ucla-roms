@@ -1390,6 +1390,98 @@ the Pac river file, with tracer concentrations capped. The Pac file has
 DIC and ALK up to 2e7 mmol/m3, which MARBL's carbonate solver cannot
 handle.
 
+## CDR port (2026-10-17): CPU reference and the CDR_LITE tracers
+
+### CPU reference
+
+- **Source and keys.** CWorthy-ocean/ucla-roms main 1c9fcfae, in a clone of
+  its own. Built in cases/CDR/bld_cpu_ref with the validated Iceland0 keys
+  (cases/CMP/bld5_sflx_marbl) plus CDR_FORCING and CDR_LITE.
+- **CDR off.** It matches the validated build bit for bit (Iceland0, 12
+  steps, every history, BGC and diagnostic file).
+- **Changes since the validated base (accb74d9).** Only CDR code, the
+  use_constant_Fe hooks (no-ops by default) and an I/O sync.
+- **UPSCALING left out.** Compiled in (with MARBL and MARBL_DIAGS), it
+  changes results even with do_upscale off: compute_horiz_tracer_fluxes.h
+  (89893a7c) then uses upwind inflow fluxes for every tracer at the
+  open-boundary faces. With CDR off this gave 1.5e-3 K in temperature after
+  one step. Key bisection showed CDR_FORCING and CDR_LITE alone are
+  bit-identical; UPSCALING alone reproduces the whole difference. Decision:
+  this boundary treatment follows do_upscale, so it is on only in runs that
+  write upscaling output (GPU, and our CPU reference when upscaling is
+  ported).
+- **CPU issues met while setting up:**
+  - With CDR_LITE compiled in, ddic_dco2/ddic_dalk are read every step even
+    with no CDR_LITE tracers, and the run stops if they are absent.
+  - cdr_lite_output and cdr_gas_exch_output hold file names in
+    character(len=99), so longer paths are cut. Our runs write through a
+    short symlink to the output directory.
+  - The ulla surface-physics files carry zero CDR _flx variables, with
+    CDR_time only in 202212, which stops the CPU's record search in
+    202301. Our runs list a CDR_time file first.
+- **Test case.** cases/CDR/gen_cdr.py builds Iceland0 (ulla) variants from
+  the validated CPU/GPU namelist pair: off, full, online, and lite_io (the
+  transport test below).
+
+### CDR_LITE tracers on the GPU (step 2: tracers and their inputs)
+
+- **Layout.** CDR_LITE tracers are linear ALK/DIC anomalies: nt_cdr_oae
+  ALK/DIC pairs and nt_cdr_dor DIC. MARBL never sees them. They follow the
+  MARBL tracers in tp, so the MARBL kernels still address their tracers as
+  1..32. The names are the CPU's (CDR_OAE_ALK<n>, CDR_OAE_DIC<n>,
+  CDR_DOR_DIC<n>). The CPU orders all tracers T, S, generic, CDR_LITE,
+  MARBL; inputs indexed by that order map through cpu_tracer_index.
+- **Rivers.** river_tracer may hold every tracer or every tracer but the
+  CDR block, as on the CPU. Each passive tracer maps to its row (rv_map);
+  a CDR tracer the file lacks maps to an extra zero row.
+- **Initial file.** A missing tracer stays 0, tracer by tracer.
+- **Boundaries.** Boundary data are bound for the MARBL and CDR_LITE tracers
+  (passive_bry); missing ones are 0 on inflow.
+- **Restarts and history.** They carry the CDR tracers by name.
+- **MARBL.** MARBL's surface fluxes go to its own tracers only.
+- **Transport.** As for MARBL tracers: the salinity diffusivity, no KPP
+  nonlocal term, harmonic mixing with salinity's coefficient. The CPU uses
+  each tracer's tnu2; the two agree while tnu2 is 0 for every tracer, as in
+  every case here.
+- **Not yet ported.** The surface forcing: the linearized air-sea CO2
+  exchange of the DIC tracers, and <tracer>_flx. The CPU applies both
+  whenever CDR_LITE is compiled in. A run with CDR_LITE tracers therefore
+  stops, unless ROMS_GPU_CDR_LITE_TRANSPORT_ONLY=1 (tests with both off).
+- **Regression.** With no CDR tracers the build (cdr1) is bit-identical to
+  riv11 (MiniPac smoke, rivers and MARBL).
+
+**Transport test (gen_cdr.py lite_io).** Nonzero CDR_LITE initial,
+boundary and river data (tools/make_lite_inputs.py; the ulla CDR inputs are
+all zeros). No releases. No gas exchange: ddic = 0, which the CPU skips. No
+surface flux. 12 steps on Iceland0, CPU against GPU every step:
+
+- **Physics and MARBL tracers.** Within one float32 unit, as before.
+- **CDR tracers.** The largest absolute difference is one float32 unit of
+  each tracer's largest values.
+- **Relative differences.** Only 11 of 14 million points differ by more
+  than 1e-7 relative, and the largest (2.5e-6) is one column beside a river
+  (j354, i259). There, at step 5, as river water arrives, a vertical
+  redistribution of 2e-6 appears at levels 22-25 and then decays. This is
+  consistent with the upwind vertical advection switching direction on a
+  near-zero vertical velocity: round-off-triggered, of a size set by that
+  velocity.
+
+**Three days** (cpu_lite_ref, the 1e-6 degC twin cpu_lite_pert, and
+gpu_lite). The CDR_LITE tracers stay within the CPU's own sensitivity:
+
+| hour | GPU/twin ratio range, six CDR tracers (whole domain) |
+|---|---|
+| 6 | 0.26-0.47 |
+| 24 | 0.75-0.96 |
+| 48 | 0.81-0.90 |
+| 72 | 0.92-0.99 |
+
+The river zone (0.28-0.99) is similar. The physics and MARBL ratios are
+identical to the Iceland0 river test, as they must be: the CDR tracers feed
+back on nothing, and the physics is bit-identical to riv7. That includes the
+chaotic temperature hotspot at hour 72 (see "Validation against the CPU
+noise floor" above).
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;
