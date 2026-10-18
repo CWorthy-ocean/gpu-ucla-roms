@@ -82,6 +82,10 @@ module frc_io
   type(series2d), target :: s_sss              ! SFLX_CORR: sea-surface salinity restoring data
   ! MARBL surface forcing (dust/iron/nox/nhy climatologies, atmospheric xCO2)
   type(series2d), target :: s_dust, s_iron, s_nox, s_nhy, s_xco2, s_xco2a
+  ! CDR_LITE surface forcing: carbonate sensitivities and the DIC tracers'
+  ! <name>_flx (cdr_lite_io), cataloged in the CPU's file order
+  type(series2d), target :: s_ddco2, s_ddalk
+  type(series2d), allocatable, target :: s_cflx(:)
 
   ! Record reads while stepping (ROMS_GPU_FRC_BATCH bitmask, default 3):
   ! bit 1: a series that moves on by one record copies its upper bracket
@@ -125,6 +129,7 @@ module frc_io
   public :: set_forces
   public :: init_bgc_forcing
   public :: set_bgc_forces
+  public :: init_cdr_lite_forcing, set_cdr_lite_forces
   public :: cyc_bracket
   public :: uwnd, vwnd
   public :: write_toy_flux
@@ -421,13 +426,21 @@ contains
     enddo
   end subroutine close_frc_cache
 
-  subroutine bind_series(s, vname, tname, gtype)
+  subroutine bind_series(s, vname, tname, gtype, cpu_order)
+    ! cpu_order: the records in the order the CPU's find_new_record meets
+    ! them (files in list order, each file's records in order), keeping
+    ! only records later than the last one kept, and ending at the first
+    ! file that has the variable but not its time axis (where the CPU's
+    ! search would stop). Otherwise every file's records, sorted by time.
     type(series2d),   intent(inout) :: s
     character(len=*), intent(in)    :: vname, tname, gtype
+    logical, optional, intent(in)   :: cpu_order
     integer :: i, ncid, nxi, neta, nrec, tax, k, ntot
     real(rp), allocatable :: tloc(:)
     real(rp) :: cyc
-    logical :: lcyc
+    logical :: lcyc, cord
+    cord = .false.
+    if (present(cpu_order)) cord = cpu_order
     s%vname = trim(vname)
     s%tname = trim(tname)
     s%gtype = gtype
@@ -460,6 +473,14 @@ contains
     do i = 1, case_nfrc
       ncid = frc_file_ncid(i)   ! cached handle, closed by close_frc_cache
       if (nc_has_var(ncid, vname)) then
+        if (cord .and. .not. nc_has_var(ncid, tname)) then
+          if (s%ntot < 1) then
+            write(*,'(5a)') 'bind_series: ', trim(vname), ' first found in ', trim(case_frcfiles(i)), &
+                 ' without its time axis '//trim(tname)
+            error stop 'bind_series: forcing variable without its time axis'
+          endif
+          exit
+        endif
         call nc_forcing_layout(ncid, vname, tname, nxi, neta, nrec, tax)
         nrec = max(nrec, 1)
         allocate(tloc(nrec))
@@ -469,6 +490,9 @@ contains
           tloc = 0.0_rp
         endif
         do k = 1, nrec
+          if (cord .and. s%ntot >= 1) then
+            if (.not. (tloc(k) > s%times(s%ntot))) cycle
+          endif
           s%ntot = s%ntot + 1
           s%times(s%ntot) = tloc(k)
           s%ifile(s%ntot) = i
@@ -480,7 +504,7 @@ contains
     enddo
     if (first_bind) call wall_stamp('bind pass2 '//trim(vname))
     if (s%ntot < 1) return
-    call sort_catalog(s)
+    if (.not. cord) call sort_catalog(s)
     ! climatology? cycle_length on the time axis of the first file with the variable
     s%cycle = -1.0_rp
     do i = 1, case_nfrc
@@ -1020,23 +1044,33 @@ contains
     endif
   end subroutine weights
 
-  subroutine fill_r(s, tneed, dest)
+  subroutine fill_r(s, tneed, dest, keep_nan)
+    ! keep_nan: NaN (missing) values stay NaN, as the CPU's set_frc_data
+    ! leaves them; otherwise they become 0.
     type(series2d), intent(inout), target :: s
     real(rp),       intent(in)    :: tneed
     real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
+    logical, optional, intent(in) :: keep_nan
     real(rp) :: c1, c2
     real(rp), allocatable :: tmp(:,:)
     integer :: i0, j0
+    logical :: kn
     if (.not. s%ready) return
+    kn = .false.
+    if (present(keep_nan)) kn = keep_nan
     call advance_series(s, tneed)
     call weights(s, tneed, c1, c2)
     if (on_grid(s%n1, s%n2, 'r', i0, j0)) then
-      call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
+      if (kn) then
+        call interp_on_grid_nan(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
+      else
+        call interp_on_grid(s%buf, s%n1, s%n2, c1, c2, dest, i0, j0)
+      endif
     else
       allocate(tmp(s%n1, s%n2))
       call sync_arch()
       tmp = c1 * s%buf(:,:,1) + c2 * s%buf(:,:,2)
-      where (is_nan(tmp)) tmp = 0.0_rp
+      if (.not. kn) where (is_nan(tmp)) tmp = 0.0_rp
       call map_field(tmp, s%n1, s%n2, dest, 'r')
     endif
   end subroutine fill_r
@@ -1124,6 +1158,84 @@ contains
       enddo
     enddo
   end subroutine interp_on_grid
+
+  subroutine interp_on_grid_nan(b, n1, n2, c1, c2, dest, i0, j0)
+    ! As interp_on_grid, with NaN kept (CPU set_frc_data).
+    integer,  intent(in) :: n1, n2, i0, j0
+    real(rp), WORK_ATTR intent(in) :: b(n1, n2, 2)
+    real(rp), intent(in) :: c1, c2
+    real(rp), WORK_ATTR intent(inout) :: dest(decomp%is:decomp%ie, decomp%js:decomp%je)
+    integer :: i, j
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, n2
+      do i = 1, n1
+        dest(i0 + i - 1, j0 + j - 1) = c1 * b(i, j, 1) + c2 * b(i, j, 2)
+      enddo
+    enddo
+  end subroutine interp_on_grid_nan
+
+  ! CDR_LITE surface forcing (CPU surf_flux / tracers): the carbonate
+  ! sensitivities ddic_dco2, ddic_dalk (on ddic_dco2_time, ddic_dalk_time)
+  ! and the surface flux <name>_flx of each CDR_LITE DIC tracer (on
+  ! CDR_time; absent everywhere = 0, as the CPU's allow_missing). Records
+  ! are cataloged in the CPU's file order (bind_series cpu_order); NaN in
+  ! the sensitivities stays NaN (no gas exchange there, as on the CPU).
+  subroutine init_cdr_lite_forcing(nd, names, have_dco2, have_dalk, have_flx)
+    integer,          intent(in)  :: nd
+    character(len=*), intent(in)  :: names(:)
+    logical,          intent(out) :: have_dco2, have_dalk, have_flx(:)
+    integer :: d
+    have_dco2 = .false.; have_dalk = .false.; have_flx = .false.
+    if (case_nfrc < 1) return
+    call bind_series(s_ddco2, 'ddic_dco2', 'ddic_dco2_time', 'r', cpu_order=.true.)
+    call bind_series(s_ddalk, 'ddic_dalk', 'ddic_dalk_time', 'r', cpu_order=.true.)
+    have_dco2 = s_ddco2%ready; have_dalk = s_ddalk%ready
+    if (allocated(s_cflx)) deallocate(s_cflx)
+    allocate(s_cflx(max(nd, 1)))
+    do d = 1, nd
+      call bind_series(s_cflx(d), trim(names(d))//'_flx', 'CDR_time', 'r', cpu_order=.true.)
+      have_flx(d) = s_cflx(d)%ready
+    enddo
+  end subroutine init_cdr_lite_forcing
+
+  subroutine set_cdr_lite_forces(tneed, nd, ddco2, ddalk, cflx)
+    ! The fields at tneed. A record bracket that does not cover tneed stops
+    ! the run, as the CPU's search does at the end of its records.
+    real(rp), intent(in) :: tneed
+    integer,  intent(in) :: nd
+    real(rp), WORK_ATTR intent(inout) :: ddco2(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: ddalk(decomp%is:decomp%ie, decomp%js:decomp%je)
+    real(rp), WORK_ATTR intent(inout) :: cflx(decomp%is:decomp%ie, decomp%js:decomp%je, max(nd, 1))
+    integer :: d
+    call frc_batch_begin()
+    call advance_series(s_ddco2, tneed)
+    call advance_series(s_ddalk, tneed)
+    do d = 1, nd
+      call advance_series(s_cflx(d), tneed)
+    enddo
+    call frc_batch_flush()
+    call cover_check(s_ddco2, tneed)
+    call cover_check(s_ddalk, tneed)
+    if (s_ddco2%ready) call fill_r(s_ddco2, tneed, ddco2, keep_nan=.true.)
+    if (s_ddalk%ready) call fill_r(s_ddalk, tneed, ddalk, keep_nan=.true.)
+    do d = 1, nd
+      call cover_check(s_cflx(d), tneed)
+      if (s_cflx(d)%ready) call fill_r(s_cflx(d), tneed, cflx(:, :, d))
+    enddo
+  end subroutine set_cdr_lite_forces
+
+  subroutine cover_check(s, tneed)
+    type(series2d), intent(in) :: s
+    real(rp),       intent(in) :: tneed
+    if (.not. s%ready .or. s%ntot < 2 .or. s%cycle > 0.0_rp) return
+    if (tneed < s%times(1) .or. tneed > s%times(s%ntot)) then
+      write(*,'(3a,3es16.8)') 'forcing ', trim(s%vname), ': records do not cover the model time', &
+           s%times(1), s%times(s%ntot), tneed
+      error stop 'set_cdr_lite_forces: no forcing record for the model time'
+    endif
+  end subroutine cover_check
 
   ! MARBL surface forcing series. Names/units as the CPU model
   ! (bgc_shared_vars / marbl_driver): dust kg/m2/s, iron nmol/cm2/s ->

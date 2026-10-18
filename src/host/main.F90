@@ -6,6 +6,7 @@ program roms_gpu
   use step_driver
   use case_io, only: load_case, report_loaded_case
   use his_io, only: maybe_wrt_output
+  use cdr_lite_out, only: wrt_cdr_lite
   use arch_mod, only: init_arch, arch_name, select_device
   use comm_mod, only: init_comm, finalize_comm, comm_rank, comm_size, is_io_rank
   use io_server, only: io_server_run, io_finalize
@@ -77,6 +78,7 @@ program roms_gpu
         call run_baroclinic_step()
         call rt_tic(RT_OUTPUT)
         call maybe_wrt_output()
+        call wrt_cdr_lite()
         call rt_toc(RT_OUTPUT)
         rt_nsteps = rt_nsteps + 1
         call rt_step_end()

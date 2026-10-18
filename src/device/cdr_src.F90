@@ -27,6 +27,7 @@ module cdr_src_mod
   implicit none
   private
   public :: cdr_on, cdr_set_lists, cdr_set_record, cdr_copy_upper, cdr_set_weights, cdr_apply_tp
+  public :: cdr_src_out
 
   integer, parameter :: CDR_NKB = 4                    ! chunks of levels per (cell, tracer)
   logical :: cdr_on = .false.
@@ -185,5 +186,42 @@ contains
       enddo
     enddo
   end subroutine cdr_apply_tp
+
+  subroutine cdr_src_out(a, itr, om, cf, inst)
+    ! CDR_LITE output (the CPU's calc_cdr_lite_source): the release source
+    ! of passive tracer itr [per cell and level, the flux unit, mmol/s],
+    ! sum over the cell's releases in release order of w(k)*flux, with the
+    ! corrector's flux. inst: a = source on the release cells (the caller
+    ! zeroes a first); otherwise the average a = a*om + source*cf (a stays
+    ! 0 elsewhere, as the CPU's 0*(1-coef) + 0*coef).
+    real(rp), WORK_ATTR intent(inout) :: a(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz)
+    integer(ip), intent(in) :: itr
+    real(rp), intent(in) :: om, cf
+    logical, intent(in) :: inst
+    integer(ip) :: c, k, i, j, q, n, nz, it, r, md
+    real(rp) :: c1, c2, src, f
+    if (.not. cdr_on .or. ncc == 0) return
+    n = ncc; nz = decomp%nz; it = itr; c1 = w_cor(1); c2 = w_cor(2)
+    md = merge(1_ip, 0_ip, inst)
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*, *, 0, work_stream>>>
+#endif
+    do k = 1, nz
+      do c = 1, n
+        i = cc_i(c); j = cc_j(c)
+        src = 0.0_rp
+        do q = cc_p0(c), cc_p0(c + 1) - 1
+          r = cq_rel(q)
+          f = c1 * cd_flx(it, r, 1) + c2 * cd_flx(it, r, 2)
+          src = src + cq_w(k, q) * f
+        enddo
+        if (md == 1) then
+          a(i, j, k) = src
+        else
+          a(i, j, k) = a(i, j, k) * om + src * cf
+        endif
+      enddo
+    enddo
+  end subroutine cdr_src_out
 
 end module cdr_src_mod

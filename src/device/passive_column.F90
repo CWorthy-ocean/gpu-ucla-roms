@@ -432,14 +432,17 @@ contains
   ! ------------------- vertical advection + implicit solve, one thread per (tracer, column)
   DEVICE_ATTR
   subroutine column_col(itr, ci, i, j, ctr, dtp, ntr, is, ie, js, je, nz, nts, isl, mir, &
-                        tps, tpn, ncl, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
+                        tps, tpn, ncl, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_, sfo, psf_)
     ! The vertical flux divergence (vert_column_fused arithmetic, sliding
     ! window over k) feeds the Thomas forward sweep level by level, with
     ! the intermediate dc kept in place in tpn (slot nn); then the back
     ! substitution. tps = slot ts (the advected field, not written).
     ! ctr = 1: centred (predictor), 0: upwind-weighted (corrector). mir = 1:
     ! tracer 1 receives salinity's surface flux and the KPP nonlocal term
-    ! between the vertical advection and the solve. The face values are
+    ! between the vertical advection and the solve. sfo = 1: every other
+    ! tracer receives its surface flux psf_(itr, ci) (CDR_LITE; 0 for most
+    ! tracers) on the top layer at the same point, dt*stflx as the CPU's
+    ! step3d_t. The face values are
     ! thickness_tplus/thickness_tminus with their shared differences carried
     ! between levels: dlt_m(k) = dlt(k-1) and dlt(k) = dlt_p(k-1) (same
     ! operands in the same order). The next level's tpn value is loaded
@@ -452,6 +455,8 @@ contains
     real(rp), intent(in) :: pm_(is:ie, js:je), pn_(is:ie, js:je), rmask_(is:ie, js:je)
     real(rp), intent(in) :: stflx_(is:ie, js:je, nts), ghat_(is:ie, js:je, 0:nz)
     real(rp), intent(in) :: fc_(is:ie, js:je, 0:nz), cf_(is:ie, js:je, 0:nz), wc_(is:ie, js:je, 0:nz)
+    integer(ip), intent(in) :: sfo
+    real(rp), intent(in) :: psf_(ntr, *)
     integer(ip) :: k
     real(rp) :: dtpp, rm, w, sfx, cffk, cffm, tt
     real(rp) :: Hz_km1, Hz_k, Hz_kp1, Hz_kp2, fck, wcm, cfk
@@ -462,6 +467,7 @@ contains
     dtpp = dtp * pm_(i, j) * pn_(i, j)
     rm = rmask_(i, j)
     sfx = 0.0_rp
+    if (sfo == 1) sfx = psf_(itr, ci)
     if (mir == 1 .and. itr == 1) sfx = stflx_(i, j, isl)
     Hz_k = Hz_(i, j, 1)
     Hz_kp1 = Hz_(i, j, 2)
@@ -575,6 +581,8 @@ contains
           cffm = -dtp * ghat_(i, j, k - 1) * sfx
           rhs = real(rhs - cffm, pp)
         endif
+      else if (sfo == 1) then
+        if (k == nz) rhs = real(rhs + dtp * sfx, pp)
       endif
       if (k < nz) tnk = real(tpn(itr, ci, k + 1), rp)
       if (k == 1) then
@@ -680,7 +688,7 @@ contains
   end subroutine t3dmix_kernel
 
   attributes(global) launch_bounds(128, 7) subroutine column_kernel(nwet, wet_i, wet_j, ctr, dtp, ntr, nz, is, ie, js, je, nts, isl, mir, &
-                                              tps, tpn, ncl, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
+                                              tps, tpn, ncl, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_, sfo, psf_)
     ! block (ntr, columns), grid (columns)
     integer(ip), value :: nwet, ctr, ntr, nz, is, ie, js, je, nts, isl, mir, ncl
     real(rp), value :: dtp
@@ -691,13 +699,15 @@ contains
     real(rp), device, intent(in) :: pm_(is:ie, js:je), pn_(is:ie, js:je), rmask_(is:ie, js:je)
     real(rp), device, intent(in) :: stflx_(is:ie, js:je, nts), ghat_(is:ie, js:je, 0:nz)
     real(rp), device, intent(in) :: fc_(is:ie, js:je, 0:nz), cf_(is:ie, js:je, 0:nz), wc_(is:ie, js:je, 0:nz)
+    integer(ip), value :: sfo
+    real(rp), device, intent(in) :: psf_(ntr, *)
     integer(ip) :: cc, itr, i, j
     cc = (blockIdx%x - 1) * blockDim%y + threadIdx%y
     if (cc > nwet) return
     itr = threadIdx%x
     i = wet_i(cc); j = wet_j(cc)
     call column_col(itr, cc, i, j, ctr, dtp, ntr, is, ie, js, je, nz, nts, isl, mir, &
-                    tps, tpn, ncl, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_)
+                    tps, tpn, ncl, Hz_, We_, pm_, pn_, rmask_, stflx_, ghat_, fc_, cf_, wc_, sfo, psf_)
   end subroutine column_kernel
 #endif
 
@@ -781,14 +791,16 @@ contains
 #endif
   end subroutine passive_t3dmix_run
 
-  subroutine passive_column_run(tp, ntr, ts, nn, dtp, ctr, use_fwd, mirror)
+  subroutine passive_column_run(tp, ntr, ts, nn, dtp, ctr, use_fwd, mirror, sflx_on, psf)
     ! Factorization, then one thread per (tracer, column); slot ts is read
-    ! (the advected field), slot nn (/= ts) updated in place.
+    ! (the advected field), slot nn (/= ts) updated in place. sflx_on: add
+    ! the surface fluxes psf(itr, wet column) (the corrector's CDR_LITE).
     integer(ip), intent(in) :: ntr, ts, nn, ctr
     real(pp), WORK_ATTR intent(inout) :: tp(ntr, 0:ntpcol, decomp%nz, 3)
     real(rp), intent(in) :: dtp
-    logical, intent(in) :: use_fwd, mirror
-    integer(ip) :: nz, mir, is, ie, js, je, nts, isl
+    logical, intent(in) :: use_fwd, mirror, sflx_on
+    real(rp), WORK_ATTR contiguous, intent(in) :: psf(:,:)
+    integer(ip) :: nz, mir, is, ie, js, je, nts, isl, sfo
 #ifdef USE_CUDA
     integer(ip) :: ncb
     type(dim3) :: grid, block
@@ -799,6 +811,8 @@ contains
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     nts = int(size(stflx, 3), ip); isl = int(isalt, ip)
     mir = merge(1_ip, 0_ip, mirror)
+    sfo = merge(1_ip, 0_ip, sflx_on)
+    if (sfo == 1 .and. size(psf, 1) /= ntr) error stop 'passive_column_run: surface flux array shape'
     call passive_factor(dtp, use_fwd)
     if (nwet <= 0) return
 #ifdef USE_CUDA
@@ -807,11 +821,13 @@ contains
     block = dim3(ntr, ncb, 1)
     grid = dim3((nwet + ncb - 1) / ncb, 1, 1)
     call column_kernel<<<grid, block>>>(nwet, wet_i, wet_j, ctr, dtp, ntr, nz, is, ie, js, je, nts, isl, mir, &
-         tp(1, 0, 1, ts), tp(1, 0, 1, nn), ntpcol, Hz, We, pm, pn, rmask, stflx, ghat, col_fc, col_cf, col_wc)
+         tp(1, 0, 1, ts), tp(1, 0, 1, nn), ntpcol, Hz, We, pm, pn, rmask, stflx, ghat, col_fc, col_cf, col_wc, &
+         sfo, psf)
 #else
     do c = 1, nwet; do itr = 1, ntr
       call column_col(itr, c, wet_i(c), wet_j(c), ctr, dtp, ntr, is, ie, js, je, nz, nts, isl, mir, &
-                      tp(1, 0, 1, ts), tp(1, 0, 1, nn), ntpcol, Hz, We, pm, pn, rmask, stflx, ghat, col_fc, col_cf, col_wc)
+                      tp(1, 0, 1, ts), tp(1, 0, 1, nn), ntpcol, Hz, We, pm, pn, rmask, stflx, ghat, col_fc, col_cf, col_wc, &
+                      sfo, psf)
     enddo; enddo
 #endif
   end subroutine passive_column_run

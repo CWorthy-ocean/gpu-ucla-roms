@@ -22,6 +22,7 @@ module passive_mod
   use halo_mod, only: halo_fill_3d_tp, halo_tp_start, halo_tp_mid, halo_tp_finish, tp_overlap_on
   use rivers_mod, only: river_on, rivers_tp, RIV_PRE, RIV_COR
   use cdr_src_mod, only: cdr_on, cdr_apply_tp
+  use cdr_lite_mod, only: cdrl_on, cdrl_psf
 #ifdef USE_CUDA
   use arch_mod, only: work_stream
 #endif
@@ -278,14 +279,15 @@ contains
     call halo_tp_finish(tp, ntp)
     call passive_horiz_run(tp, ntp, 1_ip, nrhs, n_stp, n_new, indx, cf_stp, cf_bak, dtau)
     if (river_on) call rivers_tp(tp, ntp, RIV_PRE, n_new, dtau)   ! river faces, before the column pass
-    call passive_column_run(tp, ntp, nrhs, n_new, dtau, 1_ip, .true., passive_mirror)
+    ! no surface fluxes in the predictor (the CPU's pre_step3d has none)
+    call passive_column_run(tp, ntp, nrhs, n_new, dtau, 1_ip, .true., passive_mirror, .false., cdrl_psf)
   end subroutine passive_predictor
 
   ! --------------------------------------------------------- corrector
   subroutine passive_corrector(dt_in)
     ! Called from step3d_t after the T/S corrector: UP3 horizontal from
-    ! slot nrhs (= 3), U3 vertical + (mirror: salinity forcing) + implicit
-    ! solve, open boundaries.
+    ! slot nrhs (= 3), U3 vertical + (mirror: salinity forcing; CDR_LITE:
+    ! surface fluxes) + implicit solve, open boundaries.
     real(rp), intent(in) :: dt_in
     if (ntp <= 0) return
     ! slot nrhs (= 3): exchange started by pre_step3d after the predictor's
@@ -296,7 +298,9 @@ contains
     ! CDR releases: the CPU adds them in the corrector after the horizontal
     ! advection (and the river flux it contains), before the vertical pass
     if (cdr_on) call cdr_apply_tp(tp, ntp, nnew, dt_in)
-    call passive_column_run(tp, ntp, nrhs, nnew, dt_in, 0_ip, .false., passive_mirror)
+    ! CDR_LITE DIC tracers: surface flux (cdr_lite_io, set at n+1/2) on the
+    ! top layer after the vertical advection
+    call passive_column_run(tp, ntp, nrhs, nnew, dt_in, 0_ip, .false., passive_mirror, cdrl_on, cdrl_psf)
     call passive_t3dbc()
     ! No exchange of slot nnew here: MARBL and t3dmix read it at the point
     ! only (t3dmix's stencil is slot nrhs) and passive_t3dmix exchanges it.

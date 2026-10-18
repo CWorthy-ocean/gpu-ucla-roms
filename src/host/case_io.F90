@@ -13,6 +13,8 @@ module case_io
   use tide_io, only: read_tide_namelist, init_tides, set_tides
   use river_io, only: read_river_namelist, init_rivers
   use cdr_io, only: read_cdr_namelist, init_cdr
+  use cdr_lite_io, only: read_cdr_lite_namelist, init_cdr_lite
+  use cdr_lite_out, only: read_cdr_lite_output_namelist, set_cdr_lite_output_root, init_cdr_lite_output
   use his_io, only: read_output_namelist, set_output_root, init_output
   use comm_mod, only: comm_rank, comm_size, comm_min_real
   use tile_balance, only: balance_cuts, uniform_cuts
@@ -80,8 +82,6 @@ contains
     character(len=512) :: msg, nml_dir
 
     integer(ip) :: llm, mmm, nz, n, np_xi, np_eta, nt_passive, nt_bgc, ntrc_bio, nt_cdr_oae, nt_cdr_dor
-    character(len=8) :: envv
-    integer :: envs
     integer(ip) :: nsub_x, nsub_e, ndtfast_in, ntimes_in, ninfo, nrrec
     real(rp) :: dt_in, theta_s_in, theta_b_in, hc_in
     real(rp) :: zob_in, rdrg_in, rdrg2_in, visc2_in, akv_bak_in, rho0_in
@@ -123,22 +123,6 @@ contains
       error stop 'read_namelist'
     endif
     call set_cdr_lite(nt_cdr_oae, nt_cdr_dor)
-    if (ncdr > 0) then
-      ! The CDR_LITE tracers are transported (and read from the initial,
-      ! boundary and river data), but their surface forcing is not on the GPU
-      ! yet: the linearized air-sea CO2 exchange of the DIC tracers and the
-      ! <tracer>_flx surface fluxes. The CPU applies both whenever the build
-      ! has CDR_LITE (ddic_dco2 > 0, a _flx in the forcing files), so stop
-      ! unless a test with them switched off asks to go on.
-      call get_environment_variable('ROMS_GPU_CDR_LITE_TRANSPORT_ONLY', envv, status=envs)
-      if (envs /= 0 .or. trim(envv) /= '1') then
-        write(*,'(a,i0,a)') 'read_namelist: ', ncdr, ' CDR_LITE tracers (nt_cdr_oae, nt_cdr_dor), but their '// &
-             'surface forcing (gas exchange, <tracer>_flx) is not on the GPU yet'
-        error stop 'read_namelist: CDR_LITE surface forcing not on the GPU'
-      endif
-      write(*,'(a,i0,a)') 'read_namelist: ', ncdr, ' CDR_LITE tracers, transport only '// &
-           '(ROMS_GPU_CDR_LITE_TRANSPORT_ONLY=1: no gas exchange, no _flx surface flux)'
-    endif
 
     rewind(unit); read(unit, nml=grid_settings, iostat=ios, iomsg=msg)
     if (ios /= 0) then
@@ -169,6 +153,8 @@ contains
     call read_marbl_namelist(unit, nml_dir, nt_bgc)
     call read_river_namelist(unit)
     call read_cdr_namelist(unit)
+    call read_cdr_lite_namelist(unit)
+    call read_cdr_lite_output_namelist(unit)
     case_ntp_est = max(ntp, nt_bgc) + ncdr
 
     rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios)
@@ -194,6 +180,7 @@ contains
     endif
     case_title = trim(title)
     case_output_root = resolve_path(nml_dir, output_root_name)
+    call set_cdr_lite_output_root(case_output_root)
     theta_s = theta_s_in
     theta_b = theta_b_in
     hc = hc_in
@@ -639,6 +626,8 @@ contains
     call wall_stamp('river init')
     call init_cdr(case_grdname)       ! CDR releases (passive list and columns final)
     call wall_stamp('cdr init')
+    call init_cdr_lite()              ! CDR_LITE surface forcing (binds forcing series)
+    call wall_stamp('cdr_lite init')
     call close_frc_cache()
     frc_slot = 0
     call set_forces()
@@ -646,6 +635,7 @@ contains
     call set_tides()
     call set_output_root(case_output_root, case_title)
     call init_output()
+    call init_cdr_lite_output()       ! after the history/restart staging is sized
     call wall_stamp('output init')
   end subroutine load_case
 

@@ -19,7 +19,8 @@ module io_server
   !
   ! Writer groups: the writer ranks are split into groups of
   ! ROMS_GPU_IO_GROUP writers (default min(4, max(1, nwriters/2))). File
-  ! nfile of kind fkind belongs to group mod(nfile-1 + fkind-1, ngroups),
+  ! nfile of kind fkind belongs to group mod(nfile-1 + fkind-1, ngroups)
+  ! (CDR_LITE files: offset 1 with fewer than 3 groups; file_group),
   ! so a restart and the history file of the same number, and consecutive
   ! history files, are written by different groups at the same time. A
   ! file's bandwidth is limited (more writers on one file do not help;
@@ -41,7 +42,10 @@ module io_server
 #endif
   private
 
-  integer, parameter, public :: IO_KIND_HIS = 1, IO_KIND_RST = 2
+  ! IO_KIND_CDR: the CDR_LITE output file (_cdrtrc, double; its records
+  ! may carry avg_begin_time / avg_end_time)
+  integer, parameter, public :: IO_KIND_HIS = 1, IO_KIND_RST = 2, IO_KIND_CDR = 3
+  integer, parameter :: NKIND = 3
   integer, parameter :: CMD_OPEN = 1, CMD_PUT = 2, CMD_QUIT = 3
   integer, parameter :: TAG_CMD = 900, TAG_STR = 901, TAG_TIME = 902, TAG_DATA = 910
   integer, parameter :: MAXV = 256, NAMELEN = 32, PATHLEN = 512   ! variables per record: up to ~240 tracers
@@ -56,6 +60,9 @@ module io_server
     integer :: tstep = 0                     ! model step (iic) of a restart record, for time_step
     logical :: dbl = .false.                 ! real(8) record (restart)
     real(rp) :: time = 0.0_rp
+    logical :: has_tavg = .false.            ! avg_begin_time, avg_end_time in tavg
+    real(rp) :: tavg(2) = 0.0_rp
+    real(8) :: tmsg(3) = 0.0d0               ! time and tavg, sent together
     character(len=PATHLEN) :: open_path = ''
     character(len=NAMELEN) :: names(MAXV) = ''
     integer :: n1(MAXV) = 0, n2(MAXV) = 0, n3(MAXV) = 0, nrank(MAXV) = 0, off(MAXV) = 0
@@ -107,10 +114,10 @@ module io_server
   real(8), allocatable :: hpin8_1(:), hpin8_2(:), dstage8(:)
 #endif
   ! Compute-side fallback (no server): current file per kind.
-  character(len=PATHLEN) :: fname_sync(2) = ''
+  character(len=PATHLEN) :: fname_sync(NKIND) = ''
   ! Server side.
   real(4), allocatable :: rbuf(:)
-  integer :: ncid_open(2) = -1
+  integer :: ncid_open(NKIND) = -1
 
   public :: io_init
   public :: io_stage_begin
@@ -154,12 +161,13 @@ contains
     endif
   end subroutine io_init
 
-  subroutine io_stage_begin(fkind, rec, nfile, time, open_path, dbl, tstep)
+  subroutine io_stage_begin(fkind, rec, nfile, time, open_path, dbl, tstep, tavg)
     integer, intent(in) :: fkind, rec, nfile
     real(rp), intent(in) :: time
     character(len=*), intent(in) :: open_path
     logical, intent(in), optional :: dbl
     integer, intent(in), optional :: tstep
+    real(rp), intent(in), optional :: tavg(2)
     integer :: idx
     logical :: is_dbl
     if (hcap == 0) error stop 'io_stage_begin: io_init not called'
@@ -190,6 +198,10 @@ contains
     pend(idx)%time = time
     pend(idx)%open_path = open_path
     if (present(tstep)) pend(idx)%tstep = tstep
+    if (present(tavg)) then
+      pend(idx)%has_tavg = .true.
+      pend(idx)%tavg = tavg
+    endif
     cur = idx
   end subroutine io_stage_begin
 
@@ -470,9 +482,15 @@ contains
   end subroutine writer_groups
 
   integer function file_group(fkind, nfile)
-    ! Writer group of file nfile of kind fkind.
+    ! Writer group of file nfile of kind fkind. Each kind starts in its own
+    ! group where there are enough; with two groups the CDR_LITE files share
+    ! the restarts' (rare) group, away from the history: on one group,
+    ! history and CDR_LITE records together outran the writer.
     integer, intent(in) :: fkind, nfile
-    file_group = mod(max(nfile, 1) - 1 + fkind - 1, wgroups)
+    integer :: koff
+    koff = fkind - 1
+    if (fkind == IO_KIND_CDR .and. wgroups < 3) koff = 1
+    file_group = mod(max(nfile, 1) - 1 + koff, wgroups)
   end function file_group
 
   subroutine io_finalize()
@@ -560,6 +578,15 @@ contains
     call nc_put_ints_rec(ncid, 'time_step', (/r%tstep, r%rec, r%rec, 0, 0, 0/), r%rec)
   end subroutine put_time_step
 
+  subroutine put_avg_times(ncid, r)
+    ! Averaging records (CDR_LITE output): avg_begin_time, avg_end_time.
+    integer, intent(in) :: ncid
+    type(rec_t), intent(in) :: r
+    if (.not. r%has_tavg) return
+    if (nc_has_var(ncid, 'avg_begin_time')) call nc_put_1d_rec(ncid, 'avg_begin_time', r%tavg(1), r%rec)
+    if (nc_has_var(ncid, 'avg_end_time')) call nc_put_1d_rec(ncid, 'avg_end_time', r%tavg(2), r%rec)
+  end subroutine put_avg_times
+
   subroutine pack_hdr(r, hdr)
     type(rec_t), intent(in) :: r
     integer, intent(out) :: hdr(NHDR)
@@ -572,6 +599,7 @@ contains
     hdr(5) = r%tstep
     hdr(6) = r%nfile
     hdr(7) = merge(1, 0, r%dbl)
+    hdr(8) = merge(1, 0, r%has_tavg)
     do iv = 1, r%nvars
       b = 8 + 6 * (iv - 1)
       hdr(b + 1) = r%n1(iv)
@@ -636,7 +664,8 @@ contains
       nr = nr + 1
       call MPI_Isend(pend(idx)%namebuf, NAMELEN * MAXV, MPI_CHARACTER, dest, TAG_STR, comm, pend(idx)%reqs(nr), ierr)
       nr = nr + 1
-      call MPI_Isend(pend(idx)%time, 1, MPI_DOUBLE_PRECISION, dest, TAG_TIME, comm, pend(idx)%reqs(nr), ierr)
+      pend(idx)%tmsg = (/real(pend(idx)%time, 8), real(pend(idx)%tavg(1), 8), real(pend(idx)%tavg(2), 8)/)
+      call MPI_Isend(pend(idx)%tmsg, 3, MPI_DOUBLE_PRECISION, dest, TAG_TIME, comm, pend(idx)%reqs(nr), ierr)
     enddo
     pend(idx)%nreq = nr
 #else
@@ -671,6 +700,7 @@ contains
       call nc_set_par_access(ncid, .true.)
       call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
       call put_time_step(ncid, r0)
+      call put_avg_times(ncid, r0)
       do iv = 1, r0%nvars
         if (r0%nrank(iv) == 2) then
           call nc_put_2d_rec_f(ncid, trim(r0%names(iv)), zero1, 1, 1, r0%rec, me_w + 1, 1)
@@ -683,6 +713,7 @@ contains
     else
       call nc_put_1d_rec(ncid, 'ocean_time', r0%time, r0%rec)
       call put_time_step(ncid, r0)
+      call put_avg_times(ncid, r0)
     endif
     call system_clock(cb, cr)
     t_ext = real(cb - ca) / real(cr)
@@ -776,6 +807,7 @@ contains
     integer :: iv, off
     call nc_put_1d_rec(ncid, 'ocean_time', r%time, r%rec)
     call put_time_step(ncid, r)
+    call put_avg_times(ncid, r)
     do iv = 1, r%nvars
       off = r%off(iv)
       if (r%nrank(iv) == 2) then
@@ -788,10 +820,15 @@ contains
 
   ! ---------------- double-precision staging (restart records) ----------------
   subroutine io_init8(cap_record, cap_field)
+    ! Called by every double writer (restart, CDR_LITE output) before the
+    ! first record; the capacities are the largest asked for.
     integer, intent(in) :: cap_record, cap_field
-    if (hcap8 > 0) return
-    hcap8 = max(cap_record, 1)
-    dcap8 = max(cap_field, 1)
+    if (allocated(hpin8_1)) then
+      if (cap_record > hcap8 .or. cap_field > dcap8) error stop 'io_init8: capacity raised after the first double record'
+      return
+    endif
+    hcap8 = max(hcap8, cap_record, 1)
+    dcap8 = max(dcap8, cap_field, 1)
     write(*,'(a,f6.2,a)') 'io: double-precision staging ', 2.0 * real(hcap8) * 8.0 / 2.0**30, &
          ' GB host (pageable, allocated at the first restart write)'
   end subroutine io_init8
@@ -801,15 +838,16 @@ contains
     if (.not. allocated(dstage8)) allocate(dstage8(dcap8))
   end subroutine ensure_stage8
 
-  subroutine io_stage8_begin(fkind, rec, nfile, time, open_path, tstep)
+  subroutine io_stage8_begin(fkind, rec, nfile, time, open_path, tstep, tavg)
     integer, intent(in) :: fkind, rec, nfile
     integer, intent(in), optional :: tstep
     real(rp), intent(in) :: time
     character(len=*), intent(in) :: open_path
+    real(rp), intent(in), optional :: tavg(2)
     if (hcap8 == 0) error stop 'io_stage8_begin: io_init8 not called'
     if (hcap == 0) error stop 'io_stage8_begin: io_init not called'
     call ensure_stage8()
-    call io_stage_begin(fkind, rec, nfile, time, open_path, dbl=.true., tstep=tstep)
+    call io_stage_begin(fkind, rec, nfile, time, open_path, dbl=.true., tstep=tstep, tavg=tavg)
     pend(cur)%dbl = .true.
   end subroutine io_stage8_begin
 
@@ -921,6 +959,7 @@ contains
     integer :: iv, off
     call nc_put_1d_rec(ncid, 'ocean_time', r%time, r%rec)
     call put_time_step(ncid, r)
+    call put_avg_times(ncid, r)
     do iv = 1, r%nvars
       off = r%off(iv)
       if (r%nrank(iv) == 2) then
@@ -958,6 +997,9 @@ contains
     if (r%fkind == IO_KIND_HIS) then
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote history t = ', r%time, &
            '  rec = ', r%rec, '  file ', r%nfile
+    elseif (r%fkind == IO_KIND_CDR) then
+      write(*,'(a,es14.6,a,i0,a,i0)') 'wrote cdr_lite t = ', r%time, &
+           '  rec = ', r%rec, '  file ', r%nfile
     else
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote restart t = ', r%time, &
            '  rec = ', r%rec, '  file ', r%nfile
@@ -971,8 +1013,8 @@ contains
     integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), src, comm, iv, off, n, b, k, ntot, nquit, ncompute, isl
     real :: trecv(NSLOT)
     integer(8) :: c_start, c_end, rate_end
-    character(len=PATHLEN) :: open_name(2)
-    logical :: open_pending(2)
+    character(len=PATHLEN) :: open_name(NKIND)
+    logical :: open_pending(NKIND)
     integer :: c0, c1, c2, c3, rate
     character(len=PATHLEN) :: path
     character(len=NAMELEN * MAXV) :: namebuf
@@ -1049,7 +1091,10 @@ contains
         r%tstep = hdr(5)
         r%nfile = hdr(6)
         call MPI_Recv(namebuf, NAMELEN * MAXV, MPI_CHARACTER, src, TAG_STR, comm, stat, ierr)
-        call MPI_Recv(r%time, 1, MPI_DOUBLE_PRECISION, src, TAG_TIME, comm, stat, ierr)
+        call MPI_Recv(r%tmsg, 3, MPI_DOUBLE_PRECISION, src, TAG_TIME, comm, stat, ierr)
+        r%time = r%tmsg(1)
+        r%has_tavg = (hdr(8) == 1)
+        r%tavg = r%tmsg(2:3)
         ntot = 0
         do iv = 1, r%nvars
           b = 8 + 6 * (iv - 1)
@@ -1132,7 +1177,7 @@ contains
             endif
           endif
         enddo
-        do k = 1, 2
+        do k = 1, NKIND
           if (ncid_open(k) >= 0) call nc_close(ncid_open(k))
           ncid_open(k) = -1
         enddo

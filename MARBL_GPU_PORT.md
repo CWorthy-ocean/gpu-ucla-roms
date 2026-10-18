@@ -1443,10 +1443,9 @@ handle.
   nonlocal term, harmonic mixing with salinity's coefficient. The CPU uses
   each tracer's tnu2; the two agree while tnu2 is 0 for every tracer, as in
   every case here.
-- **Not yet ported.** The surface forcing: the linearized air-sea CO2
-  exchange of the DIC tracers, and <tracer>_flx. The CPU applies both
-  whenever CDR_LITE is compiled in. A run with CDR_LITE tracers therefore
-  stops, unless ROMS_GPU_CDR_LITE_TRANSPORT_ONLY=1 (tests with both off).
+- **Surface forcing.** Ported in step 4 (below). Until then a run with
+  CDR_LITE tracers stopped unless ROMS_GPU_CDR_LITE_TRANSPORT_ONLY=1; that
+  switch no longer exists.
 - **Regression.** With no CDR tracers the build (cdr1) is bit-identical to
   riv11 (MiniPac smoke, rivers and MARBL).
 
@@ -1574,6 +1573,137 @@ ALK and five CDR_LITE tracers, on top of the lite_io transport test.
 - **Regression.** With no releases, cdr2 is bit-identical to cdr1 (MiniPac
   smoke; Iceland0 lite_io). cdr3 is bit-identical to cdr2 (rel and relni
   over 12 steps, and the 3-day rel run, which crosses a record change).
+
+### CDR_LITE surface forcing and output (step 4)
+
+**Surface forcing (src/device/cdr_lite.F90, src/host/cdr_lite_io.F90).** The
+CPU's tracers.F90 (set_surf_tracer_flx with CDR_LITE). Each DIC tracer
+(CDR_OAE_DIC<n>, CDR_DOR_DIC<n>) takes the surface flux
+
+    stflx = <name>_flx + FG,   FG = -(k_gas/beta) * (DIC' - eta*ALK') * rmask
+
+- **Inputs.** beta = ddic_dco2 and eta = ddic_dalk, read from the forcing
+  files; both are required, as on the CPU. ALK' is the paired
+  CDR_OAE_ALK<n>, 0 for the DOR tracers.
+- **No exchange** where beta is not > 0, NaN included.
+- **k_gas** = 6.97e-7 * (uwnd^2 + vwnd^2) * sqrt(660/Sc). The Schmidt
+  number Sc is a polynomial in SST, and k_gas = 0 where SST <= -1.8 C.
+- **Precision.** Sc, beta, eta and ALK' are single precision, as in the CPU
+  build (default real), and the rest is double.
+- **ALK tracers** have no surface flux.
+- **Timing.** The CPU sets the flux in its set_forces at n+1/2, from the
+  predicted state (slot 3). Only the corrector applies it, as dt*stflx on
+  the top layer after the vertical advection and before the implicit
+  mixing; pre_step3d applies none.
+- **On the GPU.** set_cdr_lite runs after the corrector's set_forces. A
+  kernel with one thread per wet column fills psf(tracer, column), and the
+  passive column kernel adds dtp*psf at the top (sfo = 1, corrector only).
+  The column kernel's registers and stack are unchanged, and runs without
+  CDR_LITE take the old path. The gas flux costs no measurable step time
+  (3-day median 58.8 ms, against 58.6 ms with releases only).
+
+Three CPU details that matter:
+
+- **SEA_ICE_NOFLUX is always on.** set_global_definitions.h defines it
+  unconditionally, not cppdefs.opt. The first GPU version missed it: k_gas
+  must be 0 where SST <= -1.8 C. On Iceland0 that is a cold patch off east
+  Greenland (j 358-381, i 251-281 in the test), where the four DIC tracers
+  differed by 1e-3 relative after one step. The GPU's bulk heat flux
+  already had the rule.
+- **CPU file order.** The forcing series are cataloged in the order the
+  CPU's find_new_record meets them (bind_series cpu_order). Files go in
+  list order, a record is kept only if it is later than the last one kept,
+  and the catalog ends at a file that has the variable but not its time
+  axis. The ulla surface-physics files carry zero CDR _flx: 202212 has one
+  CDR_time record (8400.958), 202301/02 have none. A time-sorted catalog
+  would bracket the test file's 8410 record with that zero record, where
+  the CPU uses the test file's 8400 and 8410 records.
+- **NaN in the sensitivities stays NaN** (fill_r keep_nan), as the CPU's
+  set_frc_data leaves it, so no exchange happens there. Other forcing
+  still turns NaN into 0. Not on the GPU yet:
+  cdr_online_carbonate_sensitivity, which stops at start-up.
+
+**Output (src/host/cdr_lite_out.F90).** The CPU's cdr_lite_output:
+&cdr_lite_output_settings with every key, including wrt_cdr_lite_avg,
+wrt_tracers, wrt_vertical_integrals, wrt_thickness_weighted, wrt_sources,
+wrt_alk, wrt_dic and wrt_gas_exchange.
+
+- **Files.** <root>_cdrtrc.nc, <root>_cdrtrc_0002.nc and so on, the GPU's
+  naming, with nrpf_cdr_lite records each, every output_period_cdr_lite.
+- **Contents.** In double, with the CPU's dimensions, variables, attributes
+  and order: tracers, int_z_*, h* (the instantaneous thickness-weighted
+  field, also in averaging mode), h*_avg, *_source, FG_*, and
+  avg_begin_time/avg_end_time.
+- **Averages.** As the CPU's calc_average: every step after the step,
+  avg = avg*(1-coef) + x*coef with the single-precision coef = 1./navg,
+  over the points the tile writes. Release sources come from the
+  corrector's flux, summed in release order (cdr_src_out). The gas flux
+  also covers the east boundary column, which the CPU's loop (i to iend+1)
+  includes.
+- **Writer.** A third io_server kind (IO_KIND_CDR) on the double staging
+  path. Records carry avg_begin_time/avg_end_time (hdr(8), three doubles in
+  the time message), and io_init8 takes the largest capacity requested.
+- **Not on the GPU yet:** cdr_lite_monthly_averages, which stops at
+  start-up (in the feature check too).
+- **Cost.** Measured on Iceland0 over 3 days with every field averaged and
+  a record every 6 h (nsys on compute rank 2):
+  - **Averaging layout.** The first version (cdr4e) kept the averages by
+    (i, j, k) over every written point, land included. Its 3-D and 2-D
+    (vertical integral) kernels took 1.2 ms each per step, because they
+    read tp at the column stride and the integral had one thread per
+    column.
+  - **Now.** The averages live in tp's layout (tracer innermost) over the
+    wet columns the tile writes. One kernel per step, a thread per
+    (tracer, column) over the levels, updates all three; records gather
+    them back to (i, j, k). That takes 1.1 ms per step for 6 tracers and
+    reproduces the earlier output bit for bit.
+  - **Step time.** Median 59.9 ms against 58.7 ms without the output
+    (cdr4h, same node). The mean, which includes the record writes, is
+    67.5 against 63.8 ms.
+  - **Writers.** With two writer groups, file_group put the CDR_LITE files
+    in the history's group. One writer then took about 5 s per history
+    record and 4 s per CDR_LITE record, and fell behind; steps waiting for
+    it took 2.3-2.7 s. CDR_LITE files now share the restarts' group when
+    there are fewer than 3 groups, and the slowest step is 0.29 s.
+  - **Per record.** A record still costs the compute ranks about 0.4 s:
+    about 2.8 GB of doubles for the domain, staged through the pageable
+    double buffers of the restart path (copies at 9 GB/s, then the sends).
+    For daily output that is under 1 ms per step; for hourly output pinned
+    staging would be the next step.
+  - **Start-up.** The averages are zeroed on the device; zeroing about
+    0.5 GB of managed memory on the host cost start-up seconds.
+
+**Test (gen_cdr.py gas; --lite-out for every output field).** The release
+test (step 3) plus the real carbonate sensitivities (roms_surf_flux_2023.nc)
+and the nonzero DIC _flx of Iceland0_cdr_surface_flx_test.nc.
+
+- **Every step (12 steps).** Every field is within one float32 unit,
+  including the four DIC tracers (6e-8 relative).
+- **Three days (cpu_gas_ref, cpu_gas_pert, gpu_gas).** GPU/twin ratios at
+  hour 72 are 0.930-0.988 for the four DIC tracers (zone 0.954-1.001) and
+  0.983-0.991 for the ALK tracers. The other ratios equal the release
+  test's, hotspot included.
+- **Surface-forcing response.** The GPU's error in the response, (gas -
+  rel), is compared with the twin's (tools/rel_signal3d.py --case gas
+  --base rel --gpu-base gpu_rel3). Domain-wide ratios are 0.13-1.25 over
+  hours 6-72 and 0.59-0.94 at hour 72, for a signal of 0.03-0.27 mmol/m3
+  RMS in the zone at hour 72.
+- **Output (12 steps, a record every 2 steps, 4 per file).** Compared with
+  the CPU's _cdrtrc file by file and record by record
+  (tools/cmp_cdrtrc.py): the same variables, attributes, shapes, times and
+  averaging times. Largest relative differences in the averaged run:
+  tracers 4e-9, thickness-weighted 6e-10, integrals 9e-13, sources 2e-14,
+  gas fluxes 1e-7 (its single-precision part). The instantaneous run is
+  similar, up to 8e-8 for the tracers.
+- **Output does not touch the solution.** The instantaneous _cdrtrc
+  tracers, rounded to float32, equal the history of a run without CDR
+  output (36 of 36 fields). A run writing history, restarts and _cdrtrc
+  together reproduces both bit for bit. A 3-day run with averaged output
+  of every field has the same history, bit for bit, as one without
+  (final binary cdr4h).
+- **Regression.** With ddic = 0 and zero _flx (the step 2/3 tests) the
+  build is bit-identical to cdr3. MiniPac without CDR is bit-identical to
+  cdr2, which covers the io_server changes.
 
 ## Toolchain lessons (nvfortran 25.9)
 

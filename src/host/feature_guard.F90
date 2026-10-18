@@ -44,9 +44,10 @@ contains
       call need_off('cdr_frc_settings', 'cdr_forcing_3d', 'CDR 3D forcing')
     endif
     call need_off('cdr_output_settings', 'do_cdr_output', 'CDR output')
-    call need_off('cdr_lite_output_settings', 'do_cdr_lite_output', 'CDR_LITE tracer output')
     call need_off('cdr_tracer_output_settings', 'do_cdr_tracer_output', 'CDR tracer output')
     call need_off('cdr_gas_exch_output_settings', 'do_cdr_gas_exch_output', 'CDR gas-exchange output')
+    if (is_true('cdr_lite_output_settings', 'do_cdr_lite_output')) &
+      call need_off('cdr_lite_output_settings', 'cdr_lite_monthly_averages', 'monthly CDR_LITE averages')
     call need_off('upscale_settings', 'do_upscale', 'upscaling output')
     call need_off('extract_data_settings', 'do_extract', 'output for nested child grids (extract_data)')
     call need_off('zslice_settings', 'do_zslice', 'z-slice output')
