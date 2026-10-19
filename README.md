@@ -13,7 +13,9 @@ namelists and input files.
   every CDR forcing mode (cdr_frc point and Gaussian releases of tracer or
   of water with cdr_volume, depth profiles, 3-D forcing), and the CDR
   outputs (cdr, cdr_lite, cdr_gas_exch, and the upscaling transects with
-  their open-boundary flux term). Model fields stay in GPU memory for the
+  their open-boundary flux term). Output: history, restarts, averaged
+  history and BGC averages, the true vertical velocity w, and child-grid
+  boundary files (extract_data). Model fields stay in GPU memory for the
   whole run.
 - **Many GPUs:** one MPI rank per GPU, tiles balanced by ocean cells and
   memory, halo exchanges GPU to GPU with a CUDA-aware MPI. Separate writer
@@ -29,8 +31,8 @@ namelists and input files.
 - **Speed (Derecho):** Pacific domain with MARBL, 2 nodes of each kind: 21x
   faster per time step than CPU ROMS-MARBL (8 A100s vs 256 AMD cores).
 - **Not yet on the GPU:** pipes (point sources), monthly CDR
-  averages, output for nested child grids, closed basins (one known
-  boundary bug), averaged history files (_avg) and monthly restarts. A
+  averages, averaged BGC diagnostics (_bgc_dia_avg), closed basins (one
+  known boundary bug) and monthly restarts. A
   namelist that switches on a feature the GPU lacks stops the run at
   start-up with a list of the switches.
 

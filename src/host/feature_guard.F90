@@ -45,18 +45,13 @@ contains
       call need_off('cdr_gas_exch_output_settings', 'cdr_gas_monthly_averages', 'monthly CDR gas-exchange averages')
     if (is_true('cdr_lite_output_settings', 'do_cdr_lite_output')) &
       call need_off('cdr_lite_output_settings', 'cdr_lite_monthly_averages', 'monthly CDR_LITE averages')
-    call need_off('extract_data_settings', 'do_extract', 'output for nested child grids (extract_data)')
     call need_off('zslice_settings', 'do_zslice', 'z-slice output')
     call need_off('particles_settings', 'floats', 'particles (floats)')
     call need_off('random_output_settings', 'do_random', 'random-point output')
     call need_off('frc_output_settings', 'wrt_frc', 'forcing output')
     call need_off('surf_flx_output_settings', 'wrt_smflx', 'surface momentum flux output')
     call need_off('surf_flx_output_settings', 'wrt_stflx', 'surface tracer flux output')
-    call need_off('basic_output_settings', 'wrt_file_avg', 'averages output')
     call need_off('basic_output_settings', 'monthly_restarts', 'monthly restarts')
-    if (is_true('basic_output_settings', 'wrt_file_his')) &
-      call need_off('basic_output_settings', 'wrt_w', 'true vertical velocity w (wvlcty) in history')
-    call need_off('bgc_settings', 'wrt_bgc_avg', 'BGC averages output')
     call need_off('bgc_settings', 'wrt_bgc_dia_avg', 'BGC diagnostic averages output')
     call need_off('tidal_frc_settings', 'ana_tides', 'analytical tides')
     call need_off('tides_settings', 'ana_tides', 'analytical tides')

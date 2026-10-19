@@ -1,7 +1,8 @@
+#include "mem_attr.inc"
 module his_io
   ! Serial history / restart writer. Namelist keys match UCLA
-  ! BASIC_OUTPUT_SETTINGS / TS_OUTPUT_SETTINGS. No averages, no
-  ! monthly calendar, no true w (wvlcty is not ported).
+  ! BASIC_OUTPUT_SETTINGS / TS_OUTPUT_SETTINGS. Averages are in avg_out;
+  ! no monthly calendar.
   use kinds
   use decomp_mod
   use gpu_state
@@ -14,6 +15,7 @@ module his_io
   use run_timers, only: rt_tic, rt_toc, rt_mark_rst, RT_HIS, RT_RST
   use passive_mod, only: ntp, tp, wrt_passive, passive_name
   use rivers_mod, only: river_on
+  use wvlcty_mod, only: wvlcty_compute
   use marbl_gpu, only: marbl_on, marbl_gpu_nhis, marbl_gpu_nhis3, marbl_gpu_define_his, marbl_gpu_stage_his, &
                        marbl_gpu_define_rst, marbl_gpu_write_rst, marbl_gpu_stage_rst8
   implicit none
@@ -41,7 +43,7 @@ module his_io
   real(rp) :: output_time_his = 0.0_rp
   real(rp) :: output_time_rst = 0.0_rp
   logical  :: output_ready = .false.
-  logical  :: warned_w = .false.
+  real(rp), WORK_ATTR allocatable :: wvl(:,:,:)     ! true vertical velocity (wrt_W)
 
   integer :: ir0, ir1, jr0, jr1, iu0, iu1, jv0, jv1
   integer :: nxi, neta, nxi_u, neta_v           ! this tile's written extents
@@ -233,9 +235,10 @@ contains
     endif
     if (wrt_R)    call io_stage_3d('rho', rho1(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
     if (wrt_O)    call io_stage_omega('omega', ir0, ir1, jr0, jr1, ir0, jr0)
-    if (wrt_W .and. .not. warned_w) then
-      write(*,*) 'wrt_W requested but wvlcty is not ported; skipping w'
-      warned_w = .true.
+    if (wrt_W) then                ! true vertical velocity (CPU wvlcty, slot nstp)
+      if (.not. allocated(wvl)) allocate(wvl(decomp%is:decomp%ie, decomp%js:decomp%je, decomp%nz))
+      call wvlcty_compute(wvl)
+      call io_stage_3d('w', wvl(is, js, 1), 1, nz, ir0, ir1, jr0, jr1, ir0, jr0)
     endif
     if (wrt_Akv)  call io_stage_3d('Akv', Akv(is, js, 0), 0, nz, ir0, ir1, jr0, jr1, ir0, jr0)
     if (wrt_Akt)  call io_stage_3d('Akt', Akt(is, js, 0, itemp), 0, nz, ir0, ir1, jr0, jr1, ir0, jr0)
@@ -374,6 +377,7 @@ contains
     endif
     if (wrt_R)    id = nc_def_var_f(ncid, 'rho', (/d_xi, d_eta, d_s, d_t/))
     if (wrt_O)    id = nc_def_var_f(ncid, 'omega', (/d_xi, d_eta, d_w, d_t/))
+    if (wrt_W)    id = nc_def_var_f(ncid, 'w', (/d_xi, d_eta, d_s, d_t/))
     if (wrt_Akv)  id = nc_def_var_f(ncid, 'Akv', (/d_xi, d_eta, d_w, d_t/))
     if (wrt_Akt)  id = nc_def_var_f(ncid, 'Akt', (/d_xi, d_eta, d_w, d_t/))
     if (wrt_Aks)  id = nc_def_var_f(ncid, 'Aks', (/d_xi, d_eta, d_w, d_t/))
@@ -445,7 +449,7 @@ contains
     nh = decomp%nz
     nhw = decomp%nz + 1
     n2d = count((/wrt_Z, wrt_Ub, wrt_Vb, wrt_Hbls, wrt_Hbbl/)) + marbl_gpu_nhis()
-    n3d = count((/wrt_U, wrt_V, wrt_temp, wrt_salt, wrt_R/))
+    n3d = count((/wrt_U, wrt_V, wrt_temp, wrt_salt, wrt_R, wrt_W/))
     if (wrt_passive) n3d = n3d + ntp
     n3d = n3d + marbl_gpu_nhis3()
     n3w = count((/wrt_O, wrt_Akv, wrt_Akt, wrt_Aks/))

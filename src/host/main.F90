@@ -9,6 +9,8 @@ program roms_gpu
   use cdr_lite_out, only: wrt_cdr_lite
   use cdr_gas_out, only: wrt_cdr_gas, wrt_cdr_gas_final
   use cdr_out, only: wrt_cdr
+  use avg_out, only: wrt_avg, step_bgc_avg
+  use extract_out, only: wrt_extract
   use upscale_out, only: wrt_upscale_final
   use arch_mod, only: init_arch, arch_name, select_device
   use comm_mod, only: init_comm, finalize_comm, comm_rank, comm_size, is_io_rank
@@ -81,9 +83,12 @@ program roms_gpu
         call run_baroclinic_step()
         call rt_tic(RT_OUTPUT)
         call maybe_wrt_output()
+        call wrt_avg()
+        call wrt_extract()
         call wrt_cdr_lite()
         call wrt_cdr_gas()
         call wrt_cdr()
+        call step_bgc_avg()
         call rt_toc(RT_OUTPUT)
         rt_nsteps = rt_nsteps + 1
         call rt_step_end()

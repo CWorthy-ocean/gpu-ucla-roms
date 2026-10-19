@@ -19,6 +19,7 @@ module marbl_host
   integer(ip), public, save :: nt_marbl = 0
   character(len=64), allocatable, public, save :: marbl_tracer_names(:)
   character(len=64), allocatable, public, save :: marbl_tracer_units(:)
+  character(len=128), allocatable, public, save :: marbl_tracer_lnames(:)   ! long names (averages file)
   logical, public, save :: marbl_host_ready = .false.
 
   ! Indices into mi%surface_flux_forcings (0 when MARBL did not request it).
@@ -177,10 +178,11 @@ contains
     call mi%StatusLog%erase()
 
     nt_marbl = size(mi%tracer_metadata)
-    allocate(marbl_tracer_names(nt_marbl), marbl_tracer_units(nt_marbl))
+    allocate(marbl_tracer_names(nt_marbl), marbl_tracer_units(nt_marbl), marbl_tracer_lnames(nt_marbl))
     do m = 1, nt_marbl
       marbl_tracer_names(m) = trim(mi%tracer_metadata(m)%short_name)
       marbl_tracer_units(m) = trim(mi%tracer_metadata(m)%units)
+      marbl_tracer_lnames(m) = trim(mi%tracer_metadata(m)%long_name)
     enddo
 
     do idx = 1, size(mi%surface_flux_forcings)

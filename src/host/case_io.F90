@@ -4,7 +4,8 @@ module case_io
   use decomp_mod
   use gpu_state
   use time_state
-  use geom, only: setup_metrics, set_depth, dump_vic
+  use geom, only: setup_metrics, set_depth, dump_vic, set_HUV, omega
+  use rho_eos_mod, only: rho_eos
   use nc_io
   use host_buf, only: host_read_2d, host_read_3d
   use par_read, only: pr_begin, pr_flush, pr_take, pr_end, pr_taking, pr_store_2d, pr_store_3d, pr_store_3d_pt
@@ -19,6 +20,8 @@ module case_io
   use cdr_out, only: read_cdr_output_namelist, set_cdr_output_root, init_cdr_output
   use upscale_out, only: read_upscale_namelist, set_upscale_root, init_upscale_output
   use his_io, only: read_output_namelist, set_output_root, init_output
+  use avg_out, only: read_avg_namelist, set_avg_root, init_avg_output
+  use extract_out, only: read_extract_namelist, init_extract
   use comm_mod, only: comm_rank, comm_size, comm_min_real
   use tile_balance, only: balance_cuts, uniform_cuts
   use halo_mod, only: halo_fill_2d, halo_fill_2d_s, halo_fill_3d_s, halo_fill_3d_t, halo_fill_3d_tp
@@ -153,6 +156,8 @@ contains
     call read_forcing_namelist(unit, nml_dir)
     call read_tide_namelist(unit)
     call read_output_namelist(unit)
+    call read_avg_namelist(unit)
+    call read_extract_namelist(unit)
     call read_passive_namelist(unit, nt_passive)
     call read_marbl_namelist(unit, nml_dir, nt_bgc)
     call read_river_namelist(unit)
@@ -643,21 +648,26 @@ contains
     call set_forces()
     call set_bry_all()
     call set_tides()
-    ! the CPU's initial MARBL diagnostics (its first wrt_bgc), before the
-    ! initial history record. They need the depths, which the CPU sets
-    ! (set_depth(0)) right after this set_forces; report_loaded_case sets
-    ! the same again.
-    if (marbl_on) then
-      iic = 0
-      call set_depth()
-      call marbl_gpu_init_diagnostics()
-    endif
+    ! The CPU's start-up diagnostics before its initial history record
+    ! (main.F90 after this set_forces: set_depth, set_HUV, omega,
+    ! rho_eos): the initial record's rho, omega and w, and the depths the
+    ! initial MARBL diagnostics need. Every step recomputes them first.
+    iic = 0
+    call set_depth()
+    call set_HUV()
+    call omega()
+    call rho_eos(nstp)
+    ! the CPU's initial MARBL diagnostics (its first wrt_bgc)
+    if (marbl_on) call marbl_gpu_init_diagnostics()
     call set_output_root(case_output_root, case_title)
     call init_output()
+    call set_avg_root(case_output_root)
+    call init_avg_output()            ! before the outputs that write a double record at start-up
     call init_cdr_lite_output()       ! after the history/restart staging is sized
     call init_cdr_gas_output()        ! writes its start (bracket) record
     call init_cdr_output()
     call init_upscale_output()        ! after init_bry (open sides)
+    call init_extract()               ! child-grid boundary extraction
     call wall_stamp('output init')
   end subroutine load_case
 
@@ -984,7 +994,7 @@ contains
     ! restart is stored by device kernels), and host loops over these
     ! managed arrays migrated ~2 GB per rank to the host and back. The tests
     ! and assignments per element are those of the former host loops.
-    integer(ip) :: i, j, k, n, m, is, ie, js, je, nz, ntr
+    integer(ip) :: i, j, k, n, m, is, ie, js, je, nz, ntr, c, nt3
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
     nz = decomp%nz; ntr = size(t, 5)
 #ifdef USE_CUDA
@@ -1048,6 +1058,31 @@ contains
         enddo
       enddo
     enddo
+    ! The passive tracers at land as the CPU's (0): land cells inside the
+    ! tile read the zero column, but the stored columns of the boundary ring
+    ! held the initial file's land values until the first step's boundary
+    ! conditions (seen in the initial history record and in averages over
+    ! the first steps).
+    if (ntp > 0 .and. allocated(tp)) then
+      nt3 = int(ntp)
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do j = js, je
+        do i = is, ie
+          c = tpcol(i, j)
+          if (c > 0 .and. rmask(i, j) < 0.5_rp) then
+            do m = 1, 3
+              do k = 1, nz
+                do n = 1, nt3
+                  tp(n, c, k, m) = 0.0_pp
+                enddo
+              enddo
+            enddo
+          endif
+        enddo
+      enddo
+    endif
   end subroutine sanitize_land
 
   subroutine pad_physical_halo()

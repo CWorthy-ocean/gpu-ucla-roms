@@ -50,6 +50,9 @@ module marbl_gpu
   logical :: his_staged = .false.
   ! The CDR output (cdr_out) averages them too: computed at every MARBL call.
   logical, public :: marbl_need_zsat = .false.
+  ! marbl_tracers_to_write as read: the CPU writes (and averages) the named
+  ! tracers, or every tracer when the list is empty (avg_out)
+  character(len=32), public :: marbl_trc_list(64) = ''
   real(rp), parameter :: Cp = 3985.0_rp
 
   ! history diagnostics (2-D, surface flux module slots)
@@ -104,6 +107,7 @@ contains
     rewind(unit)
     read(unit, nml=marbl_biogeochemistry_settings, iostat=ios)
     if (ios > 0) error stop 'marbl_biogeochemistry_settings: read error'
+    marbl_trc_list = marbl_tracers_to_write
     if (use_constant_Fe) then
       if (constant_Fe_value < 0.0_rp) error stop 'use_constant_Fe: constant_Fe_value must be non-negative'
       write(*,'(a,es12.5,a)') 'MARBL Fe held constant at ', constant_Fe_value, ' (use_constant_Fe)'

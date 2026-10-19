@@ -60,6 +60,7 @@ module cdr_io
   implicit none
   private
   public :: read_cdr_namelist, init_cdr, set_cdr, set_cdr_pred
+  public :: remap_src_to_grid      ! the CPU's flux-conserving PPM remap (also extract_out)
   public :: cdr_source
 
   logical :: cdr_source = .false., cdr_forcing_depth_profiles = .false., cdr_forcing_3d = .false.

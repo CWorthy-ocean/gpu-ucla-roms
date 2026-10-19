@@ -1956,6 +1956,112 @@ made.
   to 95 registers (its launch bound allows 102); the fastest steps without
   output are unchanged.
 
+## Averages, true vertical velocity and child-grid extraction (2026-10-18)
+
+**Averaged history and BGC averages (src/host/avg_out.F90).** These are
+the CPU's basic_output (wrt_file_avg) and bgc_io (wrt_bgc_avg), in
+double:
+
+- **Running means.** Every step after the step, avg*(1 - 1/n) + x/n.
+  - zeta, ubar and vbar are taken at knew (time n+1).
+  - u, v and the tracers come from slot nstp (time n, the CPU's choice).
+  - rho is rho1 - qp1*z_r; omega is We + Wi, times pm*pn at the write.
+  - Also averaged: the true w, Akv, Akt, AKs (the CPU's name), hbls and
+    hbbl.
+- **Records.** _avg.nc carries a record every output_period_avg, stamped
+  with the mean model time. _bgc_avg.nc carries the MARBL tracers every
+  output_period_bgc_avg, stamped with the time at the write.
+- **Which tracers.** As the CPU's wrt_t_avg: with MARBL, the names in
+  marbl_tracers_to_write, or every tracer when the list is empty.
+  Temperature, salinity and CDR_LITE go to _avg, MARBL to _bgc_avg. So with
+  the usual MARBL list, the CPU's _avg file has no temperature or salinity
+  (the likely CPU oversight, kept for now).
+- **CPU behaviours kept.** Without BGC history output (wrt_bgc_his off),
+  the CPU's start-up call already adds the initial state to the BGC
+  average and advances its clock by a step.
+- **Not kept.** The CPU resets its _bgc_avg record counter on every call,
+  so it writes one file per record. Here nrpf_bgc_avg records go in each
+  file.
+
+**True vertical velocity (src/device/wvlcty.F90).** The CPU's wvlcty_tile:
+the bottom-up mass-flux divergence times pm*pn, interpolated to rho
+levels, plus u, v (slot nstp) along the s-surface slopes, and the gradient
+condition at the physical edges. It feeds wrt_W in the history (no longer
+stopped) and the w average.
+
+**Start-up fixes, found with these outputs.**
+
+- **Passive tracers at land are zeroed at load (sanitize_land).** Land
+  cells of the boundary ring are stored columns, so they kept the initial
+  file's values until the first step's boundary conditions. The CPU has 0
+  there, and the values showed up in the initial history record and in
+  averages that include the first steps.
+- **The CPU's start-up diagnostics now run before the initial history
+  record:** set_depth, set_HUV, omega and rho_eos. Before, the GPU's
+  initial record had rho, omega and w from unset fields. Every step
+  recomputes them first, so the run itself is unchanged: bit-identical to
+  cdr6g on Iceland0 and MiniPac.
+
+**Child-grid extraction (src/host/extract_out.F90).** The CPU's
+extract_data, its PARALLEL_IO path:
+
+- **Objects.** An objects file has one variable per object: the points of
+  a child boundary in the parent's absolute index space, plus the child
+  angle for u/v points, and the fields in output_vars (matched as
+  substrings, as the CPU's findstr). Each tile takes the first contiguous
+  run of points inside it.
+- **Interpolation.** Bilinear with the mask in the weights, normalized;
+  u/v are rotated by the parent angle minus the child angle. When the
+  child's vertical grid differs (N_chd, theta_s/b_chd, hc_chd), every
+  column is remapped with the CPU's PPM remap from the interpolated parent
+  layers (at u/v points, the mean of two rho columns) to the child layers
+  of the same depth.
+- **Output.** _bry.nc has the CPU's dimensions and variables (per side:
+  zeta, ubar, vbar, every tracer, u, v) and bry_time in days. A record
+  comes every output_period_extract, nrpf_extract per file.
+- **Where it runs.** The interpolation runs on the device, rotation and
+  remap on the host, and compute rank 0 writes the sum over ranks.
+- **Not supported:** up/vp (they need calc_pflx, not on the GPU) and w
+  (the CPU's parallel-I/O path does not write it). Both stop at start-up.
+
+**Validation (Iceland0, 12 steps; gen_cdr.py rel with --avg, --bgc-avg,
+--his-all, --all-tracers, --extract; objects from
+tools/make_extract_test.py).** The test child box is 2x refined over
+parent cells 200-330 and crosses land on two sides.
+
+- **Averages (av1: the MARBL list; av2: an empty list, with temperature,
+  salinity and CDR_LITE).** Records, file split and variables are the
+  CPU's.
+  - Every field agrees to 6e-8 relative.
+  - BGC averages agree to 1.3e-7.
+  - Akv, Akt and AKs are within 1-3e-5. That is the KPP mixing
+    coefficients' own GPU-CPU difference (3.7e-6 absolute after 10 steps).
+    The CPU's 1e-6 degC twin differs by 1e-2 after 2 steps.
+- **w and the initial record.** The history's w agrees to float32
+  precision, and the initial record's w, rho and tracers now match.
+- **Extraction (ex1 with a 40-level child grid and remap, ex2 without).**
+  Records, files and variables are the CPU's, with no finite/NaN
+  mismatch.
+  - zeta, ubar and vbar agree to 4e-13.
+  - u and v agree to 3e-10.
+  - Temperature, salinity and the tracers agree to 7e-10.
+- **Regression.** With none of these on, the build reproduces cdr6g bit
+  for bit (Iceland0 gas, MiniPac).
+- **Cost (Iceland0, 4 A100s, 36-step runs, median step 58.7 ms).**
+  - Accumulating both averages adds 3.1 ms per step (5 %), mostly the 32
+    MARBL tracers.
+    - The BGC kernel takes one thread per (tracer, column, level), tracers
+      fastest. A thread per (column, level) looping over the tracers cost
+      4.3 ms.
+    - The ocean fields and w add the rest.
+  - An extraction record adds about 60 ms, nearly all the rank-0 netCDF
+    write of ~170 variables. That is 2 ms per step at hourly records.
+    - The interpolations are queued on the device into one buffer, copied
+      once: 1 ms. Fetching each field through managed memory cost 0.2 s.
+    - The remap takes 15 ms on the host and the reduction over the ranks
+      10-20 ms.
+    - netCDF-4 with a chunk per record beat CDF5 (150 ms) for this file.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;
