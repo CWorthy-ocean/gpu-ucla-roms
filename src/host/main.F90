@@ -8,6 +8,8 @@ program roms_gpu
   use his_io, only: maybe_wrt_output
   use cdr_lite_out, only: wrt_cdr_lite
   use cdr_gas_out, only: wrt_cdr_gas, wrt_cdr_gas_final
+  use cdr_out, only: wrt_cdr
+  use upscale_out, only: wrt_upscale_final
   use arch_mod, only: init_arch, arch_name, select_device
   use comm_mod, only: init_comm, finalize_comm, comm_rank, comm_size, is_io_rank
   use io_server, only: io_server_run, io_finalize
@@ -81,11 +83,13 @@ program roms_gpu
         call maybe_wrt_output()
         call wrt_cdr_lite()
         call wrt_cdr_gas()
+        call wrt_cdr()
         call rt_toc(RT_OUTPUT)
         rt_nsteps = rt_nsteps + 1
         call rt_step_end()
       enddo
       call rt_toc(RT_LOOP)
+      call wrt_upscale_final()        ! the CPU's final wrt_upscale
       call wrt_cdr_gas_final()        ! end-time bracket record of the CDR gas-exchange output
       call wall_stamp('loop done')
       call rt_tic(RT_FINAL)

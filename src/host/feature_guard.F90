@@ -37,19 +37,14 @@ contains
     if (is_true('river_frc_settings', 'river_source')) &
       call need_off('river_frc_settings', 'river_analytical', 'analytical river forcing')
     call need_off('pipe_frc_settings', 'pipe_source', 'pipe (point source) forcing')
-    if (is_true('cdr_frc_settings', 'cdr_source')) then
-      ! parameterized tracer-flux releases are on the GPU; the other modes not yet
-      call need_off('cdr_frc_settings', 'cdr_volume', 'CDR volume releases (cdr_volume)')
-      call need_off('cdr_frc_settings', 'cdr_forcing_depth_profiles', 'CDR depth-profile forcing')
-      call need_off('cdr_frc_settings', 'cdr_forcing_3d', 'CDR 3D forcing')
-    endif
-    call need_off('cdr_output_settings', 'do_cdr_output', 'CDR output')
+    ! every CDR forcing mode (cdr_frc_settings) is on the GPU
+    if (is_true('cdr_output_settings', 'do_cdr_output')) &
+      call need_off('cdr_output_settings', 'cdr_monthly_averages', 'monthly CDR averages')
     call need_off('cdr_tracer_output_settings', 'do_cdr_tracer_output', 'CDR tracer output')
     if (is_true('cdr_gas_exch_output_settings', 'do_cdr_gas_exch_output')) &
       call need_off('cdr_gas_exch_output_settings', 'cdr_gas_monthly_averages', 'monthly CDR gas-exchange averages')
     if (is_true('cdr_lite_output_settings', 'do_cdr_lite_output')) &
       call need_off('cdr_lite_output_settings', 'cdr_lite_monthly_averages', 'monthly CDR_LITE averages')
-    call need_off('upscale_settings', 'do_upscale', 'upscaling output')
     call need_off('extract_data_settings', 'do_extract', 'output for nested child grids (extract_data)')
     call need_off('zslice_settings', 'do_zslice', 'z-slice output')
     call need_off('particles_settings', 'floats', 'particles (floats)')

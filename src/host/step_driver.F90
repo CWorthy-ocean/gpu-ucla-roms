@@ -23,12 +23,13 @@ module step_driver
   use lmd_mod, only: lmd_vmix
   use frc_io, only: set_forces, frc_prefetch
   use river_io, only: set_rivers
-  use cdr_io, only: set_cdr
+  use cdr_io, only: set_cdr, set_cdr_pred
   use cdr_lite_io, only: set_cdr_lite
   use bry_io, only: set_bry_all, dump_bry_north
   use tide_io, only: set_tides
   use run_timers, only: rt_dev_collect
   use arch_mod, only: sync_arch
+  use upscale_out, only: wrt_upscale
   implicit none
   private
 
@@ -81,6 +82,7 @@ contains
     frc_slot = 0
     call set_forces()
     call set_rivers(0)                    ! river data at time n (predictor)
+    call set_cdr_pred()                   ! CDR volume releases at time n (predictor, first omegas)
     call dump_swflx_b('after pred set_forces')
     call step_mark('set_forces')
     frc_slot = 1
@@ -196,6 +198,9 @@ contains
     ! kernels queued by step3d_t run on the device (before marbl_gpu_step,
     ! which drains the device on some calls for its solver report).
     call frc_prefetch()
+    ! upscaling: this step's open-boundary fluxes (slot nrhs, unchanged by
+    ! MARBL), as the CPU's wrt_upscale at the end of its tracer loop
+    call wrt_upscale()
     call marbl_gpu_step()
     call dump_max_t('after step3d_t')
     call dump_col_probe('after step3d_t', nnew)

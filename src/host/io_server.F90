@@ -46,8 +46,10 @@ module io_server
   ! may carry avg_begin_time / avg_end_time). IO_KIND_CDRGAS: the CDR
   ! gas-exchange output (_cdrgas, double; records also carry the forcing
   ! time of ddic_dco2_time / ddic_dalk_time).
+  ! IO_KIND_CDROUT: the CDR output (cdr_output, _cdr, double).
   integer, parameter, public :: IO_KIND_HIS = 1, IO_KIND_RST = 2, IO_KIND_CDR = 3, IO_KIND_CDRGAS = 4
-  integer, parameter :: NKIND = 4
+  integer, parameter, public :: IO_KIND_CDROUT = 5
+  integer, parameter :: NKIND = 5
   integer, parameter :: CMD_OPEN = 1, CMD_PUT = 2, CMD_QUIT = 3
   integer, parameter :: TAG_CMD = 900, TAG_STR = 901, TAG_TIME = 902, TAG_DATA = 910
   integer, parameter :: MAXV = 256, NAMELEN = 32, PATHLEN = 512   ! variables per record: up to ~240 tracers
@@ -1017,6 +1019,9 @@ contains
            '  rec = ', r%rec, '  file ', r%nfile
     elseif (r%fkind == IO_KIND_CDRGAS) then
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote cdr_gas t = ', r%time, &
+           '  rec = ', r%rec, '  file ', r%nfile
+    elseif (r%fkind == IO_KIND_CDROUT) then
+      write(*,'(a,es14.6,a,i0,a,i0)') 'wrote cdr t = ', r%time, &
            '  rec = ', r%rec, '  file ', r%nfile
     else
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote restart t = ', r%time, &

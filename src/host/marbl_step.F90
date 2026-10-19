@@ -48,6 +48,8 @@ module marbl_gpu
   ! first MARBL call (init_output), so his_staged tells whether any record
   ! can ever need them; without history they are not computed.
   logical :: his_staged = .false.
+  ! The CDR output (cdr_out) averages them too: computed at every MARBL call.
+  logical, public :: marbl_need_zsat = .false.
   real(rp), parameter :: Cp = 3985.0_rp
 
   ! history diagnostics (2-D, surface flux module slots)
@@ -67,6 +69,7 @@ module marbl_gpu
   public :: marbl_gpu_init_forcing
   public :: marbl_gpu_load_state
   public :: marbl_gpu_step
+  public :: marbl_gpu_init_diagnostics
   public :: marbl_gpu_nhis
   public :: marbl_gpu_nhis3
   public :: marbl_gpu_define_his
@@ -209,7 +212,7 @@ contains
     enddo
     ! interior: carbonate chemistry, then the column ecosystem/sinking sweep
     call marbl_carbonate_compute(ntp, nz, nn, 3_ip, tp, nt, t, z_r, rmask)
-    if (his_staged) call marbl_zsat_compute(nz, z_r, z_w, rmask)
+    if (his_staged .or. marbl_need_zsat) call marbl_zsat_compute(nz, z_r, z_w, rmask)
     call marbl_interior_compute(ntp, nz, nn, 3_ip, tp, nt, t, z_r, z_w, Hz, rmask, sf_dust, dtm, .false.)
     call rt_dev_end()
     ncalls = ncalls + 1
@@ -231,6 +234,58 @@ contains
       write(*,'(a,i0,a,i0,a)') 'MARBL call ', ncalls, ' at iic ', iic, '  carbonate solver: no failures'
     endif
   end subroutine marbl_gpu_step
+
+  ! The CPU's marbldrv_compute_init_diagnostics, which its first wrt_bgc
+  ! calls at start-up (before the first MARBL step): the surface-flux and
+  ! carbonate diagnostics of the initial state (slot nstp) with the
+  ! start-time forcing (load_case's set_forces, frc_slot 0). The tracers
+  ! and the saved state stay as loaded: the CPU does not copy MARBL's
+  ! saved state back here, so its first MARBL step starts from the loaded
+  ! pH, and its pH output (saved state) stays as loaded until then. Until
+  ! the first MARBL call the history and the CDR output hold these values,
+  ! as the CPU's.
+  subroutine marbl_gpu_init_diagnostics()
+    integer(ip) :: i, j, k, nx, ny, nz, n0, is, ie, js, je
+    real(rp) :: tfrc
+    real(rp), WORK_ATTR allocatable :: s1(:,:), s2(:,:), p1(:,:,:), p2(:,:,:)
+    if (.not. marbl_on) return
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    n0 = nstp
+    tfrc = frc_modtime()
+    call set_bgc_forces(tfrc, sf_dust, sf_iron, sf_nox, sf_nhy, sf_xco2, sf_xco2_alt)
+    allocate(s1(is:ie, js:je), s2(is:ie, js:je), p1(is:ie, js:je, nz), p2(is:ie, js:je, nz))
+    CUF_DO2
+    do j = js, je
+      do i = is, ie
+        s1(i, j) = sf_ph(i, j); s2(i, j) = sf_ph_alt(i, j)
+        do k = 1, nz
+          p1(i, j, k) = it_ph(i, j, k); p2(i, j, k) = it_pha(i, j, k)
+        enddo
+      enddo
+    enddo
+    CUF_DO2
+    do j = 1, ny
+      do i = 1, nx
+        sf_u10sqr(i, j) = (uwnd(i, j)**2) + (vwnd(i, j)**2)
+      enddo
+    enddo
+    call marbl_sflux_compute(msf, ntp, nz, nz, n0, tp, nt, t, rmask)
+    call marbl_carbonate_compute(ntp, nz, n0, 3_ip, tp, nt, t, z_r, rmask)
+    call marbl_zsat_compute(nz, z_r, z_w, rmask)
+    CUF_DO2
+    do j = js, je
+      do i = is, ie
+        sf_ph(i, j) = s1(i, j); sf_ph_alt(i, j) = s2(i, j)
+        do k = 1, nz
+          it_ph(i, j, k) = p1(i, j, k); it_pha(i, j, k) = p2(i, j, k)
+        enddo
+      enddo
+    enddo
+    call sync_arch()
+    deallocate(s1, s2, p1, p2)
+    write(*,'(a)') 'MARBL initial diagnostics (surface flux, carbonate) from the initial state'
+  end subroutine marbl_gpu_init_diagnostics
 
   subroutine solver_abort(nsf, nit, nn)
     ! MARBL's carbonate solver failed on this tile: list the first columns

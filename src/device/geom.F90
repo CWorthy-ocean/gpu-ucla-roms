@@ -9,6 +9,7 @@ module geom
   use formulas
   use halo_mod
   use arch_mod, only: sync_arch
+  use cdr_src_mod, only: cdr_vol_on, cdr_cmap, cd_vol, cq_w, cc_p0, cq_rel
   implicit none
   private
 
@@ -216,8 +217,8 @@ contains
   end subroutine set_HUV1
 
   subroutine omega()
-    integer(ip) :: i, j, k, nx, ny, nz, lim
-    real(rp) :: dtau, wrk, c2d, dh, cw, cw_max, cw_max2, cw_min, cff, cx0, cxk, cxkp, wacc
+    integer(ip) :: i, j, k, nx, ny, nz, lim, cvo, cc, q, r
+    real(rp) :: dtau, wrk, c2d, dh, cw, cw_max, cw_max2, cw_min, cff, cx0, cxk, cxkp, wacc, cfv
     real(rp), parameter :: cmnx_ratio = cu_min / cu_max
     real(rp), parameter :: cutoff = 2.0_rp - cmnx_ratio
     real(rp), parameter :: r4cmx = 0.25_rp / (1.0_rp - cmnx_ratio)
@@ -233,6 +234,7 @@ contains
       dtau = 0.6_rp * dt
     endif
     lim = dry_lim(G_GEOM)
+    cvo = merge(1_ip, 0_ip, cdr_vol_on)
 
     ! Zero Wi, We except where the kernel below assigns them: in its
     ! columns (1:nx, 1:ny with the same dry skip) it writes Wi(1:nz) and
@@ -255,6 +257,10 @@ contains
       enddo
     enddo
 
+    ! Two copies of the column kernel: without CDR volume releases the
+    ! original one (its registers unchanged), with them the same plus the
+    ! releases' water.
+    if (cvo == 0) then
 #ifdef USE_CUDA
     !$cuf kernel do(2) <<<*,*>>>
 #endif
@@ -302,6 +308,72 @@ contains
         enddo
       enddo
     enddo
+
+    else
+#ifdef USE_CUDA
+    !$cuf kernel do(2) <<<*,*>>>
+#endif
+    do j = 1, ny
+      do i = 1, nx
+        if (lim > 0) then; if (colact(i, j) == 0) cycle; end if
+        wacc = 0.0_rp
+        do k = 1, nz
+          wacc = wacc - FlxU(i + 1, j, k) + FlxU(i, j, k) &
+                 - FlxV(i, j + 1, k) + FlxV(i, j, k)
+          Wi(i, j, k) = wacc
+          col_fc(i, j, k) = max(FlxU(i + 1, j, k), 0.0_rp) - min(FlxU(i, j, k), 0.0_rp) &
+                          + max(FlxV(i, j + 1, k), 0.0_rp) - min(FlxV(i, j, k), 0.0_rp)
+        enddo
+        ! CDR volume releases (CPU omega): each release's water, accumulated
+        ! bottom up with its weights, before the rain and the grid motion
+        if (.true.) then
+          cc = cdr_cmap(i, j)
+          if (cc > 0) then
+            do q = cc_p0(cc), cc_p0(cc + 1) - 1
+              r = cq_rel(q)
+              cfv = 0.0_rp
+              do k = 1, nz
+                cfv = cfv + cd_vol(r) * cq_w(k, q)
+                Wi(i, j, k) = Wi(i, j, k) + cfv
+              enddo
+            enddo
+          endif
+        endif
+        Wi(i, j, nz) = Wi(i, j, nz) + swflx(i, j) * dm_r(i, j) * dn_r(i, j)
+        wrk = Wi(i, j, nz) / max(z_w(i, j, nz) - z_w(i, j, 0), 1.0e-30_rp)
+        Wi(i, j, nz) = 0.0_rp
+        We(i, j, nz) = 0.0_rp
+        We(i, j, 0) = 0.0_rp
+        cx0 = dtau * pm(i, j) * pn(i, j)
+        do k = nz - 1, 1, -1
+          Wi(i, j, k) = Wi(i, j, k) - wrk * (z_w(i, j, k) - z_w(i, j, 0))
+          cxk = col_fc(i, j, k)
+          cxkp = col_fc(i, j, k + 1)
+          c2d = max(cxk, cxkp)
+          dh  = min(Hz(i, j, k), Hz(i, j, k + 1))
+          cw_max = cu_max * dh - c2d * cx0
+          if (cw_max > 0.0_rp) then
+            cw_max2 = cw_max * cw_max
+            cw_min = cw_max * cmnx_ratio
+            cw = abs(Wi(i, j, k)) * cx0
+            if (cw < cw_min) then
+              cff = cw_max2
+            elseif (cw < cutoff * cw_max) then
+              cff = cw_max2 + r4cmx * (cw - cw_min)**2
+            else
+              cff = cw_max * cw
+            endif
+            We(i, j, k) = apply_mask(cw_max2 * Wi(i, j, k) / cff, rmask(i, j))
+            Wi(i, j, k) = apply_mask(Wi(i, j, k) - We(i, j, k), rmask(i, j))
+          else
+            We(i, j, k) = 0.0_rp
+            Wi(i, j, k) = apply_mask(Wi(i, j, k), rmask(i, j))
+          endif
+        enddo
+      enddo
+    enddo
+
+    endif
 
     call apply_volume_sources()
     call fill_omega_edge_ghosts()

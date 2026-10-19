@@ -150,27 +150,36 @@ contains
   end subroutine c4_div
 
   DEVICE_ATTR
-  subroutine c4_faces(t0, xm1, xp1, ym1, yp1, bu1, bu2, bv1, bv2, qxw, qxe, qys, qyn, fu1, fu2, fv1, fv2, hdiv)
-    ! fxe - fxw + fen - fes with the C4 faces
+  subroutine c4_faces(t0, xm1, xp1, ym1, yp1, bu1, bu2, bv1, bv2, qxw, qxe, qys, qyn, fu1, fu2, fv1, fv2, &
+                      wedge, eedge, sedge, nedge, usc, hdiv)
+    ! fxe - fxw + fen - fes with the C4 faces; usc: the UPSCALING term on
+    ! the faces at the physical edges
     real(rp), intent(in) :: t0, xm1, xp1, ym1, yp1, qxw, qxe, qys, qyn, fu1, fu2, fv1, fv2
-    logical, intent(in) :: bu1, bu2, bv1, bv2
+    logical, intent(in) :: bu1, bu2, bv1, bv2, wedge, eedge, sedge, nedge, usc
     real(rp), intent(out) :: hdiv
     real(rp) :: fxw, fxe, fes, fen
     fxw = selm(0.5_rp * (t0 + xm1 - qxw) * fu1, bu1)
     fxe = selm(0.5_rp * (xp1 + t0 - qxe) * fu2, bu2)
     fes = selm(0.5_rp * (t0 + ym1 - qys) * fv1, bv1)
     fen = selm(0.5_rp * (yp1 + t0 - qyn) * fv2, bv2)
+    if (usc) then
+      if (wedge) fxw = fxw + selm(0.5_rp * (xm1 - t0) * max(fu1, 0.0_rp), bu1)
+      if (eedge) fxe = fxe + selm(0.5_rp * (xp1 - t0) * min(fu2, 0.0_rp), bu2)
+      if (sedge) fes = fes + selm(0.5_rp * (ym1 - t0) * max(fv1, 0.0_rp), bv1)
+      if (nedge) fen = fen + selm(0.5_rp * (yp1 - t0) * min(fv2, 0.0_rp), bv2)
+    endif
     hdiv = fxe - fxw + fen - fes
   end subroutine c4_faces
 
   DEVICE_ATTR
   subroutine up3_div(t0, xm2, xm1, xp1, xp2, ym2, ym1, yp1, yp2, wedge, eedge, sedge, nedge, &
                      um0, um1, um2, um3, vm0, vm1, vm2, vm3, bu0, bu1, bu2, bu3, bv0, bv1, bv2, bv3, &
-                     brw, brc, bre, brs, brn, fu1, fu2, fv1, fv2, hdiv)
-    ! fxe - fxw + fen - fes with the UP3 faces
+                     brw, brc, bre, brs, brn, fu1, fu2, fv1, fv2, usc, hdiv)
+    ! fxe - fxw + fen - fes with the UP3 faces; usc: the UPSCALING term on
+    ! the faces at the physical edges
     real(rp), intent(in) :: t0, xm2, xm1, xp1, xp2, ym2, ym1, yp1, yp2, fu1, fu2, fv1, fv2
     real(rp), intent(in) :: um0, um1, um2, um3, vm0, vm1, vm2, vm3
-    logical, intent(in) :: wedge, eedge, sedge, nedge, bu0, bu1, bu2, bu3, bv0, bv1, bv2, bv3
+    logical, intent(in) :: wedge, eedge, sedge, nedge, bu0, bu1, bu2, bu3, bv0, bv1, bv2, bv3, usc
     logical, intent(in) :: brw, brc, bre, brs, brn
     real(rp), intent(out) :: hdiv
     real(rp) :: dcw, dlw, drw, dre, fxw, fxe, fes, fen, face_t
@@ -242,6 +251,12 @@ contains
     endif
     fen = selm(face_t * fv2 - coef_up3 * ( &
           (drw - dcw) * vm1 * vm2 * max(fv2, 0.0_rp) + (dre - drw) * vm2 * vm3 * min(fv2, 0.0_rp)), bv2)
+    if (usc) then
+      if (wedge) fxw = fxw + selm(0.5_rp * (xm1 - t0) * max(fu1, 0.0_rp), bu1)
+      if (eedge) fxe = fxe + selm(0.5_rp * (xp1 - t0) * min(fu2, 0.0_rp), bu2)
+      if (sedge) fes = fes + selm(0.5_rp * (ym1 - t0) * max(fv1, 0.0_rp), bv1)
+      if (nedge) fen = fen + selm(0.5_rp * (yp1 - t0) * min(fv2, 0.0_rp), bv2)
+    endif
     hdiv = fxe - fxw + fen - fes
   end subroutine up3_div
 
@@ -300,7 +315,7 @@ contains
     real(rp), intent(in) :: pm_(is:ie, js:je), pn_(is:ie, js:je), umask_(is:ie, js:je), vmask_(is:ie, js:je)
     real(rp) :: dtpp, t0, hdiv, told, tbk, hb, hzc, fu1, fu2, fv1, fv2
     real(rp) :: xm2, xm1, xp1, xp2, ym2, ym1, yp1, yp2, qxw, qxe, qys, qyn
-    logical :: wedge, eedge, sedge, nedge, bu0, bu1, bu2, bu3, bv0, bv1, bv2, bv3
+    logical :: wedge, eedge, sedge, nedge, bu0, bu1, bu2, bu3, bv0, bv1, bv2, bv3, usc
     integer(ip) :: nb8(8), k
     call stencil_cols(ci, i, nx, ncl, nwet, nbt_, nb8)
     dtpp = dtp * pm_(i, j) * pn_(i, j)
@@ -308,10 +323,11 @@ contains
     bu2 = umask_(i + 1, j) > 0.5_rp; bu3 = umask_(i + 2, j) > 0.5_rp
     bv0 = vmask_(i, j - 1) > 0.5_rp; bv1 = vmask_(i, j) > 0.5_rp
     bv2 = vmask_(i, j + 1) > 0.5_rp; bv3 = vmask_(i, j + 2) > 0.5_rp
-    wedge = (west == 1 .and. i == 1)
-    eedge = (east == 1 .and. i == nx)
-    sedge = (south == 1 .and. j == 1)
-    nedge = (north == 1 .and. j == ny)
+    wedge = (west >= 1 .and. i == 1)
+    eedge = (east >= 1 .and. i == nx)
+    sedge = (south >= 1 .and. j == 1)
+    nedge = (north >= 1 .and. j == ny)
+    usc = (west == 2 .or. east == 2 .or. south == 2 .or. north == 2)
     k = k0
     told = real(tpo(itr, ci, k), rp); tbk = real(tpk(itr, ci, k), rp)
     fu1 = FlxU_(i, j, k); fu2 = FlxU_(i + 1, j, k)
@@ -325,7 +341,8 @@ contains
       yp1 = real(tps(itr, nb8(7), k), rp); yp2 = real(tps(itr, nb8(8), k), rp)
       call c4_div(t0, xm2, xm1, xp1, xp2, ym2, ym1, yp1, yp2, wedge, eedge, sedge, nedge, &
                   bu0, bu1, bu2, bu3, bv0, bv1, bv2, bv3, qxw, qxe, qys, qyn)
-      call c4_faces(t0, xm1, xp1, ym1, yp1, bu1, bu2, bv1, bv2, qxw, qxe, qys, qyn, fu1, fu2, fv1, fv2, hdiv)
+      call c4_faces(t0, xm1, xp1, ym1, yp1, bu1, bu2, bv1, bv2, qxw, qxe, qys, qyn, fu1, fu2, fv1, fv2, &
+                    wedge, eedge, sedge, nedge, usc, hdiv)
       tpn(itr, ci, k) = real(hb * (cs * told + cb * tbk) - dtpp * hdiv, pp)
       tpk(itr, ci, k) = real(hzc * told, pp)
       if (k < k1) then
@@ -355,7 +372,7 @@ contains
     real(rp) :: dtpp, t0, hdiv, tnn, fu1, fu2, fv1, fv2
     real(rp) :: xm2, xm1, xp1, xp2, ym2, ym1, yp1, yp2
     real(rp) :: um0, um1, um2, um3, vm0, vm1, vm2, vm3
-    logical :: wedge, eedge, sedge, nedge, bu0, bu1, bu2, bu3, bv0, bv1, bv2, bv3
+    logical :: wedge, eedge, sedge, nedge, bu0, bu1, bu2, bu3, bv0, bv1, bv2, bv3, usc
     logical :: brw, brc, bre, brs, brn
     integer(ip) :: nb8(8), k
     integer(8) :: tk, ts0, o1, o2, o3, o4, o5, o6, o7, o8, gk, g0, nxa
@@ -367,10 +384,11 @@ contains
     bv0 = vm0 > 0.5_rp; bv1 = vm1 > 0.5_rp; bv2 = vm2 > 0.5_rp; bv3 = vm3 > 0.5_rp
     brw = rmask_(i - 1, j) > 0.5_rp; brc = rmask_(i, j) > 0.5_rp; bre = rmask_(i + 1, j) > 0.5_rp
     brs = rmask_(i, j - 1) > 0.5_rp; brn = rmask_(i, j + 1) > 0.5_rp
-    wedge = (west == 1 .and. i == 1)
-    eedge = (east == 1 .and. i == nx)
-    sedge = (south == 1 .and. j == 1)
-    nedge = (north == 1 .and. j == ny)
+    wedge = (west >= 1 .and. i == 1)
+    eedge = (east >= 1 .and. i == nx)
+    sedge = (south >= 1 .and. j == 1)
+    nedge = (north >= 1 .and. j == ny)
+    usc = (west == 2 .or. east == 2 .or. south == 2 .or. north == 2)
     ! tp(itr, c, k) = tps(itr + ntr*c + ntr*(ncl+1)*(k-1)); F(i, j, k) = F(g0 + nxa*nya*(k-1))
     tk = int(ntr, 8) * int(ncl + 1, 8)
     ts0 = int(itr, 8) + int(ntr, 8) * int(ci, 8) + tk * int(k0 - 1, 8)
@@ -392,7 +410,7 @@ contains
       fv1 = FlxV_(g0); fv2 = FlxV_(g0 + nxa)
       call up3_div(t0, xm2, xm1, xp1, xp2, ym2, ym1, yp1, yp2, wedge, eedge, sedge, nedge, &
                    um0, um1, um2, um3, vm0, vm1, vm2, vm3, bu0, bu1, bu2, bu3, bv0, bv1, bv2, bv3, &
-                   brw, brc, bre, brs, brn, fu1, fu2, fv1, fv2, hdiv)
+                   brw, brc, bre, brs, brn, fu1, fu2, fv1, fv2, usc, hdiv)
       tpn(ts0) = real(tnn - dtpp * hdiv, pp)
       ts0 = ts0 + tk
       g0 = g0 + gk
@@ -730,10 +748,11 @@ contains
 #endif
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
-    west  = merge(1_ip, 0_ip, decomp%edge_w)
-    east  = merge(1_ip, 0_ip, decomp%edge_e)
-    south = merge(1_ip, 0_ip, decomp%edge_s)
-    north = merge(1_ip, 0_ip, decomp%edge_n)
+    ! edge codes: 0 interior, 1 physical edge, 2 edge with the UPSCALING term
+    west  = merge(1_ip, 0_ip, decomp%edge_w) + merge(1_ip, 0_ip, decomp%edge_w .and. uscl_obc)
+    east  = merge(1_ip, 0_ip, decomp%edge_e) + merge(1_ip, 0_ip, decomp%edge_e .and. uscl_obc)
+    south = merge(1_ip, 0_ip, decomp%edge_s) + merge(1_ip, 0_ip, decomp%edge_s .and. uscl_obc)
+    north = merge(1_ip, 0_ip, decomp%edge_n) + merge(1_ip, 0_ip, decomp%edge_n .and. uscl_obc)
     if (nwet <= 0) return
 #ifdef USE_CUDA
     if (ntr > 128) error stop 'passive_horiz_run: ntr > 128 (kernel block size)'

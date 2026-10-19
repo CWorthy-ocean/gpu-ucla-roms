@@ -51,10 +51,11 @@ contains
     call ensure_wrk3()
     t_slot = tidx
     itr = itrc
-    west  = merge(1_ip, 0_ip, decomp%edge_w)
-    east  = merge(1_ip, 0_ip, decomp%edge_e)
-    south = merge(1_ip, 0_ip, decomp%edge_s)
-    north = merge(1_ip, 0_ip, decomp%edge_n)
+    ! edge codes: 0 interior, 1 physical edge, 2 edge with the UPSCALING term
+    west  = merge(1_ip, 0_ip, decomp%edge_w) + merge(1_ip, 0_ip, decomp%edge_w .and. uscl_obc)
+    east  = merge(1_ip, 0_ip, decomp%edge_e) + merge(1_ip, 0_ip, decomp%edge_e .and. uscl_obc)
+    south = merge(1_ip, 0_ip, decomp%edge_s) + merge(1_ip, 0_ip, decomp%edge_s .and. uscl_obc)
+    north = merge(1_ip, 0_ip, decomp%edge_n) + merge(1_ip, 0_ip, decomp%edge_n .and. uscl_obc)
 
     call hg_begin()
     call hg_add(F_UMASK)
@@ -74,12 +75,12 @@ contains
           t_c = t(i, j, k, t_slot, itr)
           t_l = t(i - 1, j, k, t_slot, itr)
           d_c = apply_mask(t_c - t_l, umask(i, j))
-          if (west == 1 .and. i == 1) then
+          if (west >= 1 .and. i == 1) then
             d_l = d_c
           else
             d_l = apply_mask(t_l - t(i - 2, j, k, t_slot, itr), umask(i - 1, j))
           endif
-          if (east == 1 .and. i == nx + 1) then
+          if (east >= 1 .and. i == nx + 1) then
             d_r = d_c
           else
             d_r = apply_mask(t(i + 1, j, k, t_slot, itr) - t_c, umask(i + 1, j))
@@ -99,6 +100,10 @@ contains
           wrk3a(i, j, k) = apply_mask(face_t * uflux - coef_up3 * ( &
                curv_l * max(uflux, 0.0_rp) + curv_r * min(uflux, 0.0_rp)), &
                umask(i, j))
+          if (west == 2 .and. i == 1) wrk3a(i, j, k) = wrk3a(i, j, k) + &
+               apply_mask(0.5_rp * (t_l - t_c) * max(uflux, 0.0_rp), umask(i, j))
+          if (east == 2 .and. i == nx + 1) wrk3a(i, j, k) = wrk3a(i, j, k) + &
+               apply_mask(0.5_rp * (t_c - t_l) * min(uflux, 0.0_rp), umask(i, j))
         enddo
       enddo
     enddo
@@ -112,12 +117,12 @@ contains
           t_c = t(i, j, k, t_slot, itr)
           t_l = t(i, j - 1, k, t_slot, itr)
           d_c = apply_mask(t_c - t_l, vmask(i, j))
-          if (south == 1 .and. j == 1) then
+          if (south >= 1 .and. j == 1) then
             d_l = d_c
           else
             d_l = apply_mask(t_l - t(i, j - 2, k, t_slot, itr), vmask(i, j - 1))
           endif
-          if (north == 1 .and. j == ny + 1) then
+          if (north >= 1 .and. j == ny + 1) then
             d_r = d_c
           else
             d_r = apply_mask(t(i, j + 1, k, t_slot, itr) - t_c, vmask(i, j + 1))
@@ -137,6 +142,10 @@ contains
           wrk3b(i, j, k) = apply_mask(face_t * uflux - coef_up3 * ( &
                curv_l * max(uflux, 0.0_rp) + curv_r * min(uflux, 0.0_rp)), &
                vmask(i, j))
+          if (south == 2 .and. j == 1) wrk3b(i, j, k) = wrk3b(i, j, k) + &
+               apply_mask(0.5_rp * (t_l - t_c) * max(uflux, 0.0_rp), vmask(i, j))
+          if (north == 2 .and. j == ny + 1) wrk3b(i, j, k) = wrk3b(i, j, k) + &
+               apply_mask(0.5_rp * (t_c - t_l) * min(uflux, 0.0_rp), vmask(i, j))
         enddo
       enddo
     enddo
@@ -162,10 +171,11 @@ contains
     call ensure_wrk3()
     t_slot = tidx
     itr = itrc
-    west  = merge(1_ip, 0_ip, decomp%edge_w)
-    east  = merge(1_ip, 0_ip, decomp%edge_e)
-    south = merge(1_ip, 0_ip, decomp%edge_s)
-    north = merge(1_ip, 0_ip, decomp%edge_n)
+    ! edge codes: 0 interior, 1 physical edge, 2 edge with the UPSCALING term
+    west  = merge(1_ip, 0_ip, decomp%edge_w) + merge(1_ip, 0_ip, decomp%edge_w .and. uscl_obc)
+    east  = merge(1_ip, 0_ip, decomp%edge_e) + merge(1_ip, 0_ip, decomp%edge_e .and. uscl_obc)
+    south = merge(1_ip, 0_ip, decomp%edge_s) + merge(1_ip, 0_ip, decomp%edge_s .and. uscl_obc)
+    north = merge(1_ip, 0_ip, decomp%edge_n) + merge(1_ip, 0_ip, decomp%edge_n .and. uscl_obc)
 
     call hg_begin()
     call hg_add(F_UMASK)
@@ -184,18 +194,22 @@ contains
           t_c = t(i, j, k, t_slot, itr)
           t_l = t(i - 1, j, k, t_slot, itr)
           d_c = apply_mask(t_c - t_l, umask(i, j))
-          if (west == 1 .and. i == 1) then
+          if (west >= 1 .and. i == 1) then
             d_l = d_c
           else
             d_l = apply_mask(t_l - t(i - 2, j, k, t_slot, itr), umask(i - 1, j))
           endif
-          if (east == 1 .and. i == nx + 1) then
+          if (east >= 1 .and. i == nx + 1) then
             d_r = d_c
           else
             d_r = apply_mask(t(i + 1, j, k, t_slot, itr) - t_c, umask(i + 1, j))
           endif
           wrk3a(i, j, k) = apply_mask(0.5_rp * (t_c + t_l - (d_r - d_l) / 6.0_rp) * &
                FlxU(i, j, k), umask(i, j))
+          if (west == 2 .and. i == 1) wrk3a(i, j, k) = wrk3a(i, j, k) + &
+               apply_mask(0.5_rp * (t_l - t_c) * max(FlxU(i, j, k), 0.0_rp), umask(i, j))
+          if (east == 2 .and. i == nx + 1) wrk3a(i, j, k) = wrk3a(i, j, k) + &
+               apply_mask(0.5_rp * (t_c - t_l) * min(FlxU(i, j, k), 0.0_rp), umask(i, j))
         enddo
       enddo
     enddo
@@ -209,18 +223,22 @@ contains
           t_c = t(i, j, k, t_slot, itr)
           t_l = t(i, j - 1, k, t_slot, itr)
           d_c = apply_mask(t_c - t_l, vmask(i, j))
-          if (south == 1 .and. j == 1) then
+          if (south >= 1 .and. j == 1) then
             d_l = d_c
           else
             d_l = apply_mask(t_l - t(i, j - 2, k, t_slot, itr), vmask(i, j - 1))
           endif
-          if (north == 1 .and. j == ny + 1) then
+          if (north >= 1 .and. j == ny + 1) then
             d_r = d_c
           else
             d_r = apply_mask(t(i, j + 1, k, t_slot, itr) - t_c, vmask(i, j + 1))
           endif
           wrk3b(i, j, k) = apply_mask(0.5_rp * (t_c + t_l - (d_r - d_l) / 6.0_rp) * &
                FlxV(i, j, k), vmask(i, j))
+          if (south == 2 .and. j == 1) wrk3b(i, j, k) = wrk3b(i, j, k) + &
+               apply_mask(0.5_rp * (t_l - t_c) * max(FlxV(i, j, k), 0.0_rp), vmask(i, j))
+          if (north == 2 .and. j == ny + 1) wrk3b(i, j, k) = wrk3b(i, j, k) + &
+               apply_mask(0.5_rp * (t_c - t_l) * min(FlxV(i, j, k), 0.0_rp), vmask(i, j))
         enddo
       enddo
     enddo
@@ -407,18 +425,22 @@ contains
     t_c = t(i, j, k, ts, itr)
     t_l = t(i - 1, j, k, ts, itr)
     d_c = apply_mask(t_c - t_l, umask(i, j))
-    if (west == 1 .and. i == 1) then
+    if (west >= 1 .and. i == 1) then
       d_l = d_c
     else
       d_l = apply_mask(t_l - t(i - 2, j, k, ts, itr), umask(i - 1, j))
     endif
-    if (east == 1 .and. i == nx + 1) then
+    if (east >= 1 .and. i == nx + 1) then
       d_r = d_c
     else
       d_r = apply_mask(t(i + 1, j, k, ts, itr) - t_c, umask(i + 1, j))
     endif
     fx = apply_mask(0.5_rp * (t_c + t_l - (d_r - d_l) / 6.0_rp) * &
          FlxU(i, j, k), umask(i, j))
+    if (west == 2 .and. i == 1) fx = fx + &
+         apply_mask(0.5_rp * (t_l - t_c) * max(FlxU(i, j, k), 0.0_rp), umask(i, j))
+    if (east == 2 .and. i == nx + 1) fx = fx + &
+         apply_mask(0.5_rp * (t_c - t_l) * min(FlxU(i, j, k), 0.0_rp), umask(i, j))
   end function c4_fx
 
 #ifdef USE_CUDA
@@ -430,18 +452,22 @@ contains
     t_c = t(i, j, k, ts, itr)
     t_l = t(i, j - 1, k, ts, itr)
     d_c = apply_mask(t_c - t_l, vmask(i, j))
-    if (south == 1 .and. j == 1) then
+    if (south >= 1 .and. j == 1) then
       d_l = d_c
     else
       d_l = apply_mask(t_l - t(i, j - 2, k, ts, itr), vmask(i, j - 1))
     endif
-    if (north == 1 .and. j == ny + 1) then
+    if (north >= 1 .and. j == ny + 1) then
       d_r = d_c
     else
       d_r = apply_mask(t(i, j + 1, k, ts, itr) - t_c, vmask(i, j + 1))
     endif
     fe = apply_mask(0.5_rp * (t_c + t_l - (d_r - d_l) / 6.0_rp) * &
          FlxV(i, j, k), vmask(i, j))
+    if (south == 2 .and. j == 1) fe = fe + &
+         apply_mask(0.5_rp * (t_l - t_c) * max(FlxV(i, j, k), 0.0_rp), vmask(i, j))
+    if (north == 2 .and. j == ny + 1) fe = fe + &
+         apply_mask(0.5_rp * (t_c - t_l) * min(FlxV(i, j, k), 0.0_rp), vmask(i, j))
   end function c4_fe
 
 #ifdef USE_CUDA
@@ -453,12 +479,12 @@ contains
     t_c = t(i, j, k, ts, itr)
     t_l = t(i - 1, j, k, ts, itr)
     d_c = apply_mask(t_c - t_l, umask(i, j))
-    if (west == 1 .and. i == 1) then
+    if (west >= 1 .and. i == 1) then
       d_l = d_c
     else
       d_l = apply_mask(t_l - t(i - 2, j, k, ts, itr), umask(i - 1, j))
     endif
-    if (east == 1 .and. i == nx + 1) then
+    if (east >= 1 .and. i == nx + 1) then
       d_r = d_c
     else
       d_r = apply_mask(t(i + 1, j, k, ts, itr) - t_c, umask(i + 1, j))
@@ -478,6 +504,10 @@ contains
     fx = apply_mask(face_t * uflux - coef_up3 * ( &
          curv_l * max(uflux, 0.0_rp) + curv_r * min(uflux, 0.0_rp)), &
          umask(i, j))
+    if (west == 2 .and. i == 1) fx = fx + &
+         apply_mask(0.5_rp * (t_l - t_c) * max(uflux, 0.0_rp), umask(i, j))
+    if (east == 2 .and. i == nx + 1) fx = fx + &
+         apply_mask(0.5_rp * (t_c - t_l) * min(uflux, 0.0_rp), umask(i, j))
   end function up3_fx
 
 #ifdef USE_CUDA
@@ -489,12 +519,12 @@ contains
     t_c = t(i, j, k, ts, itr)
     t_l = t(i, j - 1, k, ts, itr)
     d_c = apply_mask(t_c - t_l, vmask(i, j))
-    if (south == 1 .and. j == 1) then
+    if (south >= 1 .and. j == 1) then
       d_l = d_c
     else
       d_l = apply_mask(t_l - t(i, j - 2, k, ts, itr), vmask(i, j - 1))
     endif
-    if (north == 1 .and. j == ny + 1) then
+    if (north >= 1 .and. j == ny + 1) then
       d_r = d_c
     else
       d_r = apply_mask(t(i, j + 1, k, ts, itr) - t_c, vmask(i, j + 1))
@@ -514,6 +544,10 @@ contains
     fe = apply_mask(face_t * uflux - coef_up3 * ( &
          curv_l * max(uflux, 0.0_rp) + curv_r * min(uflux, 0.0_rp)), &
          vmask(i, j))
+    if (south == 2 .and. j == 1) fe = fe + &
+         apply_mask(0.5_rp * (t_l - t_c) * max(uflux, 0.0_rp), vmask(i, j))
+    if (north == 2 .and. j == ny + 1) fe = fe + &
+         apply_mask(0.5_rp * (t_c - t_l) * min(uflux, 0.0_rp), vmask(i, j))
   end function up3_fe
 
 #ifdef USE_CUDA
@@ -599,10 +633,11 @@ contains
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = nt
     ts = tidx; ns = n_stp; nn = n_new; nb = indx
     dtp = dtau; cs = cf_stp; cb = cf_bak
-    west  = merge(1_ip, 0_ip, decomp%edge_w)
-    east  = merge(1_ip, 0_ip, decomp%edge_e)
-    south = merge(1_ip, 0_ip, decomp%edge_s)
-    north = merge(1_ip, 0_ip, decomp%edge_n)
+    ! edge codes: 0 interior, 1 physical edge, 2 edge with the UPSCALING term
+    west  = merge(1_ip, 0_ip, decomp%edge_w) + merge(1_ip, 0_ip, decomp%edge_w .and. uscl_obc)
+    east  = merge(1_ip, 0_ip, decomp%edge_e) + merge(1_ip, 0_ip, decomp%edge_e .and. uscl_obc)
+    south = merge(1_ip, 0_ip, decomp%edge_s) + merge(1_ip, 0_ip, decomp%edge_s .and. uscl_obc)
+    north = merge(1_ip, 0_ip, decomp%edge_n) + merge(1_ip, 0_ip, decomp%edge_n .and. uscl_obc)
     call tracer_halos(tidx, .true., .false.)
     lim = dry_lim(G_TRC)
 #ifdef USE_CUDA
@@ -726,10 +761,11 @@ contains
 
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = nt
     ts = tidx; nn = n_new; dtl = dt_in
-    west  = merge(1_ip, 0_ip, decomp%edge_w)
-    east  = merge(1_ip, 0_ip, decomp%edge_e)
-    south = merge(1_ip, 0_ip, decomp%edge_s)
-    north = merge(1_ip, 0_ip, decomp%edge_n)
+    ! edge codes: 0 interior, 1 physical edge, 2 edge with the UPSCALING term
+    west  = merge(1_ip, 0_ip, decomp%edge_w) + merge(1_ip, 0_ip, decomp%edge_w .and. uscl_obc)
+    east  = merge(1_ip, 0_ip, decomp%edge_e) + merge(1_ip, 0_ip, decomp%edge_e .and. uscl_obc)
+    south = merge(1_ip, 0_ip, decomp%edge_s) + merge(1_ip, 0_ip, decomp%edge_s .and. uscl_obc)
+    north = merge(1_ip, 0_ip, decomp%edge_n) + merge(1_ip, 0_ip, decomp%edge_n .and. uscl_obc)
     call tracer_halos(tidx, .true., .true.)
     lim = dry_lim(G_TRC)
     njp = (ny + 1) / 2

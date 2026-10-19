@@ -74,6 +74,10 @@ module gpu_state
   logical,  public :: obc_east = .false.
   logical,  public :: obc_south = .false.
   logical,  public :: obc_north = .false.
+  ! Upscaling output (do_upscale): the horizontal tracer flux through the
+  ! faces on the physical edges gets the CPU's UPSCALING term
+  ! 0.5*(t_out - t_in)*inflow (upwind on inflow), predictor and corrector
+  logical,  public :: uscl_obc = .false.
   logical,  public :: have_flux = .false.
   logical,  public :: have_bry = .false.
   logical,  public :: have_bulk = .false.

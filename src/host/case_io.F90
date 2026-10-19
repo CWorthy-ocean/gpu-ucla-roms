@@ -16,6 +16,8 @@ module case_io
   use cdr_lite_io, only: read_cdr_lite_namelist, init_cdr_lite
   use cdr_lite_out, only: read_cdr_lite_output_namelist, set_cdr_lite_output_root, init_cdr_lite_output
   use cdr_gas_out, only: read_cdr_gas_output_namelist, set_cdr_gas_output_root, init_cdr_gas_output
+  use cdr_out, only: read_cdr_output_namelist, set_cdr_output_root, init_cdr_output
+  use upscale_out, only: read_upscale_namelist, set_upscale_root, init_upscale_output
   use his_io, only: read_output_namelist, set_output_root, init_output
   use comm_mod, only: comm_rank, comm_size, comm_min_real
   use tile_balance, only: balance_cuts, uniform_cuts
@@ -23,6 +25,7 @@ module case_io
   use formulas, only: rho0_eos => rho0
   use passive_mod, only: ntp, tp, read_passive_namelist, alloc_passive, init_passive, passive_name, &
        passive_hold, set_cdr_lite, passive_finish_list, ncdr
+  use marbl_gpu, only: marbl_gpu_init_diagnostics
   use marbl_gpu, only: marbl_on, read_marbl_namelist, marbl_gpu_setup_tracers, marbl_gpu_init_forcing, &
                        marbl_gpu_load_state
   implicit none
@@ -157,6 +160,8 @@ contains
     call read_cdr_lite_namelist(unit)
     call read_cdr_lite_output_namelist(unit)
     call read_cdr_gas_output_namelist(unit)
+    call read_cdr_output_namelist(unit)
+    call read_upscale_namelist(unit)
     case_ntp_est = max(ntp, nt_bgc) + ncdr
 
     rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios)
@@ -184,6 +189,8 @@ contains
     case_output_root = resolve_path(nml_dir, output_root_name)
     call set_cdr_lite_output_root(case_output_root)
     call set_cdr_gas_output_root(case_output_root)
+    call set_cdr_output_root(case_output_root)
+    call set_upscale_root(case_output_root)
     theta_s = theta_s_in
     theta_b = theta_b_in
     hc = hc_in
@@ -636,10 +643,21 @@ contains
     call set_forces()
     call set_bry_all()
     call set_tides()
+    ! the CPU's initial MARBL diagnostics (its first wrt_bgc), before the
+    ! initial history record. They need the depths, which the CPU sets
+    ! (set_depth(0)) right after this set_forces; report_loaded_case sets
+    ! the same again.
+    if (marbl_on) then
+      iic = 0
+      call set_depth()
+      call marbl_gpu_init_diagnostics()
+    endif
     call set_output_root(case_output_root, case_title)
     call init_output()
     call init_cdr_lite_output()       ! after the history/restart staging is sized
     call init_cdr_gas_output()        ! writes its start (bracket) record
+    call init_cdr_output()
+    call init_upscale_output()        ! after init_bry (open sides)
     call wall_stamp('output init')
   end subroutine load_case
 

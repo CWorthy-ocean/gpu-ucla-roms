@@ -1772,6 +1772,190 @@ of the ALT_CO2 surface state:
 - **Cost.** The 3-day online run with instantaneous _cdrgas output has a
   median step of 59.6 ms, against 58.7 ms with file sensitivities.
 
+### The remaining CDR pieces (stage 6, 2026-10-18)
+
+With these, every CDR forcing mode and every CDR output of the CPU model
+runs on the GPU, apart from the monthly averages of the outputs, which
+still stop at start-up.
+
+**Depth profiles (cdr_forcing_depth_profiles; src/host/cdr_io.F90,
+src/device/cdr_src.F90).**
+
+- **CPU semantics.** Each release (cdr_lon/cdr_lat) goes to its single
+  nearest wet cell. Its profiles cdr_trcflx_profile (mmol/s per source
+  layer) on the source layers cdr_layer_thickness are named by
+  cdr_trc_name; names that are not tracers are skipped. Every set_forces
+  interpolates both in time, remaps each tracer's flux per metre onto the
+  cell's current layers with the CPU's flux-conserving PPM remap
+  (remap_src_to_grid), and multiplies by Hz; the release flux is 1.
+- **On the GPU.** The release columns are few, so the remap runs on the
+  host: the CPU's vertical_remapping routines are carried over verbatim in
+  cdr_io. Every corrector gathers Hz of those columns (one device sync),
+  remaps, and uploads the weights cq_wt(k, profile, cell). The kernel
+  cdr_apply_dp_tp adds them in the CPU's release order.
+- **CPU bug (report to Scott).** A source layer of zero thickness inside a
+  column gives NaN for the whole column: thomas_PPM is singular when two
+  interfaces coincide (vertical_remapping.F90:347). The test input
+  (tools/make_dp_test.py) avoids it. A release whose whole source column
+  has no thickness is handled: it has no source.
+- **Validation (gen_cdr.py dp).** Sources agree to 7e-14 relative and
+  tracers to one float32 unit.
+
+**3-D forcing (cdr_forcing_3d).**
+
+- **Inputs.** cdr_trcflx_3d_ALK and cdr_trcflx_3d_DIC (mmol/s per cell)
+  come from the forcing files, cataloged in the CPU's file order. Each
+  tile reads the interior window of two records.
+- **Applied** to MARBL ALK and DIC in the corrector, as
+  t += dt*pm*pn*(c1*f1 + c2*f2) on the wet interior columns.
+- **Validation (gen_cdr.py d3).** Within one float32 unit; the
+  forcing signal matches the CPU's.
+
+**Volume releases (cdr_volume).**
+
+- **CPU semantics.** cdr_volume (m3/s) of water with tracer
+  concentrations cdr_tracer, temperature and salinity included. The
+  tracer source is volume x concentration with the release's normalized
+  weights. In addition:
+  - zeta(kstp) += dtfast*pm*pn*vol*sum_k(w) at every fast step (step2d);
+  - Wi takes the cumulative source from the bottom up in omega, before
+    the rain term;
+  - T and S get their own rows (cdr_apply_ts).
+- **Time levels.** The CPU's predictor omega and its first corrector omega
+  use the volume of its first set_forces (time n); set_cdr_pred sets that
+  volume after the predictor's forcing.
+- **Omega kernel.** The CDR term raised the column kernel from 89 to 114
+  registers. omega therefore has two copies of the kernel; the one without
+  the term runs whenever there are no volume releases (bit-identical to
+  before).
+- **Validation (gen_cdr.py vol).**
+  - Every 2 steps, zeta, u, T, S and the tracers are within one float32
+    unit.
+  - The release signal matches: zeta 2.5657e-4 against the CPU's
+    2.5660e-4, temperature 6.6038e-3 against 6.6037e-3.
+  - A 3-day noise-floor run with volume releases has not been done yet.
+
+**CDR output (cdr_output; src/host/cdr_out.F90).** The CPU's
+cdr_output.F90, with &cdr_output_settings:
+
+- **Files.** <root>_cdr.nc, _cdr_0002.nc and so on, nrpf_cdr records every
+  output_period_cdr, in double, with the CPU's variables, attributes and
+  order:
+  - zeta, T, S, ALK, DIC and their ALT_CO2 twins, PO4, SiO3;
+  - the ALK/DIC vertical integrals;
+  - 3-D pH, FG_CO2 and FG_ALT_CO2, surface pCO2;
+  - CO3, co3_sat_arag/calc, zsatarag/zsatcalc;
+  - Chl_TOT_surf and C_TOT_100m;
+  - the instantaneous thickness-weighted ALK/DIC;
+  - with cdr_source, the ALK/DIC sources: releases, depth profiles, volume
+    or 3-D forcing;
+  - with wrt_cdr_avg, the averaged thickness-weighted ALK/DIC.
+- **Averaging (wrt_cdr_avg).** These are the CPU's sums:
+  - every step, c0*sum + x, with c0 = 0 on the window's first step;
+  - the fields that only MARBL changes are added once, weighted by the
+    steps they were held, before each MARBL step and at the write;
+  - at the write, sum/navg.
+- **Writer.** A fifth io_server kind (IO_KIND_CDROUT). The saturation
+  depths are computed at every MARBL call when this output is on
+  (marbl_need_zsat).
+- **Not on the GPU yet:** cdr_monthly_averages, which stops at start-up.
+- **Initial MARBL diagnostics.** Found with this output. At start-up the
+  CPU calls marbldrv_compute_init_diagnostics (from its first wrt_bgc):
+  MARBL's surface fluxes and interior carbonate chemistry on the initial
+  state, with the start-time forcing and depths. These fill the
+  diagnostic arrays without touching the tracers or ROMS's copy of the
+  saved state. Until the first MARBL call (an hour into Iceland0), the
+  CPU's history diagnostics and its CDR output hold these values. The GPU
+  had zeros there. marbl_gpu_init_diagnostics (src/host/marbl_step.F90)
+  now does the same:
+  - after load_case's set_forces and a set_depth, the surface-flux,
+    carbonate and saturation-depth kernels on the initial state;
+  - sf_ph/sf_ph_alt/it_ph/it_pha are saved and restored, so the first
+    MARBL call starts from the loaded pH, as on the CPU;
+  - the 3-D pH output stays at the loaded saved state (0 in a cold start)
+    until then, also as on the CPU.
+- **Validation (12 steps, a record every 2 steps, 4 per file; gen_cdr.py rel
+  --cdr-out [--inst]).**
+  - Structure: the CPU's records, file split, averaging times, variables
+    and attributes.
+  - Values: zeta 2e-12 relative, ALK/DIC 1.4e-9, temperature 2e-8,
+    PO4/SiO3 2e-7 (the state's own per-step differences); sources 2e-15;
+    C_TOT_100m 1e-10; Chl 7e-12.
+  - MARBL fields: all 12 steps fall before the first (hourly) MARBL call,
+    so the fields hold the initial diagnostics. CO3, co3_sat, zsat, FG
+    and pCO2 agree to 5e-8 relative; pH is 0 in both (cold start).
+    Before marbl_gpu_init_diagnostics, the GPU wrote zeros there. Without
+    the depths, the bottom co3_sat came out at its surface value.
+  - The same initial values now fill the GPU history's MARBL diagnostics
+    (PH, pCO2SURF and zsat identical to the CPU's _bgc_dia; FG 1.3e-7,
+    CO3 7e-8, co3_sat 1e-7). Every other field and file is bit-identical
+    to cdr6e (Iceland0 gas and upscaling, MiniPac).
+  - Averaging across MARBL steps (co3_*_avg: marbl_timestep 240 s, MARBL
+    every 2 steps, a record every 3 steps, so the windows straddle MARBL
+    steps at both offsets). Same structure as the CPU's. The 3-D pH
+    agrees to 3e-10 relative: the first window's 5.485 is 0 held one step
+    and the step-2 value held two. CO3, co3_sat, zsat, FG and pCO2 agree
+    to 5e-8; T, S, ALK, DIC, PO4 and SiO3 to 1.2e-7 at most.
+
+**Upscaling output (upscale_output; src/host/upscale_out.F90).** It writes
+the open-boundary transects from which a parent domain's CDR forcing is
+made.
+
+- **The boundary term.** With UPSCALING compiled, the CPU adds
+  0.5*(t_out - t_in)*inflow to the horizontal tracer flux through every
+  face on a physical edge (compute_horiz_tracer_fluxes.h): upwind on
+  inflow, for every tracer, in the predictor (C4) and the corrector (UP3).
+  Main gates it by the key alone, so it changes runs that write no
+  upscaling output. Scott decided (2026-10-17) that it follows do_upscale.
+  The GPU applies it with do_upscale (gpu_state uscl_obc):
+  - edge code 2 in advect (per-tracer and fused T/S kernels) and in the
+    passive C4/UP3 face routines;
+  - masked like the face, so a river face keeps only its river flux, as
+    the CPU's later override.
+- **CPU reference change (roms_cdr_ref working tree, uncommitted).** The
+  four boundary blocks in compute_horiz_tracer_fluxes.h test
+  `do_upscale .and.` the edge. pre_step3d_mod uses do_upscale, and
+  upscale_output gives it a default of .false. The diff is
+  cases/CDR/bld_cpu_uscl/upscale_gate.patch; the build is
+  cases/CDR/bld_cpu_uscl (the reference keys plus UPSCALING).
+- **Output.**
+  - Every step after step3d_t: the outward advective flux of ALK, DIC,
+    their ALT_CO2 twins and the CDR_LITE tracers through each open-boundary
+    face. It is the corrector's UP3 face with the term, recomputed from the
+    same operands (slot nrhs).
+  - The running means (the CPU's calc_average, avg*(1 - 1/n) + x/n) of:
+    ALK - ALK_ALT_CO2, DIC - DIC_ALT_CO2, each CDR_LITE flux, and the
+    boundary cells' layer thickness, corners included.
+  - Records as the CPU's wrt_upscale: one at the first step, then every
+    output_period_uscl, nrpf_uscl per file, stamped with the step's start
+    time. The final call after the loop adds the last step's fluxes once
+    more and writes if a record is due.
+  - Files <root>_uscl.nc, _uscl_0002.nc and so on, in double, sides north,
+    south, east, west, with the boundary lat/lon. Compute rank 0 writes
+    them from a sum of the boundary lines over the ranks
+    (comm_reduce_sum).
+- **Validation (12 steps, a record every 2 steps, 4 per file; gen_cdr.py rel
+  --upscale, CPU bld_cpu_uscl).**
+  - CPU gating: with do_upscale off, the UPSCALING build is bit-identical
+    to the reference build (history, BGC, diagnostics, CDR_LITE).
+  - Size of the term: with it on, temperature moves by up to 1.3e-2 C at
+    the open edges after 10 steps, and the CDR tracers next to the
+    boundary by 10-16 %.
+  - GPU against CPU with the term: every physics field and MARBL tracer is
+    within one float32 unit every 2 steps, edges included (zeta 6e-8,
+    temperature 4.8e-7, DIC/ALK 6e-8 relative).
+  - _uscl structure: the CPU's 7 records in 2 files, attributes, and
+    identical boundary lat/lon.
+  - _uscl values: layer thickness 1.5e-14 relative, CDR_LITE fluxes 6e-11.
+  - ALK_add and DIC_add are zero in that case (ALK = ALK_ALT_CO2). With
+    releases next to each open boundary (tools/make_uscl_test.py,
+    gen_cdr.py --rel-file) they are nonzero on all four sides and agree to
+    2.6e-9.
+- **Regression.** With do_upscale off, the build reproduces cdr6c bit for
+  bit (volume releases, gas, MiniPac). The UP3 passive kernel went from 90
+  to 95 registers (its launch bound allows 102); the fastest steps without
+  output are unchanged.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

@@ -14,6 +14,7 @@ module step3d_t_mod
   use pre_step3d_mod, only: ncol_probe, icol_probe, jcol_probe
   use passive_mod, only: ntp, passive_corrector
   use rivers_mod, only: river_on, rivers_ts, RIV_COR
+  use cdr_src_mod, only: cdr_vol_on, cdr_apply_ts
   implicit none
   private
   public :: step3d_t
@@ -41,6 +42,10 @@ contains
     ! River faces: their flux was masked by the advection; add it before the
     ! forcing and the implicit solve (all tracers here, per tracer below).
     if (fused .and. river_on) call rivers_ts(RIV_COR, n_new, dt_loc, 1_ip, nt)
+    ! CDR volume releases carry T and S (after the fused advection; the CPU
+    ! adds them between its horizontal and vertical passes, which differ
+    ! only in rounding as the vertical pass reads slot nrhs)
+    if (fused .and. cdr_vol_on) call cdr_apply_ts(n_new, dt_loc, 1_ip, int(nt, ip))
     do itrc = 1, nt
       if (.not. fused) then
       if (itrc == itemp) call dump_cor_col('cor in', 1)
@@ -58,6 +63,7 @@ contains
         enddo
       enddo
       if (itrc == itemp) call dump_cor_col('cor horiz', 2)
+      if (cdr_vol_on) call cdr_apply_ts(n_new, dt_loc, int(itrc, ip), int(itrc, ip))
 
       call vert_u3_fluxes(nrhs, itrc)
 #ifdef USE_CUDA
