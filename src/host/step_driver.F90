@@ -27,7 +27,7 @@ module step_driver
   use cdr_lite_io, only: set_cdr_lite
   use bry_io, only: set_bry_all, dump_bry_north
   use tide_io, only: set_tides
-  use run_timers, only: rt_dev_collect
+  use run_timers, only: rt_dev_collect, wall_time
   use arch_mod, only: sync_arch
   use upscale_out, only: wrt_upscale
   implicit none
@@ -41,9 +41,9 @@ module step_driver
   public :: run_lmd_only
   public :: not_implemented
 
-  integer, save :: clock_rate = 0
-  integer, save :: clock_start = 0
-  integer, save :: clock_last = 0
+  logical, save :: clock_on = .false.
+  real(8), save :: clock_start = 0.0d0
+  real(8), save :: clock_last = 0.0d0
 contains
 
   subroutine run_geom_only()
@@ -571,14 +571,14 @@ contains
   end subroutine set_probe_windows
 
   subroutine step_timer_init()
-    call system_clock(count=clock_start, count_rate=clock_rate)
-    if (clock_rate <= 0) clock_rate = 1
+    clock_start = wall_time()
     clock_last = clock_start
+    clock_on = .true.
   end subroutine step_timer_init
 
   subroutine step_timer_lap()
-    if (clock_rate <= 0) return
-    call system_clock(count=clock_last)
+    if (.not. clock_on) return
+    clock_last = wall_time()
   end subroutine step_timer_lap
 
   subroutine step_mark(msg)
@@ -586,7 +586,7 @@ contains
     ! prints; by default only the end-of-step stamp is kept (its cumul is
     ! the step time). ROMS_GPU_STEP_MARKS=1 restores every phase stamp.
     character(len=*), intent(in) :: msg
-    integer :: now
+    real(8) :: now
     real(rp) :: dt_sec, tot_sec
     logical, save :: checked = .false., all_marks = .false.
     character(len=16) :: val
@@ -600,12 +600,12 @@ contains
     endif
     if (.not. all_marks .and. msg /= 'baroclinic step') return
     call sync_arch()
-    if (clock_rate <= 0) then
+    if (.not. clock_on) then
       write(*,'(a,a)') 'step: ', trim(msg)
     else
-      call system_clock(count=now)
-      dt_sec = real(now - clock_last, rp) / real(clock_rate, rp)
-      tot_sec = real(now - clock_start, rp) / real(clock_rate, rp)
+      now = wall_time()
+      dt_sec = real(now - clock_last, rp)
+      tot_sec = real(now - clock_start, rp)
       write(*,'(a,a,a,f10.4,a,f10.4,a)') 'step: ', trim(msg), &
            '  dt =', dt_sec, ' s  cumul =', tot_sec, ' s'
       clock_last = now

@@ -32,6 +32,7 @@ module io_server
   use gpu_state
   use nc_io
   use comm_mod
+  use run_timers, only: wall_time
 #ifdef USE_CUDA
   use cudafor
   use arch_mod, only: work_stream
@@ -705,10 +706,10 @@ contains
     integer :: iv, t, gx, gy, n3, i, j, k, n1, n2, i0, j0, off, ntile, ierr
     real(4) :: zero1(1, 1, 1)
     type(rec_t) :: r0
-    integer(8) :: ca, cb, cr
+    real(8) :: ca, cb
     zero1 = 0.0
     t_ext = 0.0; t_asm = 0.0; t_put = 0.0
-    call system_clock(ca, cr)
+    ca = wall_time()
     ntile = size(tbuf, 1)
     r0 = tmeta(0, isl)
     if (wgroup_size > 1) then
@@ -734,11 +735,11 @@ contains
       call put_time_step(ncid, r0)
       call put_avg_times(ncid, r0)
     endif
-    call system_clock(cb, cr)
-    t_ext = real(cb - ca) / real(cr)
+    cb = wall_time()
+    t_ext = (cb - ca)
     do iv = 1, r0%nvars
       if (.not. mine(iv)) cycle
-      call system_clock(cb, cr)
+      cb = wall_time()
       gx = 0; gy = 0; n3 = r0%n3(iv)
       do t = 0, ntile - 1
         if (trim(tmeta(t, isl)%names(iv)) /= trim(r0%names(iv))) error stop 'io_server: tiles disagree on the variable list'
@@ -762,15 +763,15 @@ contains
             enddo
           enddo
         enddo
-        call system_clock(ca, cr)
-        t_asm = t_asm + real(ca - cb) / real(cr)
+        ca = wall_time()
+        t_asm = t_asm + (ca - cb)
         if (r0%nrank(iv) == 2) then
           call nc_put_2d_rec_d(ncid, trim(r0%names(iv)), gbuf8, gx, gy, r0%rec)
         else
           call nc_put_3d_rec_d(ncid, trim(r0%names(iv)), gbuf8, gx, gy, n3, r0%rec)
         endif
-        call system_clock(cb, cr)
-        t_put = t_put + real(cb - ca) / real(cr)
+        cb = wall_time()
+        t_put = t_put + (cb - ca)
         cycle
       endif
       if (allocated(gbuf)) then
@@ -789,15 +790,15 @@ contains
           enddo
         enddo
       enddo
-      call system_clock(ca, cr)
-      t_asm = t_asm + real(ca - cb) / real(cr)
+      ca = wall_time()
+      t_asm = t_asm + (ca - cb)
       if (r0%nrank(iv) == 2) then
         call nc_put_2d_rec_f(ncid, trim(r0%names(iv)), gbuf, gx, gy, r0%rec)
       else
         call nc_put_3d_rec_f(ncid, trim(r0%names(iv)), gbuf, gx, gy, n3, r0%rec)
       endif
-      call system_clock(cb, cr)
-      t_put = t_put + real(cb - ca) / real(cr)
+      cb = wall_time()
+      t_put = t_put + (cb - ca)
     enddo
   end subroutine write_assembled
 
@@ -1043,10 +1044,10 @@ contains
 #ifdef USE_MPI
     integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), src, comm, iv, off, n, b, k, ntot, nquit, ncompute, isl
     real :: trecv(NSLOT)
-    integer(8) :: c_start, c_end, rate_end
+    real(8) :: c_start, c_end
     character(len=PATHLEN) :: open_name(NKIND)
     logical :: open_pending(NKIND)
-    integer :: c0, c1, c2, c3, rate
+    real(8) :: c0, c1, c2, c3
     character(len=PATHLEN) :: path
     character(len=NAMELEN * MAXV) :: namebuf
     type(rec_t) :: r
@@ -1059,7 +1060,7 @@ contains
     me_g = mod(me_w, wgroup_size)
     call MPI_Comm_split(comm_writers(), my_group, me_w, gcomm, ierr)
     if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Comm_split groups'
-    call system_clock(c_start)
+    c_start = wall_time()
     trecv = 0.0
     nquit = 0
     open_name = ''
@@ -1143,7 +1144,7 @@ contains
         enddo
         ntot = max(ntot, 1)
         r%dbl = (hdr(7) == 1)
-        call system_clock(c0, rate)
+        c0 = wall_time()
         if (r%dbl) then
           if (allocated(tbuf(src, isl)%b8)) then
             if (size(tbuf(src, isl)%b8) < ntot) deallocate(tbuf(src, isl)%b8)
@@ -1169,28 +1170,28 @@ contains
             if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv data'
           enddo
         endif
-        call system_clock(c1)
+        c1 = wall_time()
         tmeta(src, isl) = r
         if (.not. tfill(src, isl)) slot_n(isl) = slot_n(isl) + 1
         tfill(src, isl) = .true.
-        trecv(isl) = trecv(isl) + real(c1 - c0) / real(rate)
+        trecv(isl) = trecv(isl) + (c1 - c0)
         if (slot_n(isl) == ncompute) then
           k = r%fkind
           write(*,'(a,i0,a,i0,a,i0,a,i0)') 'io_server: writer ', me_w, ' record complete: kind ', k, ' rec ', r%rec, ' file ', r%nfile
           flush(6)
           if (open_pending(k)) call open_now(k)
           if (ncid_open(k) < 0) error stop 'io_server: record before file open'
-          call system_clock(c1)
+          c1 = wall_time()
           call write_assembled(ncid_open(k), isl)
-          call system_clock(c3)
+          c3 = wall_time()
           call nc_sync(ncid_open(k))
-          call system_clock(c2)
+          c2 = wall_time()
           write(*,'(a,i0,a,i0,a,i0,a,f7.2,a,f7.2,a,f7.2,a,f7.2,a)') 'io_server: writer ', me_w, ' kind ', k, &
                ' rec ', r%rec, ': extend ', t_ext, ' s  assemble ', t_asm, ' s  put ', t_put, &
-               ' s  sync ', real(c2 - c3) / real(rate), ' s'
+               ' s  sync ', (c2 - c3), ' s'
           call report_written(r)
           write(*,'(a,i0,a,f7.2,a,f7.2,a)') 'io_server:   parts ', ncompute, '  recv ', trecv(isl), &
-               ' s  write ', real(c2 - c1) / real(rate), ' s'
+               ' s  write ', (c2 - c1), ' s'
           tfill(:, isl) = .false.; slot_n(isl) = 0; slot_key(:, isl) = -1; trecv(isl) = 0.0
         endif
       case (CMD_QUIT)
@@ -1214,9 +1215,9 @@ contains
           if (ncid_open(k) >= 0) call nc_close(ncid_open(k))
           ncid_open(k) = -1
         enddo
-        call system_clock(c_end, rate_end)
+        c_end = wall_time()
         write(*,'(a,i0,a,f10.2,a)') 'io_server: writer ', me_w, ' done  t = ', &
-             real(c_end - c_start, 8) / real(rate_end, 8), ' s since the server started'
+             (c_end - c_start), ' s since the server started'
         flush(6)
         exit
       case default

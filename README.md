@@ -73,9 +73,17 @@ make gpu FC_GPU=nvfortran \
 
 - `-gpu=ccXX` selects the GPU architecture: `cc80` for A100, `cc90` for
   H100 and H200, `cc100` for B200.
-- `-DPASSIVE_FP64` stores the MARBL and passive tracers in double precision,
-  the validated configuration. Single precision saves memory but moves the
-  carbonate saturation depths far outside the CPU noise floor.
+- `-DPASSIVE_FP64` stores the MARBL and passive tracers in double
+  precision. This is the validated configuration for MARBL runs: with MARBL,
+  single precision moves the carbonate saturation depths far outside the
+  CPU noise floor.
+- Without the flag, the passive tracers are stored in float32. This suits
+  CDR_LITE runs without MARBL:
+  - it halves the tracer memory;
+  - over 325 days on Pac, it changed the domain-integrated CDR DIC uptake
+    by at most 2e-6 relative (MARBL_GPU_PORT.md);
+  - the CDR_LITE output fields are then written as float; with the flag
+    they are double, as on the CPU.
 - `-Mnofma` turns off fused multiply-add, for reproducible rounding; it
   costs no measurable speed.
 - Run one `make` at a time. After changing flags, start from a clean

@@ -3,7 +3,10 @@ module cdr_lite_out
   ! CDR_LITE output (CPU cdr_lite_output.F90): &cdr_lite_output_settings,
   ! one file series <root>_cdrtrc.nc, <root>_cdrtrc_0002.nc, ... (the GPU's
   ! file naming) of nrpf_cdr_lite records every output_period_cdr_lite,
-  ! in double, with the CPU's dimensions, variables and attributes:
+  ! with the CPU's dimensions, variables and attributes. The fields are
+  ! written in the passive storage precision: double with -DPASSIVE_FP64
+  ! (as the CPU), float in the float32 build (computed and averaged in
+  ! double, rounded once by netCDF at the write); the times stay double:
   !   CDR_<..><n>          tracers (averages with wrt_cdr_lite_avg)
   !   hCDR_<..><n>         thickness-weighted, instantaneous at the write
   !   hCDR_<..><n>_avg     thickness-weighted average (wrt_cdr_lite_avg)
@@ -29,6 +32,8 @@ module cdr_lite_out
   use cdr_src_mod, only: cdr_on, cdr_src_out
   implicit none
   private
+  ! Output fields in float when the passive tracers are stored in float32.
+  logical, parameter :: out_float = (precision(1.0_pp) < precision(1.0_rp))
   public :: read_cdr_lite_output_namelist, set_cdr_lite_output_root, init_cdr_lite_output, wrt_cdr_lite
 
   real(rp) :: output_period_cdr_lite = 3600.0_rp
@@ -146,9 +151,9 @@ contains
     record = nrpf_cdr_lite; nfile = 0; navg = 0; output_time = 0.0_rp
     on = .true.
     if (comm_rank() == 0) then
-      write(*,'(a,es12.4,a,i0,a,l2,a,i0,a,i0,a,l2)') 'cdr_lite output: period ', output_period_cdr_lite, &
+      write(*,'(a,es12.4,a,i0,a,l2,a,i0,a,i0,a,l2,a,a)') 'cdr_lite output: period ', output_period_cdr_lite, &
            ' s, ', nrpf_cdr_lite, ' records per file, averages', wrt_cdr_lite_avg, ', tracers ', no, &
-           ', sources ', ns, ', gas exchange', wfg
+           ', sources ', ns, ', gas exchange', wfg, ', fields ', merge('float ', 'double', out_float)
     endif
   end subroutine init_cdr_lite_output
 
@@ -291,7 +296,8 @@ contains
   end subroutine make_fname
 
   subroutine create_file(path)
-    ! The CPU's dimensions, variables (double) and attributes.
+    ! The CPU's dimensions, variables and attributes; fields in the passive
+    ! storage precision (deff), the time variables in double (def1).
     character(len=*), intent(in) :: path
     integer :: ncid, d_t, d_xi, d_xiu, d_eta, d_etav, d_s, id, o, k, m, n
     integer :: d3(4), d2(3)
@@ -314,7 +320,7 @@ contains
     call def1('avg_end_time', (/d_t/), 'Time at end of averaging period', 'seconds')
     if (wrt_tracers) then
       do o = 1, no
-        call def1(trim(oname(o)), d3, trim(olname(o)), 'mMol m-3')
+        call deff(trim(oname(o)), d3, trim(olname(o)), 'mMol m-3')
       enddo
     endif
     if (wrt_vertical_integrals) then
@@ -325,28 +331,28 @@ contains
         else
           lname = 'instantaneous depth-integrated '//trim(olname(o))
         endif
-        call def1('int_z_'//trim(oname(o)), d2, trim(lname), 'meters * mMol m-3')
+        call deff('int_z_'//trim(oname(o)), d2, trim(lname), 'meters * mMol m-3')
       enddo
     endif
     if (wrt_thickness_weighted) then
       do o = 1, no
-        call def1('h'//trim(oname(o)), d3, 'instantaneous thickness-weighted '//trim(olname(o)), 'meters mMol m-3')
+        call deff('h'//trim(oname(o)), d3, 'instantaneous thickness-weighted '//trim(olname(o)), 'meters mMol m-3')
       enddo
       if (wrt_cdr_lite_avg) then
         do o = 1, no
-          call def1('h'//trim(oname(o))//'_avg', d3, 'time-averaged thickness-weighted '//trim(olname(o)), &
+          call deff('h'//trim(oname(o))//'_avg', d3, 'time-averaged thickness-weighted '//trim(olname(o)), &
                     'meters mMol m-3')
         enddo
       endif
     endif
     do k = 1, ns
-      call def1(trim(sname(k)), d3, trim(slname(k)), trim(sunit(k)))
+      call deff(trim(sname(k)), d3, trim(slname(k)), trim(sunit(k)))
     enddo
     if (wfg) then
       do m = 1, cdrl_nd
         dname = passive_name(cdrl_dic_h(m))
         lname = 'air-sea CO2 flux into '//trim(olname_of(cdrl_dic_h(m)))//' (positive into ocean)'
-        call def1('FG_'//trim(dname), d2, trim(lname), 'mmol/m^2/s')
+        call deff('FG_'//trim(dname), d2, trim(lname), 'mmol/m^2/s')
       enddo
     endif
     call nc_put_att_text(ncid, '', 'title', 'roms_gpu CDR_LITE output')
@@ -362,6 +368,18 @@ contains
       call nc_put_att_text(ncid, name, 'long_name', ln)
       call nc_put_att_text(ncid, name, 'units', un)
     end subroutine def1
+    subroutine deff(name, dims, ln, un)
+      character(len=*), intent(in) :: name, ln, un
+      integer, intent(in) :: dims(:)
+      integer :: vid
+      if (out_float) then
+        vid = nc_def_var_f(ncid, name, dims)
+      else
+        vid = nc_def_var(ncid, name, dims)
+      endif
+      call nc_put_att_text(ncid, name, 'long_name', ln)
+      call nc_put_att_text(ncid, name, 'units', un)
+    end subroutine deff
   end subroutine create_file
 
   function olname_of(itp) result(ln)

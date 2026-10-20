@@ -6,6 +6,15 @@ module run_timers
   ! synchronization): the interval runs from the end of the work queued
   ! before it to the end of its last kernel, and is read back after the
   ! end-of-step device sync.
+  ! Wall time comes from wall_time() (clock_gettime, CLOCK_MONOTONIC), not
+  ! system_clock: nvfortran's default-integer system_clock wraps every
+  ! 2**31 microseconds (2147 s) and, when it does, re-bases the integer(8)
+  ! clock as well, so integer(8) intervals spanning a wrap came out short
+  ! in a run that also made default-integer calls (a ~5950 s stepping loop
+  ! reported 1660 s, one step -2147 s; a test with only integer(8) calls
+  ! measured 2200 s correctly, and with default-integer calls every 20 s
+  ! the same interval read 20 s).
+  use iso_c_binding, only: c_int, c_long
   use kinds
   use comm_mod, only: comm_rank, comm_size, comm_reduce_maxsum
 #ifdef USE_CUDA
@@ -22,14 +31,14 @@ module run_timers
        '  restart staging (nested)', 'MARBL (device events)', 'end of run (io_finalize)', &
        'init (start-up to first step)']
   real(8) :: rt_t(NRT) = 0.0d0
-  integer(8) :: rt_c0(NRT) = 0
+  real(8) :: rt_c0(NRT) = 0.0d0
   integer :: rt_n(NRT) = 0
   integer, public :: rt_nsteps = 0
   ! Wall time of every step (baroclinic step + output) on this rank and
   ! the steps that staged a restart, for the TIMING lines (the same lines
   ! as the CPU model's timers module).
   real(8), allocatable :: step_t(:)
-  integer(8) :: step_c0 = 0
+  real(8) :: step_c0 = 0.0d0
   integer, parameter :: MAX_RST_STEPS = 16
   integer :: rst_steps(MAX_RST_STEPS) = 0, n_rst_steps = 0
 #ifdef USE_CUDA
@@ -38,17 +47,36 @@ module run_timers
 #endif
   public :: rt_tic, rt_toc, rt_dev_begin, rt_dev_end, rt_dev_collect, rt_report
   public :: rt_steps_init, rt_step_begin, rt_step_end, rt_mark_rst
+  public :: wall_time
+
+  type, bind(C) :: c_timespec
+    integer(c_long) :: tv_sec, tv_nsec
+  end type c_timespec
+  integer(c_int), parameter :: CLOCK_MONOTONIC = 1     ! Linux <time.h>
+  interface
+    integer(c_int) function c_clock_gettime(clk, ts) bind(C, name='clock_gettime')
+      import :: c_int, c_timespec
+      integer(c_int), value :: clk
+      type(c_timespec), intent(out) :: ts
+    end function c_clock_gettime
+  end interface
 contains
+  real(8) function wall_time()
+    ! Seconds on the monotonic clock (arbitrary origin; differences only).
+    type(c_timespec) :: ts
+    integer(c_int) :: ierr
+    ierr = c_clock_gettime(CLOCK_MONOTONIC, ts)
+    wall_time = real(ts%tv_sec, 8) + 1.0d-9 * real(ts%tv_nsec, 8)
+  end function wall_time
+
   subroutine rt_tic(ir)
     integer, intent(in) :: ir
-    call system_clock(rt_c0(ir))
+    rt_c0(ir) = wall_time()
   end subroutine rt_tic
 
   subroutine rt_toc(ir)
     integer, intent(in) :: ir
-    integer(8) :: now, rate
-    call system_clock(now, rate)
-    rt_t(ir) = rt_t(ir) + real(now - rt_c0(ir), 8) / real(rate, 8)
+    rt_t(ir) = rt_t(ir) + (wall_time() - rt_c0(ir))
     rt_n(ir) = rt_n(ir) + 1
   end subroutine rt_toc
 
@@ -60,16 +88,15 @@ contains
   end subroutine rt_steps_init
 
   subroutine rt_step_begin()
-    call system_clock(step_c0)
+    step_c0 = wall_time()
   end subroutine rt_step_begin
 
   subroutine rt_step_end()
     ! after rt_nsteps has been advanced for this step
-    integer(8) :: now, rate
-    call system_clock(now, rate)
+    real(8) :: now
+    now = wall_time()
     if (allocated(step_t)) then
-      if (rt_nsteps >= 1 .and. rt_nsteps <= size(step_t)) &
-           step_t(rt_nsteps) = real(now - step_c0, 8) / real(rate, 8)
+      if (rt_nsteps >= 1 .and. rt_nsteps <= size(step_t)) step_t(rt_nsteps) = now - step_c0
     endif
   end subroutine rt_step_end
 

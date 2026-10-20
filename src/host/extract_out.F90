@@ -36,6 +36,7 @@ module extract_out
   use decomp_mod
   use gpu_state
   use time_state
+  use run_timers, only: wall_time
   use netcdf
   use nc_io, only: nc_create, nc_def_dim, nc_def_var, nc_put_att_text, nc_enddef, nc_close, nc_open_write, &
                    nc_put_1d_rec
@@ -571,14 +572,14 @@ contains
 
   subroutine extract_record()
     integer :: io, np, p0, nz, k, j, n, iv, kn, ns, ncid
-    integer(8) :: c0, c1, c2, c3, c4, crate
+    real(8) :: c0, c1, c2, c3, c4
     real(rp), allocatable :: hzp(:,:), hzc(:,:), hzu(:,:), hzuc(:,:), hzv(:,:), hzvc(:,:), val(:,:), vc(:,:), &
                              ui(:,:), vi(:,:), wk(:,:), h(:)
     nz = decomp%nz; kn = knew; ns = nstp
-    call system_clock(c0, crate)
+    c0 = wall_time()
     call queue_record()
     if (nbtot > 0) hb(1:nbtot) = dbuf(1:nbtot)        ! one copy (after the queued kernels)
-    call system_clock(c1)
+    c1 = wall_time()
     hbuf(1:max(nbuf, 1)) = 0.0d0
     do io = 1, nobj
       np = obj(io)%np
@@ -666,9 +667,9 @@ contains
       endif
       deallocate(hzp, hzc, val, vc, h)
     enddo
-    call system_clock(c2)
+    c2 = wall_time()
     call comm_reduce_sum(max(nbuf, 1), hbuf, gbuf)
-    call system_clock(c3)
+    c3 = wall_time()
     if (comm_rank() == 0) then
       call nc_open_write(trim(fname), ncid)
       ! tdays of the CPU at the write: time n+1 in days
@@ -681,9 +682,9 @@ contains
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote extract t = ', (start_time + dt * real(iic - ntstart + 1, rp)) * sec2day, &
            ' days  rec = ', record, &
            '  file ', nfile
-      call system_clock(c4)
-      write(*,'(a,4f9.4,a)') 'extract timing (device+copy, host, reduce, write): ', real(c1 - c0) / real(crate), &
-           real(c2 - c1) / real(crate), real(c3 - c2) / real(crate), real(c4 - c3) / real(crate), ' s'
+      c4 = wall_time()
+      write(*,'(a,4f9.4,a)') 'extract timing (device+copy, host, reduce, write): ', (c1 - c0), &
+           (c2 - c1), (c3 - c2), (c4 - c3), ' s'
     endif
   contains
     subroutine put3(nm, o, x, hp, hc)

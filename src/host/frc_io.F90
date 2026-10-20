@@ -12,6 +12,7 @@ module frc_io
   use bulk_coare, only: calc_bulk_coare
   use arch_mod, only: sync_arch
   use comm_mod, only: comm_rank, comm_size, comm_compute
+  use run_timers, only: wall_time
   use netcdf, only: nf90_inquire, nf90_inq_varid, nf90_inquire_variable, nf90_inquire_dimension, nf90_get_var, &
                     nf90_double, nf90_float, nf90_max_var_dims, nf90_open, nf90_nowrite
 #ifdef USE_CUDA
@@ -316,12 +317,12 @@ contains
     integer(8) :: fsize(max_frc)
     integer(8), allocatable :: load(:)
     logical :: done(max_frc)
-    integer(8) :: c0, c1, c2, crate
+    real(8) :: c0, c1, c2
     character(len=64) :: vname
     integer :: ierr
     nc = comm_size(); me = comm_rank()
     allocate(load(0:nc - 1))
-    call system_clock(c0, crate)
+    c0 = wall_time()
     ! Owners by file size (largest first to the least-loaded rank): the
     ! read cost scales with the record count, i.e. with the file size.
     do i = 1, case_nfrc
@@ -362,7 +363,7 @@ contains
         nlast(i) = ntc
       endif
     enddo
-    call system_clock(c1, crate)
+    c1 = wall_time()
 #ifdef USE_MPI
     do i = 1, case_nfrc
       owner = owner_of(i)
@@ -387,9 +388,9 @@ contains
       enddo
     enddo
 #endif
-    call system_clock(c2, crate)
+    c2 = wall_time()
     write(*,'(a,i0,a,i0,a,i0,a,f7.2,a,f7.2,a)') 'forcing: rank ', me, ' prefetched ', ntc, ' time axes from ', case_nfrc, &
-         ' files: reads ', real(c1 - c0) / real(crate), ' s  broadcasts ', real(c2 - c1) / real(crate), ' s'
+         ' files: reads ', (c1 - c0), ' s  broadcasts ', (c2 - c1), ' s'
   end subroutine prefetch_time_axes
 
   logical function cached_times(i, tname, tloc) result(found)
@@ -667,7 +668,7 @@ contains
     integer :: k, nc, me, n, nrem, r
     integer :: rem(MAXPEND)
     logical :: whole
-    integer(8) :: c0, c1, crate
+    real(8) :: c0, c1
     type(series2d), pointer :: sp
 #ifdef USE_MPI
     integer :: comm, ierr, t, gx, gy
@@ -677,7 +678,7 @@ contains
 #endif
     batching = .false.
     if (npend == 0) return
-    call system_clock(c0, crate)
+    c0 = wall_time()
     nc = comm_size(); me = comm_rank()
     nrem = 0
     do k = 1, npend
@@ -748,9 +749,9 @@ contains
         call read_catalog_rec(pend(rem(r))%s, pend(rem(r))%idx, pend(rem(r))%slot)
       enddo
     endif
-    call system_clock(c1, crate)
+    c1 = wall_time()
     if (frc_timing) write(*,'(a,i0,a,i0,a,i0,a,l1,a,f8.4,a)') 'forcing: rank ', me, '  records ', npend, &
-         '  prefetched ', npend - nrem, '  whole ', whole, '  ', real(c1 - c0, 8) / real(crate, 8), ' s'
+         '  prefetched ', npend - nrem, '  whole ', whole, '  ', (c1 - c0), ' s'
     do k = 1, npend
       pend(k)%s => null()
     enddo
@@ -828,7 +829,7 @@ contains
     ! model time). Candidate k (k <= nranks) is read by rank k-1.
     type(pend_t) :: cand(32)
     integer :: n, k, nc, me, nb
-    integer(8) :: c0, c1, crate
+    real(8) :: c0, c1
     type(series2d), pointer :: sp
     real(rp), allocatable :: fbuf(:,:)
     integer :: gx, gy
@@ -859,7 +860,7 @@ contains
     call pf_add(s_xco2, 18, cand, n)
     call pf_add(s_xco2a, 19, cand, n)
     if (n == 0) return
-    call system_clock(c0, crate)
+    c0 = wall_time()
     nc = comm_size(); me = comm_rank()
     nb = min(n, int(nc))
 #ifdef USE_MPI
@@ -908,9 +909,9 @@ contains
 #ifdef USE_MPI
     endif
 #endif
-    call system_clock(c1, crate)
+    c1 = wall_time()
     if (frc_timing) write(*,'(a,i0,a,i0,a,f8.4,a)') 'forcing: rank ', me, '  prefetch ', nb, &
-         ' records  ', real(c1 - c0, 8) / real(crate, 8), ' s'
+         ' records  ', (c1 - c0), ' s'
   end subroutine frc_prefetch
 
   subroutine frc_prefetch_drain()

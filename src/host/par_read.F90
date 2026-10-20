@@ -20,6 +20,7 @@ module par_read
   use netcdf
   use nc_io, only: nc_check
   use comm_mod, only: comm_rank, comm_size, comm_compute
+  use run_timers, only: wall_time
   use decomp_mod, only: decomp
   use gpu_state, only: tpcol, ntpcol
 #ifdef USE_CUDA
@@ -226,7 +227,7 @@ contains
     integer :: nc, me, nb, b, iv, jv, t, n, k, cur, prv, stat
     character(len=8) :: val
     integer :: gx(2), gy(2)
-    integer(8) :: c0, c1, c2, crate
+    real(8) :: c0, c1, c2
     type(sb_t) :: fbuf(2)
 #ifdef USE_MPI
     integer :: comm, ierr, src
@@ -274,10 +275,10 @@ contains
       iv = b * nc + me + 1
       cur = mod(b, 2) + 1
       prv = 3 - cur
-      call system_clock(c0, crate)
+      c0 = wall_time()
       if (iv <= nq) call read_full(ncid, q(iv), fbuf(cur)%b, gx(cur), gy(cur))
-      call system_clock(c1, crate)
-      t_read = t_read + real(c1 - c0, 8) / real(crate, 8)
+      c1 = wall_time()
+      t_read = t_read + (c1 - c0)
       if (iv <= nq) then
         do t = 0, nc - 1
           n = win(1, iv, t) * win(2, iv, t) * q(iv)%n3
@@ -294,10 +295,10 @@ contains
         if (allocated(sb(t, prv)%b)) deallocate(sb(t, prv)%b)
       enddo
       if (allocated(fbuf(prv)%b)) deallocate(fbuf(prv)%b)
-      call system_clock(c2, crate)
-      t_comm = t_comm + real(c2 - c1, 8) / real(crate, 8)
+      c2 = wall_time()
+      t_comm = t_comm + (c2 - c1)
     enddo
-    call system_clock(c1, crate)
+    c1 = wall_time()
     do cur = 1, 2
       call MPI_Waitall(nc, sreq(:, cur), MPI_STATUSES_IGNORE, ierr)
       do t = 0, nc - 1
@@ -306,8 +307,8 @@ contains
       if (allocated(fbuf(cur)%b)) deallocate(fbuf(cur)%b)
     enddo
     call MPI_Waitall(nq, rreq, MPI_STATUSES_IGNORE, ierr)
-    call system_clock(c2, crate)
-    t_comm = t_comm + real(c2 - c1, 8) / real(crate, 8)
+    c2 = wall_time()
+    t_comm = t_comm + (c2 - c1)
     deallocate(rreq, sreq, sb, win)
     write(*,'(a,i0,a,i0,a,f7.2,a,f7.2,a)') 'par_read: rank ', me, '  vars ', nq, '  whole-variable reads ', t_read, &
          ' s  redistribution ', t_comm, ' s'
@@ -330,11 +331,11 @@ contains
     ! rank with collective access (same variable order on every rank).
     integer, intent(in) :: ncid
     integer :: pncid, varid, ndims, k, n, ierr, nvars, v
-    integer(8) :: c0, c1, crate
+    real(8) :: c0, c1
     character(len=1024) :: path
     integer, allocatable :: start(:), cnt(:)
     call nc_check(nf90_inq_path(ncid, n, path), 'inq_path')
-    call system_clock(c0, crate)
+    c0 = wall_time()
     ok = .false.
     ierr = nf90_open(trim(path), ior(nf90_nowrite, nf90_mpiio), pncid, comm=comm_compute(), info=MPI_INFO_NULL)
     if (ierr /= nf90_noerr) return
@@ -369,9 +370,9 @@ contains
       deallocate(start, cnt)
     enddo
     call nc_check(nf90_close(pncid), 'close parallel')
-    call system_clock(c1, crate)
+    c1 = wall_time()
     write(*,'(a,i0,a,i0,a,f7.2,a)') 'par_read: rank ', comm_rank(), '  vars ', nq, '  collective MPI-IO window reads ', &
-         real(c1 - c0, 8) / real(crate, 8), ' s'
+         (c1 - c0), ' s'
   end function flush_mpiio
 #endif
 

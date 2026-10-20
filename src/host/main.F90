@@ -146,16 +146,16 @@ end program roms_gpu
 subroutine wall_stamp(tag)
   ! Wall clock since the first stamp, printed by every compute rank.
   use comm_mod, only: comm_rank, is_io_rank
+  use run_timers, only: wall_time
   implicit none
   character(len=*), intent(in) :: tag
-  integer(8), save :: t0 = -1, rate = 1
-  integer(8) :: now
+  real(8), save :: t0 = -1.0d0
+  real(8) :: now
   if (is_io_rank()) return
-  call system_clock(now, rate)
-  if (t0 < 0) t0 = now
-  write(*,'(a,i0,a,a,a,f10.2,a)') 'wall: rank ', comm_rank(), '  ', tag, '  t = ', &
-       real(now - t0, 8) / real(rate, 8), ' s'
-  if (tag == 'init done' .or. tag == 'restart staged') call gpu_mem_report(tag)
+  now = wall_time()
+  if (t0 < 0.0d0) t0 = now
+  write(*,'(a,i0,a,a,a,f10.2,a)') 'wall: rank ', comm_rank(), '  ', tag, '  t = ', now - t0, ' s'
+  if (tag == 'init done' .or. tag == 'restart staged' .or. tag == 'loop done') call gpu_mem_report(tag)
   flush(6)
 end subroutine wall_stamp
 

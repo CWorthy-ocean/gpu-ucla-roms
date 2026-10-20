@@ -1956,6 +1956,156 @@ made.
   to 95 registers (its launch bound allows 102); the fastest steps without
   output are unchanged.
 
+### CDR_LITE without MARBL (2026-10-19)
+
+The CDR_LITE tracers run on their own (nt_bgc = 0): the passive list is then
+the CDR_LITE block alone. They get transport, releases, the <tracer>_flx
+surface flux and gas exchange.
+
+- **Inputs.**
+  - The carbonate sensitivities come from files (ddic_dco2, ddic_dalk).
+    The online computation needs MARBL's ALT_CO2, PO4 and SiO3 tracers.
+  - The tracer axes of the river file and of the release file
+    (cdr_trcflx) must match the run's tracers: T, S and the CDR_LITE
+    block. The river file may also have T and S only.
+  - The CPU also needs tnu2 with one value per tracer.
+  - No BGC forcing files are needed.
+- **Validation (Iceland0, 12 steps; CPU cases/CDR/bld_cpu_nomarbl: the
+  reference keys without MARBL, MARBL_DIAGS and the NHY, NOX and PCO2AIR
+  forcings).**
+  - Every physics field and all six CDR_LITE tracers are within one
+    float32 unit every 2 steps.
+  - The instantaneous _cdrtrc fields agree to 2e-7 relative (FG_CDR_*
+    included).
+  - An averaged _cdrtrc with only FG_CDR_* and the DIC vertical integrals
+    has the CPU's records and times; FG agrees to 1.8e-7, the integrals to
+    3e-12.
+
+**Capacity on Pac, 8 A100-40GB (8x1 tiles, 2 nodes, 4 writer ranks).**
+Measured with `gpumem` at 'loop done', which matches the nvidia-smi
+maximum (cases/GPU namelist_roms_gpu_pacnm{40,70,70x,78x}.nml).
+
+- **Fit**, within 0.07 GiB over 13 ranks:
+  - per GPU: 2.37 GiB + 40.9 kB per tile cell - 5.2 kB per wet cell
+    + 2.515 kB per wet cell per tracer;
+  - the bare FP64 tp (3 time levels x 100 levels) is 2.40 of the
+    2.515 kB;
+  - Pac has 1.78M cells and 1.21M wet, so a tracer costs 0.353 GiB per
+    GPU on balanced tiles.
+- **Stray contexts.** Rank 0 carries 1.33 GiB extra and rank 4 (first on
+  node 2) 2.94 GiB, about 0.43 GiB for each other process on that node:
+  - MPI_Init with GPU support opens a context on device 0 before
+    `select_device`;
+  - on node 2 the four writer ranks add theirs to rank 4's GPU.
+- **The 'wet' planner goes the wrong way when tracers dominate.**
+  - At 70 tracers the land weight 0.40 gave a modelled largest tile of
+    39.40 GB (limit 39.01).
+  - The loop raised the land weight to 1.0 (equal area), which puts the
+    most wet cells on the open-ocean tiles.
+  - Ranks 2-4 then needed 43-46 GiB. They sat at 39.49 GiB, oversubscribed
+    through managed memory, at 10.4 s per step (3x).
+  - Memory balance needs the land weight lowered toward
+    mcell/(mcell + mwet) (0.19 here).
+  - The default model is also off: 53.2 kB per cell (measured 41),
+    2.40 kB per wet cell per tracer (2.515), no stray contexts.
+- **Explicit cuts that balance the fitted memory** (stray contexts
+  included):
+  - 70 tracers, tile_xcut 291 542 727 907 1076 1284 1534: 35.2-35.8 GiB
+    per GPU;
+  - 78 tracers, tile_xcut 294 544 728 906 1075 1282 1532: 38.0-38.5 GiB,
+    with no slowdown;
+  - 80 would model at 39.0 GiB, too close to the 39.49 GiB device;
+  - without the stray contexts the limit is 80.
+  - A restart write adds one double tile field of device staging (about
+    0.3 GB).
+- **Step time.** 70 tracers run at 0.41 s per step after the default
+  24-step probe window (3.7 s per step inside it; `ROMS_GPU_PROBES=0`
+  turns it off).
+- **Output size.** int_z_CDR_OAE_DIC* is double: 35 fields are 0.5 GB per
+  record.
+- **Against the CPU code.**
+  - The CPU's per-tracer cost is its t(GLOBAL_2D_ARRAY,nz,3,nt) array, on
+    every cell including land and the 2-cell halo.
+  - Its fixed cost is measured as each rank's peak resident memory:
+    Iceland0 no-MARBL with 8x8 and 4x4 tiles (cases/CDR
+    submit_mem_cpu.sh) gives 70 MB per rank + 35 kB per cell at 60
+    levels, scaled to 100 levels.
+  - Pac on the 512-rank CPU layout (58x60 tiles, 14% halo):
+    - per tracer, 4.9 GB on the CPU and 3.0 GB on the GPU (1.6x);
+    - fixed, 155 GB on the CPU and 92 GB on the GPU (1.7x).
+  - In the memory of 8 A100s (335 GB): 36 tracers on the CPU, 80 on the
+    GPU (2.2x). With 1 TB the ratio falls to 1.75x.
+
+**Float32 storage of the CDR_LITE tracers (Pac, 2026-10-19).** The build
+without `-DPASSIVE_FP64` stores every passive tracer in float32, so it
+suits only runs without MARBL (see the 2026-10-05 saturation-depth
+finding). Test files are in cases/GPU: `tools_fp32/`,
+`namelist_roms_gpu_fp32test_*`, `submit_fp32test.sh`, output in
+`output_fp32test/`.
+
+- **Runs.** Each covers 2010-02-08 to 2010-12-30 (325 days, 31,200 steps;
+  the boundary data end on Dec 31):
+  - FP64;
+  - float32;
+  - an FP64 twin with temperature +1e-6 C at wet points.
+- **Releases and forcing.**
+  - 12 OAE pairs at 6 sites, 2,000-4,900 km from the open boundaries:
+    ALOHA, California shelf, Station Papa, equator 140W, Kuroshio
+    Extension, Peru shelf.
+  - Pairs 1-6 are 30-day pulses, 7-12 continuous; 1000 mol/s ALK each.
+  - Static sensitivities from PyCO2SYS on the restart surface:
+    - beta = gamma_DIC/CO2 (gamma_DIC is in mol/kg), median 19;
+    - eta = 1/isocapnic quotient, 0.79-0.90.
+- **Output.** Daily-mean int_z of DIC and ALK and FG for every pair, and a
+  5-day 2-D history.
+- **Physics.** The float32 and FP64 runs are bit-identical (zeta, ubar,
+  vbar and hbls differences are 0 over all 325 days). The passives do not
+  feed back, so their difference is storage rounding alone. The twin
+  diverges by up to 1.5 m in zeta and 270 m in hbls.
+- **Domain-integrated CDR_OAE_DIC (the uptake).** Float32 against FP64,
+  relative: at most 1.9e-6 (Station Papa continuous), 6.4e-7 over all
+  pairs.
+  - The error is set in the first ~50 days, then stays flat to day 325.
+  - The twin's chaotic spread at day 325 is 5e-6 to 2.7e-2 per pair
+    (2.8e-3 over all pairs), mostly 1e-4 to 1e-2.
+  - Uptake efficiency DIC/ALK at day 325 is 0.20-0.64.
+- **Domain-integrated ALK.**
+  - Float32 drift at most 2.4e-6, flat after ~60 days.
+  - FP64 is exact to 1e-15 until the equator tracer reaches an open
+    boundary (twin difference from day ~285).
+- **Flux closure (FP64).** Daily-mean DIC against cumulative FG, with the
+  half-day offset removed, agrees within 1e-3 after day 60. The few
+  percent in the first weeks is daily-mean sampling of a variable flux,
+  not a leak.
+- **Memory and speed.** Float32 needs 1,286 B per wet cell per tracer
+  (FP64: 2,515), 0.18 GiB per tracer per GPU on balanced Pac tiles; the
+  128-tracer cap is about 34 GiB per GPU. The step is 2% faster (0.189 vs
+  0.193 s median).
+- **Output precision.** The CDR_LITE output fields (`_cdrtrc`) are now
+  written in the passive storage precision (`cdr_lite_out.F90`,
+  `out_float`):
+  - double with `-DPASSIVE_FP64`, as the CPU;
+  - float in the float32 build: computed and averaged in double, rounded
+    once by netCDF at the write. The time variables stay double.
+  - Check on Pac, 2 days, 24 tracers (`tools_fp32/check_outprec.py`):
+    - the FP64 build's `_cdrtrc` is bit-identical to the earlier binary;
+    - the float32 build's fields equal the earlier double values rounded
+      to float32. Values below FLT_MIN (1.2e-38, 0.02% of them, plume
+      tails) are written as 0. The file is half the size.
+- **Wall-clock timers.** The 325-day runs reported a 1,660 s stepping
+  loop for ~5,950 s of real time, and one step of -2147 s.
+  - Cause: nvfortran's default-integer `system_clock` wraps every 2^31
+    microseconds (2,147 s), and when it does it re-bases the integer(8)
+    clock as well. The model mixed default-integer calls (step_driver,
+    io_server) with integer(8) ones (run_timers), so the integer(8)
+    intervals that spanned a wrap came out short.
+  - Test over 2,200 s: with integer(8) calls only, the interval was
+    correct; with a default-integer call every 20 s, the same integer(8)
+    interval read 20.0 s.
+  - Fix: `wall_time()` in run_timers (`clock_gettime`, CLOCK_MONOTONIC)
+    replaces every `system_clock` call: run_timers, main (wall stamps),
+    step_driver, par_read, frc_io, io_server, extract_out.
+
 ## Averages, true vertical velocity and child-grid extraction (2026-10-18)
 
 **Averaged history and BGC averages (src/host/avg_out.F90).** These are
