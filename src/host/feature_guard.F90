@@ -47,7 +47,7 @@ contains
       call need_off('cdr_lite_output_settings', 'cdr_lite_monthly_averages', 'monthly CDR_LITE averages')
     call need_off('zslice_settings', 'do_zslice', 'z-slice output')
     call need_off('particles_settings', 'floats', 'particles (floats)')
-    call need_off('random_output_settings', 'do_random', 'random-point output')
+    ! random_output_settings (do_random) is on the GPU: random_out, surface passive tracers
     call need_off('frc_output_settings', 'wrt_frc', 'forcing output')
     call need_off('surf_flx_output_settings', 'wrt_smflx', 'surface momentum flux output')
     call need_off('surf_flx_output_settings', 'wrt_stflx', 'surface tracer flux output')

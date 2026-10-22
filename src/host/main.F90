@@ -7,6 +7,7 @@ program roms_gpu
   use case_io, only: load_case, report_loaded_case
   use his_io, only: maybe_wrt_output
   use cdr_lite_out, only: wrt_cdr_lite
+  use random_out, only: wrt_random
   use cdr_gas_out, only: wrt_cdr_gas, wrt_cdr_gas_final
   use cdr_out, only: wrt_cdr
   use avg_out, only: wrt_avg, step_bgc_avg
@@ -86,6 +87,7 @@ program roms_gpu
         call wrt_avg()
         call wrt_extract()
         call wrt_cdr_lite()
+        call wrt_random()
         call wrt_cdr_gas()
         call wrt_cdr()
         call step_bgc_avg()

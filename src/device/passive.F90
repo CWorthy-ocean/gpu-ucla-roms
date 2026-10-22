@@ -36,22 +36,27 @@ module passive_mod
   character(len=16), public :: passive_init = 'zero'           ! zero | blob | mirror_salt
   logical, public :: passive_mirror = .false.
   logical, public :: wrt_passive = .true.
-  ! MARBL mode: the passives are the MARBL tracers (names from MARBL, read
-  ! from the initial file by name, external boundary values from the
-  ! boundary data below instead of 0). Set by marbl_gpu before alloc_passive.
+  ! MARBL mode: the passives start with the MARBL tracers (names from
+  ! MARBL, read from the initial file by name, external boundary values from
+  ! the boundary data below instead of 0), followed by the generic tracers.
+  ! Set by marbl_gpu before alloc_passive.
   logical, public :: passive_marbl = .false.
   character(len=32), allocatable, public :: passive_names(:)
   ! CDR_LITE tracers (param_settings nt_cdr_oae ALK/DIC pairs, nt_cdr_dor
   ! DIC): linear ALK/DIC anomalies that MARBL does not see. They follow the
-  ! MARBL (or generic) tracers in tp, at tp indices cdr0+1 .. cdr0+ncdr, in
+  ! MARBL and generic tracers in tp, at tp indices cdr0+1 .. cdr0+ncdr, in
   ! the CPU's order within the block (CDR_OAE_ALK1, CDR_OAE_DIC1, ...,
-  ! CDR_DOR_DIC1, ...). The CPU orders all tracers T, S, generic passives,
-  ! CDR_LITE, MARBL; tp keeps MARBL first so the MARBL kernels address their
-  ! tracers as 1 .. ntp_base. Inputs indexed by the CPU's order (the river
-  ! tracer axis) map through cpu_tracer_index.
+  ! CDR_DOR_DIC1, ...).
+  ! tp layout: MARBL (1 .. n_marbl), generic passives (n_marbl+1 ..
+  ! ntp_base, named passive_tracer<n> as the CPU), CDR_LITE (cdr0+1 .. ntp).
+  ! The CPU orders all tracers T, S, generic passives, CDR_LITE, MARBL; tp
+  ! keeps MARBL first so the MARBL kernels address their tracers as
+  ! 1 .. n_marbl. Inputs indexed by the CPU's order (the river and CDR
+  ! release tracer axes) map through cpu_tracer_index.
   integer(ip), public :: n_oae = 0, n_dor = 0, ncdr = 0, cdr0 = 0
-  integer(ip), public :: ntp_base = 0      ! MARBL or generic tracers, before the CDR_LITE block
-  integer(ip) :: n_generic = 0             ! generic passives (before MARBL in the CPU's order)
+  integer(ip), public :: ntp_base = 0      ! MARBL + generic tracers, before the CDR_LITE block
+  integer(ip), public :: n_marbl = 0       ! MARBL tracers (tp 1 .. n_marbl; 0 without MARBL)
+  integer(ip), public :: n_generic = 0     ! generic passives (tp n_marbl+1 .. ntp_base)
   ! external boundary values from the boundary data (MARBL and CDR_LITE
   ! tracers; missing ones are 0), else 0 (generic tracers)
   logical, public :: passive_bry = .false.
@@ -105,10 +110,12 @@ contains
   function passive_name(itp) result(name)
     integer(ip), intent(in) :: itp
     character(len=32) :: name
+    character(len=8) :: num
     if (allocated(passive_names)) then
       name = trim(passive_names(itp))
     else
-      write(name, '(a,i2.2)') 'tp', itp
+      write(num, '(i0)') itp
+      name = 'passive_tracer'//trim(num)
     endif
   end function passive_name
 
@@ -122,46 +129,54 @@ contains
   end subroutine set_cdr_lite
 
   subroutine set_passive_marbl(names)
+    ! MARBL tracers first, then the nt_passive generic tracers (ntp from
+    ! read_passive_namelist; zero initial and external boundary values unless
+    ! the files carry them), then the CDR_LITE block.
     character(len=*), intent(in) :: names(:)
     character(len=32), allocatable :: base(:)
     integer(ip) :: m
-    allocate(base(size(names)))
-    do m = 1, size(names)
+    character(len=8) :: num
+    if (passive_mirror) error stop 'passive_init = mirror_salt cannot be combined with MARBL'
+    n_marbl = size(names)
+    n_generic = ntp
+    allocate(base(n_marbl + n_generic))
+    do m = 1, n_marbl
       base(m) = trim(names(m))
     enddo
+    do m = 1, n_generic
+      write(num, '(i0)') m
+      base(n_marbl + m) = 'passive_tracer'//trim(num)
+    enddo
     passive_marbl = .true.
-    passive_mirror = .false.
     passive_init = 'zero'
-    n_generic = 0
     call append_cdr_lite(base)
-    write(*,'(a,i0,a,i0,a,i0,a)') 'passive tracers: MARBL mode, ', ntp_base, ' MARBL + ', ncdr, &
-         ' CDR_LITE tracers (', int(storage_size(1.0_pp)), '-bit storage)'
+    write(*,'(a,i0,a,i0,a,i0,a,i0,a)') 'passive tracers: MARBL mode, ', n_marbl, ' MARBL + ', n_generic, &
+         ' generic + ', ncdr, ' CDR_LITE tracers (', int(storage_size(1.0_pp)), '-bit storage)'
   end subroutine set_passive_marbl
 
   subroutine passive_finish_list()
-    ! Without MARBL: append the CDR_LITE tracers to the generic passives
-    ! (named tpNN). A no-op in MARBL mode (set_passive_marbl did it) and
-    ! when there are no CDR_LITE tracers.
+    ! Without MARBL: the generic passives (named passive_tracer<n>, as the
+    ! CPU), then the CDR_LITE tracers. A no-op in MARBL mode
+    ! (set_passive_marbl did it).
     character(len=32), allocatable :: base(:)
     integer(ip) :: m
+    character(len=8) :: num
     if (passive_marbl) return
+    n_marbl = 0
     n_generic = ntp
-    if (ncdr == 0) then
-      ntp_base = ntp; cdr0 = ntp        ! generic tracers only, named tpNN
-      return
-    endif
-    if (passive_mirror) error stop 'passive_init = mirror_salt cannot be combined with CDR_LITE tracers'
+    if (passive_mirror .and. ncdr > 0) error stop 'passive_init = mirror_salt cannot be combined with CDR_LITE tracers'
     allocate(base(n_generic))
     do m = 1, n_generic
-      write(base(m), '(a,i2.2)') 'tp', m
+      write(num, '(i0)') m
+      base(m) = 'passive_tracer'//trim(num)
     enddo
     call append_cdr_lite(base)
-    write(*,'(a,i0,a,i0,a,i0,a)') 'passive tracers: ', n_generic, ' generic + ', ncdr, &
+    if (ncdr > 0) write(*,'(a,i0,a,i0,a,i0,a)') 'passive tracers: ', n_generic, ' generic + ', ncdr, &
          ' CDR_LITE tracers (', int(storage_size(1.0_pp)), '-bit storage)'
   end subroutine passive_finish_list
 
   subroutine append_cdr_lite(base)
-    ! tp = base tracers (MARBL or generic), then the CDR_LITE block.
+    ! tp = base tracers (MARBL and/or generic), then the CDR_LITE block.
     character(len=32), intent(in) :: base(:)
     integer(ip) :: m, n
     character(len=8) :: num
@@ -194,11 +209,11 @@ contains
     integer(ip) :: nc
     nc = merge(ncdr, 0_ip, with_cdr)
     if (itp > cdr0) then
-      k = merge(2 + n_generic + (itp - cdr0), 0_ip, with_cdr)
-    elseif (passive_marbl) then
-      k = 2 + n_generic + nc + itp
+      k = merge(2 + n_generic + (itp - cdr0), 0_ip, with_cdr)     ! CDR_LITE
+    elseif (itp > n_marbl) then
+      k = 2 + (itp - n_marbl)                                     ! generic
     else
-      k = 2 + itp
+      k = 2 + n_generic + nc + itp                                ! MARBL
     endif
   end function cpu_tracer_index
 

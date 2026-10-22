@@ -32,7 +32,7 @@ module avg_out
   use io_server, only: IO_KIND_AVG, IO_KIND_BGCAVG, io_init, io_init8, io_stage8_begin, io_stage8_2d, &
                        io_stage8_3d, io_stage8_3d_pt, io_stage8_end
   use comm_mod, only: comm_rank, compute_barrier
-  use passive_mod, only: ntp, ntp_base, tp, passive_name, ncdr, cdr0, n_oae
+  use passive_mod, only: ntp, n_marbl, tp, passive_name, ncdr, cdr0, n_oae
   use marbl_gpu, only: marbl_on, marbl_trc_list
   use marbl_host, only: marbl_tracer_units, marbl_tracer_lnames
   use wvlcty_mod, only: wvlcty_compute
@@ -124,8 +124,10 @@ contains
   subroutine select_tracers(sel_ts, sel_cdr, sel_marbl)
     ! The CPU's wrt_t_avg: the names in marbl_tracers_to_write (up to the
     ! first blank entry) among all tracers, or all tracers when the list
-    ! is empty; nothing without MARBL.
-    logical, intent(out) :: sel_ts(2), sel_cdr(max(int(ncdr), 1)), sel_marbl(max(int(ntp_base), 1))
+    ! is empty; nothing without MARBL. sel_cdr covers the tracers after
+    ! MARBL in tp (generic passives, then CDR_LITE: the CPU's order),
+    ! tp indices n_marbl+1 .. ntp.
+    logical, intent(out) :: sel_ts(2), sel_cdr(max(int(ntp - n_marbl), 1)), sel_marbl(max(int(n_marbl), 1))
     integer :: l, m
     sel_ts = .false.; sel_cdr = .false.; sel_marbl = .false.
     if (.not. marbl_on) return
@@ -137,21 +139,26 @@ contains
       if (len_trim(marbl_trc_list(l)) == 0) exit
       if (trim(marbl_trc_list(l)) == 'temp') sel_ts(1) = .true.
       if (trim(marbl_trc_list(l)) == 'salt') sel_ts(2) = .true.
-      do m = 1, int(ncdr)
-        if (trim(marbl_trc_list(l)) == trim(passive_name(cdr0 + m))) sel_cdr(m) = .true.
+      do m = 1, int(ntp - n_marbl)
+        if (trim(marbl_trc_list(l)) == trim(passive_name(n_marbl + m))) sel_cdr(m) = .true.
       enddo
-      do m = 1, int(ntp_base)
+      do m = 1, int(n_marbl)
         if (trim(marbl_trc_list(l)) == trim(passive_name(m))) sel_marbl(m) = .true.
       enddo
     enddo
   end subroutine select_tracers
 
-  function cdr_lname(m) result(ln)
-    ! the CPU's t_lname of CDR_LITE tracer cdr0+m
-    integer, intent(in) :: m
+  function cdr_lname(mm) result(ln)
+    ! the CPU's t_lname of tp tracer n_marbl+mm (generic passive or CDR_LITE)
+    integer, intent(in) :: mm
     character(len=64) :: ln
     character(len=8) :: num
-    if (m <= 2 * int(n_oae)) then
+    integer :: m
+    m = mm - int(cdr0 - n_marbl)          ! index within the CDR_LITE block
+    if (m <= 0) then
+      write(num, '(i0)') mm
+      ln = 'passive tracer'//trim(num)
+    elseif (m <= 2 * int(n_oae)) then
       write(num, '(i0)') (m + 1) / 2
       if (mod(m, 2) == 1) then
         ln = 'CDR OAE ALK tracer'//trim(num)
@@ -167,7 +174,7 @@ contains
   subroutine init_avg_output()
     ! After init_output (the history), before the outputs that write a
     ! double record at start-up.
-    logical :: sel_ts(2), sel_cdr(max(int(ncdr), 1)), sel_marbl(max(int(ntp_base), 1))
+    logical :: sel_ts(2), sel_cdr(max(int(ntp - n_marbl), 1)), sel_marbl(max(int(n_marbl), 1))
     integer :: is, ie, js, je, nz, m, nxy, n2, n3, nw
     on = wrt_file_avg
     bon = wrt_bgc_avg .and. marbl_on
@@ -202,7 +209,7 @@ contains
       if (wakv) allocate(akva(is:ie, js:je, 0:nz))
       if (wakt) allocate(akta(is:ie, js:je, 0:nz))
       if (waks) allocate(aksa(is:ie, js:je, 0:nz))
-      nta = count(sel_ts) + count(sel_cdr(1:max(int(ncdr), 0)))
+      nta = count(sel_ts) + count(sel_cdr(1:max(int(ntp - n_marbl), 0)))
       allocate(ta_src(max(nta, 1)), ta_name(max(nta, 1)), ta_lname(max(nta, 1)), ta_units(max(nta, 1)))
       nta = 0
       if (sel_ts(1)) then
@@ -213,9 +220,9 @@ contains
         nta = nta + 1; ta_src(nta) = -2; ta_name(nta) = 'salt'
         ta_lname(nta) = 'salinity'; ta_units(nta) = 'PSU'
       endif
-      do m = 1, int(ncdr)
+      do m = 1, int(ntp - n_marbl)
         if (.not. sel_cdr(m)) cycle
-        nta = nta + 1; ta_src(nta) = int(cdr0) + m; ta_name(nta) = passive_name(cdr0 + m)
+        nta = nta + 1; ta_src(nta) = int(n_marbl) + m; ta_name(nta) = passive_name(n_marbl + m)
         ta_lname(nta) = cdr_lname(m); ta_units(nta) = 'mMol m-3'
       enddo
       allocate(ta(is:ie, js:je, nz, max(nta, 1)))
@@ -225,10 +232,10 @@ contains
       rec = nrpf_avg; nfile = 0; navg = 0; otime = 0.0_rp; tavg = 0.0_rp
     endif
     if (bon) then
-      nba = count(sel_marbl(1:int(ntp_base)))
+      nba = count(sel_marbl(1:int(n_marbl)))
       allocate(bsrc(max(nba, 1)), bsrc_d(max(nba, 1)))
       nba = 0
-      do m = 1, int(ntp_base)
+      do m = 1, int(n_marbl)
         if (sel_marbl(m)) then
           nba = nba + 1; bsrc(nba) = m
         endif

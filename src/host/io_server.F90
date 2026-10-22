@@ -52,7 +52,9 @@ module io_server
   integer, parameter, public :: IO_KIND_CDROUT = 5
   ! IO_KIND_AVG / IO_KIND_BGCAVG: averaged history and BGC averages (avg_out, double).
   integer, parameter, public :: IO_KIND_AVG = 6, IO_KIND_BGCAVG = 7
-  integer, parameter :: NKIND = 7
+  ! IO_KIND_RND: the random output (random_out, _rnd; surface passive tracers).
+  integer, parameter, public :: IO_KIND_RND = 8
+  integer, parameter :: NKIND = 8
   integer, parameter :: CMD_OPEN = 1, CMD_PUT = 2, CMD_QUIT = 3
   integer, parameter :: TAG_CMD = 900, TAG_STR = 901, TAG_TIME = 902, TAG_DATA = 910
   integer, parameter :: MAXV = 256, NAMELEN = 32, PATHLEN = 512   ! variables per record: up to ~240 tracers
@@ -1031,6 +1033,9 @@ contains
            '  rec = ', r%rec, '  file ', r%nfile
     elseif (r%fkind == IO_KIND_BGCAVG) then
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote BGC averages t = ', r%time, &
+           '  rec = ', r%rec, '  file ', r%nfile
+    elseif (r%fkind == IO_KIND_RND) then
+      write(*,'(a,es14.6,a,i0,a,i0)') 'wrote random t = ', r%time, &
            '  rec = ', r%rec, '  file ', r%nfile
     else
       write(*,'(a,es14.6,a,i0,a,i0)') 'wrote restart t = ', r%time, &

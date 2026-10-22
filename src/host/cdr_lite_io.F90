@@ -14,7 +14,7 @@ module cdr_lite_io
   use gpu_state
   use time_state
   use comm_mod, only: comm_rank
-  use passive_mod, only: ntp, tp, n_oae, n_dor, ncdr, cdr0, passive_name, ntp_base
+  use passive_mod, only: ntp, tp, n_oae, n_dor, ncdr, cdr0, passive_name, n_marbl
   use carb_sens_mod, only: cs_surface
   use cdr_lite_mod
   use frc_io, only: init_cdr_lite_forcing, set_cdr_lite_forces, uwnd, vwnd
@@ -107,7 +107,7 @@ contains
     integer(ip), intent(out) :: ia, id, ipo, isi
     integer(ip) :: m
     ia = 0; id = 0; ipo = 0; isi = 0
-    do m = 1, ntp_base
+    do m = 1, n_marbl
       select case (trim(passive_name(m)))
       case ('ALK_ALT_CO2'); ia = m
       case ('DIC_ALT_CO2'); id = m

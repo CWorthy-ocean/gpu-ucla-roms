@@ -16,6 +16,7 @@ module case_io
   use cdr_io, only: read_cdr_namelist, init_cdr
   use cdr_lite_io, only: read_cdr_lite_namelist, init_cdr_lite
   use cdr_lite_out, only: read_cdr_lite_output_namelist, set_cdr_lite_output_root, init_cdr_lite_output
+  use random_out, only: read_random_namelist, set_random_output_root, init_random_output
   use cdr_gas_out, only: read_cdr_gas_output_namelist, set_cdr_gas_output_root, init_cdr_gas_output
   use cdr_out, only: read_cdr_output_namelist, set_cdr_output_root, init_cdr_output
   use upscale_out, only: read_upscale_namelist, set_upscale_root, init_upscale_output
@@ -164,10 +165,11 @@ contains
     call read_cdr_namelist(unit)
     call read_cdr_lite_namelist(unit)
     call read_cdr_lite_output_namelist(unit)
+    call read_random_namelist(unit)
     call read_cdr_gas_output_namelist(unit)
     call read_cdr_output_namelist(unit)
     call read_upscale_namelist(unit)
-    case_ntp_est = max(ntp, nt_bgc) + ncdr
+    case_ntp_est = nt_bgc + ntp + ncdr        ! MARBL + generic + CDR_LITE (ntp = nt_passive here)
 
     rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios)
     call read_tile_settings(unit)   ! optional group; before the unit is closed
@@ -193,6 +195,7 @@ contains
     case_title = trim(title)
     case_output_root = resolve_path(nml_dir, output_root_name)
     call set_cdr_lite_output_root(case_output_root)
+    call set_random_output_root(case_output_root)
     call set_cdr_gas_output_root(case_output_root)
     call set_cdr_output_root(case_output_root)
     call set_upscale_root(case_output_root)
@@ -664,6 +667,7 @@ contains
     call set_avg_root(case_output_root)
     call init_avg_output()            ! before the outputs that write a double record at start-up
     call init_cdr_lite_output()       ! after the history/restart staging is sized
+    call init_random_output()         ! surface passive tracers (random_output_settings)
     call init_cdr_gas_output()        ! writes its start (bracket) record
     call init_cdr_output()
     call init_upscale_output()        ! after init_bry (open sides)

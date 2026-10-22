@@ -18,7 +18,7 @@ module marbl_gpu
   use nc_io
   use frc_io, only: init_bgc_forcing, set_bgc_forces, uwnd, vwnd, bgc_frc_on
   use run_timers, only: rt_dev_begin, rt_dev_end
-  use passive_mod, only: ntp, ntp_base, tp, set_passive_marbl, passive_marbl, passive_name, &
+  use passive_mod, only: ntp, n_marbl, tp, set_passive_marbl, passive_marbl, passive_name, &
        passive_hold, hold_itr, hold_value
   use marbl_host
   use marbl_sflux_mod
@@ -201,9 +201,9 @@ contains
       enddo
     enddo
     ! surface fluxes, applied to the top layer of slot nnew; the MARBL
-    ! tracers are tp 1 .. ntp_base (CDR_LITE tracers follow; MARBL does not
-    ! see them). The kernels take ntp as tp's leading dimension.
-    nmb = ntp_base
+    ! tracers are tp 1 .. n_marbl (generic and CDR_LITE tracers follow; MARBL
+    ! does not see them). The kernels take ntp as tp's leading dimension.
+    nmb = n_marbl
     call marbl_sflux_compute(msf, ntp, nz, nz, nn, tp, nt, t, rmask)
     ! wet columns c of the interior are tp columns c (gpu_state, tpcol)
     CUF_DO2

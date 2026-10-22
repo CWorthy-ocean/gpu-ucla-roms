@@ -2212,6 +2212,51 @@ parent cells 200-330 and crosses land on two sides.
       10-20 ms.
     - netCDF-4 with a chunk per record beat CDF5 (150 ms) for this file.
 
+## Generic passive tracers with MARBL, and the random output (2026-10-21)
+
+For the CCS dye-tracer run (`ccs_4km_passive`): MARBL plus generic passive
+tracers released by CDR Gaussian patches, with their surface fields written
+every few hours.
+
+- **Tracer layout.** `tp` holds the MARBL tracers (1 .. `n_marbl`), then the
+  `nt_passive` generic tracers, then the CDR_LITE block (`cdr0` =
+  `ntp_base` = `n_marbl` + `n_generic`).
+  - Before, MARBL mode set the generic count to 0.
+  - The MARBL kernels and `marbl_step` address `1 .. n_marbl` (they used
+    `ntp_base`); `avg_out` and `extract_out` follow the same layout.
+  - `cpu_tracer_index` maps tp to the CPU's order: T, S, generic, CDR_LITE,
+    MARBL.
+- **Inputs.** The river and CDR release tracer axes are read positionally in
+  that CPU order, so a river file needs the generic rows (zero
+  concentrations), as on the CPU.
+  - roms-tools writes T, S and MARBL only; the run's
+    `scripts/make_rivers.py` inserts the rows.
+  - The roms-tools `CDRForcing` with `tracer_set="passive"` and
+    `include_marbl_bgc=True` already has them.
+  - Initial and boundary values come by name (`passive_tracer<n>`), and 0
+    when absent.
+- **Names.** Generic tracers are now `passive_tracer<n>` in every mode, as on
+  the CPU; they were `tpNN` (`tools/mirror_eval.py` updated).
+- **Random output** (`src/host/random_out.F90`, `&random_output_settings`:
+  `output_period_random`, `nrpf_random`, `do_random`). The CPU module is a
+  template that writes Hz, u and v.
+  - Here it writes the surface (top-level) field of every generic passive
+    tracer every `output_period_random` seconds.
+  - Files are `<root>_rnd.nc`, `<root>_rnd_0002.nc`, ..., with `nrpf_random`
+    records each.
+  - Fields are in the passive storage precision; the time is double.
+  - I/O kind 8.
+- **Validation (cases/CDR).** Iceland0, MARBL + 4 passive tracers fed by 4
+  passive releases, 12 steps (`gen_passive.py`, `tools/make_passive_test.py`).
+  - CPU reference: `bld_cpu_passive`, i.e. `bld_cpu_ref` with a local
+    `random_output.F90` writing the same surface fields.
+  - Random output: within 1.5e-10 relative of the CPU, every record.
+  - Physics and MARBL tracers: within one float32 unit every 2 steps.
+- **Regressions (bit-identical, `tools/cmp_bitid.py`).**
+  - A MARBL run with history, averages, BGC averages and child-grid
+    extraction, old binary against new.
+  - The no-MARBL CDR_LITE runs nm1 and nm2.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

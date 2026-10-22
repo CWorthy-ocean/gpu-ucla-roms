@@ -8,14 +8,15 @@ namelists and input files.
 - **On the GPU:** the whole baroclinic and barotropic time step (dynamics,
   KPP mixing, tracer advection and mixing, tides, bulk surface forcing,
   rivers, open boundaries), MARBL's surface fluxes and interior ecosystem, generic
-  passive tracers, the CDR_LITE tracers (transport, inputs, air-sea gas
+  passive tracers (with or without MARBL), the CDR_LITE tracers (transport, inputs, air-sea gas
   exchange with file or online carbonate sensitivities, surface fluxes),
   every CDR forcing mode (cdr_frc point and Gaussian releases of tracer or
   of water with cdr_volume, depth profiles, 3-D forcing), and the CDR
   outputs (cdr, cdr_lite, cdr_gas_exch, and the upscaling transects with
   their open-boundary flux term). Output: history, restarts, averaged
-  history and BGC averages, the true vertical velocity w, and child-grid
-  boundary files (extract_data). Model fields stay in GPU memory for the
+  history and BGC averages, the true vertical velocity w, child-grid
+  boundary files (extract_data), and the random output, which on the GPU
+  writes the surface field of every generic passive tracer. Model fields stay in GPU memory for the
   whole run.
 - **Many GPUs:** one MPI rank per GPU, tiles balanced by ocean cells and
   memory, halo exchanges GPU to GPU with a CUDA-aware MPI. Separate writer
@@ -182,7 +183,8 @@ compiled as host code for settings and initialisation
 (`src/host/marbl_host.F90`), and the surface flux and interior tendency paths
 are CUDA Fortran kernels (`src/device/marbl_sflux.F90`,
 `src/device/marbl_interior.F90`), driven from `src/host/marbl_step.F90`. The
-32 MARBL tracers are the passive tracers in MARBL mode. Design, validation
+32 MARBL tracers lead the passive tracers in MARBL mode, followed by the
+generic passive tracers (`nt_passive`) and the CDR_LITE tracers. Design, validation
 and lessons: `MARBL_GPU_PORT.md`.
 
 ## Development builds

@@ -41,7 +41,7 @@ module extract_out
   use nc_io, only: nc_create, nc_def_dim, nc_def_var, nc_put_att_text, nc_enddef, nc_close, nc_open_write, &
                    nc_put_1d_rec
   use comm_mod, only: comm_rank, comm_reduce_sum
-  use passive_mod, only: ntp, ntp_base, tp, passive_name, passive_marbl, ncdr, cdr0, n_oae, n_dor
+  use passive_mod, only: ntp, n_marbl, n_generic, tp, passive_name, passive_marbl, ncdr, cdr0, n_oae, n_dor
   use marbl_host, only: marbl_tracer_units, marbl_tracer_lnames
   use cdr_io, only: remap_src_to_grid
   use arch_mod, only: sync_arch
@@ -343,15 +343,15 @@ contains
     ! CDR_LITE, MARBL)
     integer :: m, n, ngen
     character(len=8) :: num
-    ngen = merge(0, int(ntp_base), passive_marbl)
-    ntrc = 2 + ngen + int(ncdr) + merge(int(ntp_base), 0, passive_marbl)
+    ngen = int(n_generic)
+    ntrc = 2 + ngen + int(ncdr) + int(n_marbl)
     allocate(trc_kind(ntrc), trc_src(ntrc), trc_name(ntrc), trc_lname(ntrc), trc_units(ntrc))
     n = 1; trc_kind(n) = 1; trc_src(n) = itemp; trc_name(n) = 'temp'
     trc_lname(n) = 'potential temperature'; trc_units(n) = 'Celsius'
     n = 2; trc_kind(n) = 2; trc_src(n) = isalt; trc_name(n) = 'salt'
     trc_lname(n) = 'salinity'; trc_units(n) = 'PSU'
     do m = 1, ngen
-      n = n + 1; trc_kind(n) = 3; trc_src(n) = m
+      n = n + 1; trc_kind(n) = 3; trc_src(n) = int(n_marbl) + m      ! tp index of generic tracer m
       write(num, '(i0)') m
       trc_name(n) = 'passive_tracer'//trim(num); trc_lname(n) = 'passive tracer'//trim(num)
       trc_units(n) = 'mMol m-3'
@@ -372,7 +372,7 @@ contains
       endif
     enddo
     if (passive_marbl) then
-      do m = 1, int(ntp_base)
+      do m = 1, int(n_marbl)
         n = n + 1; trc_kind(n) = 5; trc_src(n) = m
         trc_name(n) = passive_name(m); trc_lname(n) = marbl_tracer_lnames(m); trc_units(n) = marbl_tracer_units(m)
       enddo
