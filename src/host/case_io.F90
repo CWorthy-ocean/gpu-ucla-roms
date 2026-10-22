@@ -242,7 +242,9 @@ contains
 
   subroutine apply_sponge()
     ! CPU set_nudgcof (SPONGE, UV_VIS2, TS_DIF2, not PACIFIC): linear ramp
-    ! over isp = sponge_size+1 points from every non-periodic edge.
+    ! over isp = sponge_size+1 points from every open edge (the CPU's
+    ! OBC_WEST/EAST/SOUTH/NORTH; here obc_*, set by init_bry and init_tides).
+    ! A closed edge gets no sponge.
     integer(ip), parameter :: sponge_size = 15_ip
     integer(ip) :: i, j, ig, jg, isp, ibnd, itrc, i_lo, i_hi, j_lo, j_hi
     real(rp), allocatable :: wrk(:,:)
@@ -257,8 +259,10 @@ contains
       do i = i_lo, i_hi
         ig = decomp%i0 + i - 1_ip
         ibnd = isp
-        if (.not. decomp%periodic_x) ibnd = min(ibnd, ig, decomp%gnx + 1_ip - ig)
-        if (.not. decomp%periodic_y) ibnd = min(ibnd, jg, decomp%gny + 1_ip - jg)
+        if (obc_west)  ibnd = min(ibnd, ig)
+        if (obc_east)  ibnd = min(ibnd, decomp%gnx + 1_ip - ig)
+        if (obc_south) ibnd = min(ibnd, jg)
+        if (obc_north) ibnd = min(ibnd, decomp%gny + 1_ip - jg)
         wrk(i, j) = real(isp - ibnd, rp) / real(isp, rp)
       enddo
     enddo
@@ -593,9 +597,6 @@ contains
     diff2 = 0.0_rp
     diff2(:, :, 1) = 0.0_rp
     if (size(diff2, 3) >= 2) diff2(:, :, 2) = 0.0_rp
-    call apply_sponge()
-    call build_mix_map()
-    write(*,'(a,i0,a,i0,a,i0)') 'mixing skip: rank ', comm_rank(), '  active wet cells ', nmix, ' of ', nwet
 
     call nc_open_read(case_inifile, ncid)
     write(*,'(a,a)') 'init file: ', trim(case_inifile)
@@ -637,6 +638,10 @@ contains
     call wall_stamp('boundary init')
     call init_tides()
     call wall_stamp('tide init')
+    ! the sponge follows the open sides (obc_*), known from here on
+    call apply_sponge()
+    call build_mix_map()
+    write(*,'(a,i0,a,i0,a,i0)') 'mixing skip: rank ', comm_rank(), '  active wet cells ', nmix, ' of ', nwet
     ! after the initial state: the river faces add to riv_umask/riv_vmask
     ! as read from the initial file (CPU: get_init, then calc_river_flux);
     ! before close_frc_cache: it scans the forcing files' open handles

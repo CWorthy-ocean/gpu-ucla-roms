@@ -130,7 +130,10 @@ contains
       endif
     enddo
     call nc_close(ncid)
-    if (bry_tides) then
+    ! Boundary tides act on the open sides only. With boundary files, those
+    ! are the sides init_bry found data for (a closed side, the CPU's
+    ! undefined OBC_<side>, stays closed); without any, every side is open.
+    if (bry_tides .and. .not. have_bry) then
       obc_west = .true.; obc_east = .true.
       obc_south = .true.; obc_north = .true.
     endif
