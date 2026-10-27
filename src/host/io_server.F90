@@ -98,9 +98,13 @@ module io_server
   ! Server side: every tile's part of a record is received into its own
   ! buffer; when all parts of a record are in, each variable is assembled
   ! into one global array and written once at full extent (no tile waits
-  ! behind another tile's write, no partial-chunk rewrites). Two record
-  ! slots so a record can arrive while the previous one is being written.
-  integer, parameter :: NSLOT = 4                  ! records assembled at once (per-tile buffers)
+  ! behind another tile's write, no partial-chunk rewrites). Several record
+  ! slots so records can arrive while earlier ones are being written. A step
+  ! where every output falls due (restart, averages, BGC averages, _cdrtrc,
+  ! _cdrgas average and end bracket: six records) must fit: with several
+  ! writers an overrun stops the run. A slot's buffers grow to the largest
+  ! record it has held, so idle slots cost little.
+  integer, parameter :: NSLOT = 8                  ! records assembled at once (per-tile buffers)
   type :: tile_buf_t
     real(4), allocatable :: b(:)
     real(8), allocatable :: b8(:)
