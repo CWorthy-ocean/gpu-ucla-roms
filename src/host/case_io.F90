@@ -611,6 +611,7 @@ contains
     call load_init_records(ncid, i0, j0, nxi, neta, xi_u, eta_v)
     call nc_close(ncid)
     call mask_loaded_velocities()
+    call fill_masked_velocity_halos()
     call wall_stamp('initial state read')
 
     call sanitize_land()
@@ -997,6 +998,22 @@ contains
       enddo
     enddo
   end subroutine mask_loaded_velocities
+
+  subroutine fill_masked_velocity_halos()
+    ! Refill the tile halos of what mask_loaded_velocities changed. It masks the
+    ! halos too, but umask/vmask are not defined on a tile's outermost halo
+    ! column/row (geom sets them from is+1/js+1; the default there is 1), so a
+    ! land face there kept the file's velocity: on CCS the Nass river faces at
+    ! the 2x4 tile cut kept the CPU's river velocity while their owner zeroed
+    ! it, and the predictor's UP3 stencil read the stale copy.
+    integer(ip) :: n
+    call halo_fill_2d_s(ubar, STAGGER_U, 1_ip)
+    call halo_fill_2d_s(vbar, STAGGER_V, 1_ip)
+    do n = 1, 2
+      call halo_fill_3d_s(u, STAGGER_U, n)
+      call halo_fill_3d_s(v, STAGGER_V, n)
+    enddo
+  end subroutine fill_masked_velocity_halos
 
   subroutine sanitize_land()
     ! Elementwise on the device: the state may already be on the GPU (the
