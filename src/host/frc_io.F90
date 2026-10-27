@@ -163,7 +163,9 @@ contains
     read(unit, nml=bulk_frc_settings, iostat=ios)
     rewind(unit)
     read(unit, nml=sss_correction, iostat=ios)
-    dsssdt_ms = dsssdt / (100.0_rp * 86400.0_rp)
+    ! In single precision, as the CPU (surf_flux.F90: default-real dSSSdt, read from the
+    ! namelist, then dSSSdt / (100.*86400.)): about -3.6e-8 relative to the double value.
+    dsssdt_ms = real(real(dsssdt, 4) / (100.0_4 * 86400.0_4), rp)
 
     case_nfrc = 0
     do i = 1, max_frc
