@@ -29,8 +29,10 @@ module formulas
   real(rp), parameter, public :: OneFifth = 0.2_rp
   real(rp), parameter, public :: OneTwelfth = 1.0_rp / 12.0_rp
   real(rp), parameter, public :: qp2 = 0.0000172_rp
-  real(rp), parameter, public :: coef_up3 = 1.0_rp / 6.0_rp
-  real(rp), parameter, public :: uv_delta = 1.0_rp / 6.0_rp
+  ! The CPU's literals (compute_horiz_tracer_fluxes.h:112,197; pre_step3d_mod.F90:105 and
+  ! step3d_uv_mod.F90:77), not 1/6, so that both codes use the same constants.
+  real(rp), parameter, public :: coef_up3 = 0.1666666666666666_rp
+  real(rp), parameter, public :: uv_delta = 0.1666666666666667_rp
   real(rp), parameter, public :: uv_gamma = 1.0_rp / 3.0_rp
   ! step3d_uv2 mass-flux filter (not TR).
   real(rp), parameter, public :: FLUX_EPSIL = 0.36_rp
@@ -69,7 +71,8 @@ module formulas
   real(rp), parameter, public :: lmd_Vtsq_fix = 1.8_rp
   real(rp), parameter, public :: lmd_smooth_c = 1.0_rp / 12.0_rp
   real(rp), parameter, public :: lmd_smooth_c1 = 3.0_rp / 16.0_rp
-  real(rp), parameter, public :: lmd_ustar_w = 1.0_rp / 3.0_rp
+  ! The CPU's literal (lmd_kpp_mod.F90:509), not 1/3.
+  real(rp), parameter, public :: lmd_ustar_w = 0.333333333333_rp
 
   ! Paulson-Simpson Jerlov type 1 (Jwt=1).
   real(rp), parameter, public :: jwt1_mu1 = 0.35_rp
@@ -325,7 +328,7 @@ contains
     pgf = 0.5_rp * g * metric * ( &
           (h_m + h_p) * (rzeta_m - rzeta_p) + rzeta2_m - rzeta2_p + &
           (h_m - h_p) * (rzetaSA_m + rzetaSA_p + &
-          (1.0_rp / 3.0_rp) * (rhoA_m - rhoA_p) * (zwrk_m - zwrk_p)))
+          0.333333333333_rp * (rhoA_m - rhoA_p) * (zwrk_m - zwrk_p)))  ! the CPU's literal, step2d_mod.F90:263
   end function barotropic_pgf
 
 #ifdef USE_CUDA

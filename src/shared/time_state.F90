@@ -281,7 +281,10 @@ contains
     elseif (frc_slot == 1) then
       frc_modtime = tdays + 0.5_rp * dt * sec2day
     elseif (frc_slot == 2) then
-      frc_modtime = tdays + dt * sec2day
+      ! The CPU's expression for the corrector's boundary time (main.F90:603, then
+      ! roms_read_write.F90:606): tdays shifted half a step, plus half a step. It differs
+      ! from tdays + dt*sec2day by 1 ulp on about 2 steps in 3.
+      frc_modtime = (time + 0.5_rp * dt) * sec2day + 0.5_rp * dt * sec2day
     else
       frc_modtime = tdays + 1.5_rp * dt * sec2day
     endif
