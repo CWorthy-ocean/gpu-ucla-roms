@@ -5,6 +5,9 @@ biogeochemistry library, written in CUDA Fortran for NVIDIA GPUs. The time
 step follows CPU UCLA ROMS routine for routine, and the model reads the same
 namelists and input files.
 
+**Status:** beta (v0.1.1-beta, October 2026), checked against CPU UCLA ROMS
+0.11.0 on the cases below; MARBL_GPU_PORT.md has the validation history.
+
 - **On the GPU:** the whole baroclinic and barotropic time step (dynamics,
   KPP mixing, tracer advection and mixing, tides, bulk surface forcing,
   rivers, open boundaries), MARBL's surface fluxes and interior ecosystem, generic
@@ -27,13 +30,27 @@ namelists and input files.
   MiniPac). After 3 days it is within the CPU model's own sensitivity to a
   1e-6 degC initial temperature perturbation, apart from local events (one
   column, open-boundary inflow switches) that do not recur from a common
-  state. Every optimization was checked to reproduce the previous version
+  state. On CCS 4 km (rivers, a CDR release, a closed side), GPU minus CPU
+  stays within 0.2-3x of the CPU's own round-off (strict minus default
+  floating point) in every region over the first 8 steps, and over 120
+  days it is about as large as the CPU's difference from its own perturbed
+  twins. Every optimization was checked to reproduce the previous version
   bit for bit.
 - **Speed (Derecho):** Pacific domain with MARBL, 2 nodes of each kind: 21x
   faster per time step than CPU ROMS-MARBL (8 A100s vs 256 AMD cores).
+- **Closed sides:** a side is closed (the CPU's undefined OBC_<side>) when
+  the boundary files hold no data for it. Boundary tides with no boundary
+  files at all open every side. Closed walls are free-slip (gamma2 = 1);
+  any other gamma2 stops the run.
+- **Rivers:** the river records must cover the run's dates (climatologies
+  are not cycled; the run stops otherwise). A large river into one small
+  cell can drive the salinity there below zero, and MARBL's carbonate
+  solver then stops the run, as on the CPU: spread such a river over
+  several cells. With v0.1.0-beta, results near a river mouth on a tile
+  edge depended on the tile layout; fixed in v0.1.1-beta.
 - **Not yet on the GPU:** pipes (point sources), monthly CDR
-  averages, averaged BGC diagnostics (_bgc_dia_avg), closed basins (one
-  known boundary bug) and monthly restarts. A
+  averages, averaged BGC diagnostics (_bgc_dia_avg), no-slip walls and
+  monthly restarts. A
   namelist that switches on a feature the GPU lacks stops the run at
   start-up with a list of the switches.
 
@@ -52,10 +69,11 @@ namelists and input files.
 
 ### Get the code
 
-MARBL is a git submodule:
+The repository is private for now; ask for access. MARBL is a git
+submodule:
 
 ```
-git clone --recurse-submodules <repository-url> roms_gpu
+git clone --recurse-submodules https://github.com/sdbachman/gpu-ucla-roms.git roms_gpu
 cd roms_gpu
 # or, in an existing clone:  git submodule update --init
 ```
