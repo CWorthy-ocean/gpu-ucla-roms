@@ -87,6 +87,9 @@ module cdr_io
 
   real(rp), parameter :: pi = 3.14159265358979323_rp, deg2rad = pi / 180.0_rp   ! the CPU's
   real(rp), parameter :: radius = 6.371e6_rp
+  ! Release-cell threshold on frac: the CPU's single-precision literal 1e-3 (cdr_frc.F90:705,770),
+  ! which promotes to 0.0010000000475, not 1.0e-3 in double.
+  real(rp), parameter :: cdr_frac_min = real(1.0e-3, rp)
 
 contains
 
@@ -231,7 +234,7 @@ contains
         do j = 2, gy - 1
           do i = 2, gx - 1
             frac(i, j) = exp(-(dist(i, j) / rhsc(r))**2)
-            if (frac(i, j) > 1.0e-3_rp .and. mask(i, j) > 0.0_rp) nq_r = nq_r + 1
+            if (frac(i, j) > cdr_frac_min .and. mask(i, j) > 0.0_rp) nq_r = nq_r + 1
           enddo
         enddo
         if (nq_r == 0) then
@@ -246,7 +249,7 @@ contains
       if (comm_rank() == 0) write(*,'(a,i0,a,f12.3,a,2i6,a,2f10.4,a,2f10.4)') 'cdr: release ', r, &
            ' nearest cell at ', dmin, ' m, global (i, j)', imin - 1, jmin - 1, &
            ' lon/lat', lon(imin, jmin), lat(imin, jmin), ' intended', rlon(r), rlat(r)
-      nqr(r) = count(frac(2:gx-1, 2:gy-1) > 1.0e-3_rp .and. mask(2:gx-1, 2:gy-1) > 0.0_rp)
+      nqr(r) = count(frac(2:gx-1, 2:gy-1) > cdr_frac_min .and. mask(2:gx-1, 2:gy-1) > 0.0_rp)
       fr_all(:, :, r) = frac
     enddo
 
@@ -260,7 +263,7 @@ contains
       q0 = q
       do j = 2, gy - 1
         do i = 2, gx - 1
-          if (.not. (fr_all(i, j, r) > 1.0e-3_rp .and. mask(i, j) > 0.0_rp)) cycle
+          if (.not. (fr_all(i, j, r) > cdr_frac_min .and. mask(i, j) > 0.0_rp)) cycle
           call rest_grid(hh(i, j), nzl, zr0, hz0)
           prf = 0.0_rp
           if (cdr_forcing_depth_profiles) then
