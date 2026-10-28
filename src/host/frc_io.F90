@@ -149,6 +149,8 @@ contains
     namelist /sss_correction/ dsssdt
     namelist /flux_frc_settings/ interp_flux_frc
     namelist /bulk_frc_settings/ interp_bulk_frc, check_bulk_frc_units
+    real(rp) :: gamma2
+    namelist /gamma2_settings/ gamma2
 
     frcfiles = ''; frcfile = ''
     interp_bulk_frc = .false.; check_bulk_frc_units = .false.
@@ -166,6 +168,11 @@ contains
     ! In single precision, as the CPU (surf_flux.F90: default-real dSSSdt, read from the
     ! namelist, then dSSSdt / (100.*86400.)): about -3.6e-8 relative to the double value.
     dsssdt_ms = real(real(dsssdt, 4) / (100.0_4 * 86400.0_4), rp)
+    ! Closed walls: the GPU has free slip only (obc.F90 gamma2 = 1, as the CPU default).
+    gamma2 = 1.0_rp
+    rewind(unit)
+    read(unit, nml=gamma2_settings, iostat=ios)
+    if (gamma2 /= 1.0_rp) error stop 'gamma2_settings: only gamma2 = 1 (free slip) is supported'
 
     case_nfrc = 0
     do i = 1, max_frc

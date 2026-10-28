@@ -387,14 +387,12 @@ contains
     ! t3dbc for the passives: upstream radiation with tangential upstream
     ! advection, nudged on inflow toward the external value (0, or the
     ! salinity boundary data for the mirror tracer), then corners.
-    integer(ip) :: i, j, k, nx, ny, nz, ns, nn, nr, itr, ntr, ilo, ihi, jlo, jhi
+    integer(ip) :: i, j, k, nx, ny, nz, ns, nn, nr, itr, ntr
     real(rp) :: cx, cy, cext, dtw, cff, text
     real(rp) :: g0c, g0p, g1c, g1p, tn
     logical :: sw, se, nw, ne, mir, mbry
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz; ntr = ntp
     ns = nstp; nn = nnew; nr = nrhs
-    ilo = decomp%is; ihi = decomp%ie
-    jlo = decomp%js; jhi = decomp%je
     mir = passive_mirror
     mbry = passive_bry
     if (nnew == 3) then
@@ -436,10 +434,11 @@ contains
 #ifdef USE_CUDA
         !$cuf kernel do(3) <<<*,*>>>
 #endif
-        do j = jlo, jhi
+        ! Closed (CPU t3dbc_tile, j = jstr..jend): gradient, masked.
+        do j = 1, ny
           do k = 1, nz
             do itr = 1, ntr
-              tp(itr, tpcol(0, j), k, nn) = tp(itr, tpcol(1, j), k, nn)
+              tp(itr, tpcol(0, j), k, nn) = real(real(tp(itr, tpcol(1, j), k, nn), rp) * rmask(0, j), pp)
             enddo
           enddo
         enddo
@@ -479,10 +478,10 @@ contains
 #ifdef USE_CUDA
         !$cuf kernel do(3) <<<*,*>>>
 #endif
-        do j = jlo, jhi
+        do j = 1, ny
           do k = 1, nz
             do itr = 1, ntr
-              tp(itr, tpcol(nx + 1, j), k, nn) = tp(itr, tpcol(nx, j), k, nn)
+              tp(itr, tpcol(nx + 1, j), k, nn) = real(real(tp(itr, tpcol(nx, j), k, nn), rp) * rmask(nx + 1, j), pp)
             enddo
           enddo
         enddo
@@ -522,10 +521,11 @@ contains
 #ifdef USE_CUDA
         !$cuf kernel do(3) <<<*,*>>>
 #endif
-        do i = ilo, ihi
+        ! Closed (CPU, i = istr..iend); the corners are set below.
+        do i = 1, nx
           do k = 1, nz
             do itr = 1, ntr
-              tp(itr, tpcol(i, 0), k, nn) = tp(itr, tpcol(i, 1), k, nn)
+              tp(itr, tpcol(i, 0), k, nn) = real(real(tp(itr, tpcol(i, 1), k, nn), rp) * rmask(i, 0), pp)
             enddo
           enddo
         enddo
@@ -565,10 +565,10 @@ contains
 #ifdef USE_CUDA
         !$cuf kernel do(3) <<<*,*>>>
 #endif
-        do i = ilo, ihi
+        do i = 1, nx
           do k = 1, nz
             do itr = 1, ntr
-              tp(itr, tpcol(i, ny + 1), k, nn) = tp(itr, tpcol(i, ny), k, nn)
+              tp(itr, tpcol(i, ny + 1), k, nn) = real(real(tp(itr, tpcol(i, ny), k, nn), rp) * rmask(i, ny + 1), pp)
             enddo
           enddo
         enddo

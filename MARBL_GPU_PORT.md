@@ -1063,10 +1063,12 @@ Pac 8x1 strips, 3-day run:
   `cases/pac/gpu/namelist_roms_gpu_pac3dS10.nml`.
 
 Notes:
-- **Pre-existing race, not fixed.** u2dbc's closed-edge Neumann copy
-  `ubar(m, 0, kn) = ubar(m, 1, kn)` at m = nx+1 reads a cell that thread 1
-  writes in the same launch. Only closed-wall configurations are affected;
-  both test cases have all four edges open.
+- **Pre-existing race, fixed 2026-10-28.** u2dbc's closed-edge Neumann copy
+  `ubar(m, 0, kn) = ubar(m, 1, kn)` at m = nx+1 read a cell that thread 1
+  writes in the same launch. The closed-edge code now follows the CPU
+  (gamma2 times the masked inside value), and its end faces are set in the
+  serial uv2dbc_corners launch after uv2dbc, so no thread reads a cell
+  another writes.
 - **Latent, non-default case.** With a non-default `ROMS_GPU_SKIP_DRY`
   that skips G_MOM but not G_LMD, visc3d reads stale scratch at deep
   columns. Those values now differ from the old code's.

@@ -21,6 +21,10 @@ module obc
 
   real(rp), parameter :: cx_lim = 0.292893218813452_rp
   real(rp), parameter :: eps = 1.0e-33_rp
+  ! CPU gamma2 (GAMMA2_SETTINGS): +1 free slip, -1 no slip, used by the
+  ! closed-wall tangential copies. Only free slip is supported, as in the
+  ! pmask of geom (and of the CPU, which ignores gamma2 there).
+  real(rp), parameter :: gamma2 = 1.0_rp
 
   public :: zetabc
   public :: u2dbc
@@ -140,7 +144,7 @@ contains
         endif
       endif
       ! Tangent (CPU u2dbc_tile): upstream radiation, inflow nudged to
-      ! ubar_south/ubar_north; closed edges fall back to Neumann.
+      ! ubar_south/ubar_north; closed edges take the wall copy.
       ! g0(i) = ubar(i+1,edge) - ubar(i,edge), g1 likewise one row inside.
       if (es) then
         if (os) then
@@ -163,8 +167,11 @@ contains
                  + cx * (ubar(m, 1, ks) - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c)
             ubar(m, 0, kn) = ((1.0_rp - cext) * ubar(m, 0, kn) + cext * ubar_south(m)) * umask(m, 0)
           endif
-        elseif (m >= 1 .and. m <= nx + 1) then
-          ubar(m, 0, kn) = ubar(m, 1, kn)
+        elseif (m >= i0 .and. m <= nx) then
+          ! Closed wall (CPU u2dbc, i = istr..iendR). The end faces m = 1
+          ! (west edge) and nx+1 (east edge) read normal faces this launch
+          ! writes, so uv2dbc_corners sets them.
+          ubar(m, 0, kn) = gamma2 * ubar(m, 1, kn) * umask(m, 0)
         endif
       endif
       if (en) then
@@ -189,8 +196,8 @@ contains
             ubar(m, ny + 1, kn) = ((1.0_rp - cext) * ubar(m, ny + 1, kn) + &
                  cext * ubar_north(m)) * umask(m, ny + 1)
           endif
-        elseif (m >= 1 .and. m <= nx + 1) then
-          ubar(m, ny + 1, kn) = ubar(m, ny, kn)
+        elseif (m >= i0 .and. m <= nx) then
+          ubar(m, ny + 1, kn) = gamma2 * ubar(m, ny, kn) * umask(m, ny + 1)
         endif
       endif
     enddo
@@ -270,8 +277,11 @@ contains
                  + cx * (vbar(1, m, ks) - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c)
             vbar(0, m, kn) = ((1.0_rp - cext) * vbar(0, m, kn) + cext * vbar_west(m)) * vmask(0, m)
           endif
-        elseif (m >= 1 .and. m <= ny + 1) then
-          vbar(0, m, kn) = vbar(1, m, kn)
+        elseif (m >= j0 .and. m <= ny) then
+          ! Closed wall (CPU v2dbc, j = jstr..jendR). The end faces m = 1
+          ! (south edge) and ny+1 (north edge) read normal faces this launch
+          ! writes, so uv2dbc_corners sets them.
+          vbar(0, m, kn) = gamma2 * vbar(1, m, kn) * vmask(0, m)
         endif
       endif
       if (ee) then
@@ -296,8 +306,8 @@ contains
             vbar(nx + 1, m, kn) = ((1.0_rp - cext) * vbar(nx + 1, m, kn) + &
                  cext * vbar_east(m)) * vmask(nx + 1, m)
           endif
-        elseif (m >= 1 .and. m <= ny + 1) then
-          vbar(nx + 1, m, kn) = vbar(nx, m, kn)
+        elseif (m >= j0 .and. m <= ny) then
+          vbar(nx + 1, m, kn) = gamma2 * vbar(nx, m, kn) * vmask(nx + 1, m)
         endif
       endif
     enddo
@@ -361,7 +371,7 @@ contains
         endif
       endif
       ! Tangent (CPU u2dbc_tile): upstream radiation, inflow nudged to
-      ! ubar_south/ubar_north; closed edges fall back to Neumann.
+      ! ubar_south/ubar_north; closed edges take the wall copy.
       ! g0(i) = ubar(i+1,edge) - ubar(i,edge), g1 likewise one row inside.
       if (es) then
         if (os) then
@@ -384,8 +394,11 @@ contains
                  + cx * (ubar(m, 1, ks) - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c)
             ubar(m, 0, kn) = ((1.0_rp - cext) * ubar(m, 0, kn) + cext * ubar_south(m)) * umask(m, 0)
           endif
-        elseif (m >= 1 .and. m <= nx + 1) then
-          ubar(m, 0, kn) = ubar(m, 1, kn)
+        elseif (m >= i0 .and. m <= nx) then
+          ! Closed wall (CPU u2dbc, i = istr..iendR). The end faces m = 1
+          ! (west edge) and nx+1 (east edge) read normal faces this launch
+          ! writes, so uv2dbc_corners sets them.
+          ubar(m, 0, kn) = gamma2 * ubar(m, 1, kn) * umask(m, 0)
         endif
       endif
       if (en) then
@@ -410,8 +423,8 @@ contains
             ubar(m, ny + 1, kn) = ((1.0_rp - cext) * ubar(m, ny + 1, kn) + &
                  cext * ubar_north(m)) * umask(m, ny + 1)
           endif
-        elseif (m >= 1 .and. m <= nx + 1) then
-          ubar(m, ny + 1, kn) = ubar(m, ny, kn)
+        elseif (m >= i0 .and. m <= nx) then
+          ubar(m, ny + 1, kn) = gamma2 * ubar(m, ny, kn) * umask(m, ny + 1)
         endif
       endif
       if (m >= 1 .and. m <= nx) then
@@ -472,8 +485,11 @@ contains
                  + cx * (vbar(1, m, ks) - max(cy, 0.0_rp) * g1m - min(cy, 0.0_rp) * g1c)
             vbar(0, m, kn) = ((1.0_rp - cext) * vbar(0, m, kn) + cext * vbar_west(m)) * vmask(0, m)
           endif
-        elseif (m >= 1 .and. m <= ny + 1) then
-          vbar(0, m, kn) = vbar(1, m, kn)
+        elseif (m >= j0 .and. m <= ny) then
+          ! Closed wall (CPU v2dbc, j = jstr..jendR). The end faces m = 1
+          ! (south edge) and ny+1 (north edge) read normal faces this launch
+          ! writes, so uv2dbc_corners sets them.
+          vbar(0, m, kn) = gamma2 * vbar(1, m, kn) * vmask(0, m)
         endif
       endif
       if (ee) then
@@ -498,29 +514,53 @@ contains
             vbar(nx + 1, m, kn) = ((1.0_rp - cext) * vbar(nx + 1, m, kn) + &
                  cext * vbar_east(m)) * vmask(nx + 1, m)
           endif
-        elseif (m >= 1 .and. m <= ny + 1) then
-          vbar(nx + 1, m, kn) = vbar(nx, m, kn)
+        elseif (m >= j0 .and. m <= ny) then
+          vbar(nx + 1, m, kn) = gamma2 * vbar(nx, m, kn) * vmask(nx + 1, m)
         endif
       endif
     enddo
   end subroutine uv2dbc
 
   subroutine uv2dbc_corners()
-    ! Corner values of ubar/vbar(knew) from the adjacent edge values
-    ! (the former per-routine corner kernels, one launch).
+    ! Corner cells of ubar/vbar(knew), one serial launch after uv2dbc.
+    ! (1) The end faces of a closed-wall copy (CPU u2dbc i = istr, iendR;
+    ! v2dbc j = jstr, jendR) read the normal face uv2dbc wrote at the
+    ! other edge; set here, so no thread of uv2dbc reads a cell another
+    ! thread writes. (2) Corner means only between two open edges (CPU
+    ! "#if defined OBC_SOUTH && defined OBC_WEST" etc.); next to a closed
+    ! edge the corner keeps the wall value, or is left as it is (CPU).
     integer(ip) :: n, nx, ny, kn
+    logical :: ew, ee, es, en, ow, oe, os, on
     logical :: sw, se, nw, ne
     nx = decomp%nx; ny = decomp%ny
     kn = knew
-    sw = decomp%edge_s .and. decomp%edge_w; se = decomp%edge_s .and. decomp%edge_e
-    nw = decomp%edge_n .and. decomp%edge_w; ne = decomp%edge_n .and. decomp%edge_e
-    if (.not. (sw .or. se .or. nw .or. ne)) return
+    ew = decomp%edge_w; ee = decomp%edge_e; es = decomp%edge_s; en = decomp%edge_n
+    ow = obc_west; oe = obc_east; os = obc_south; on = obc_north
+    if (.not. ((es .or. en) .and. (ew .or. ee))) return
+    sw = es .and. ew .and. os .and. ow; se = es .and. ee .and. os .and. oe
+    nw = en .and. ew .and. on .and. ow; ne = en .and. ee .and. on .and. oe
     CUF_SERIAL
     do n = 1, 1
+      if (es .and. .not. os) then
+        if (ew) ubar(1, 0, kn) = gamma2 * ubar(1, 1, kn) * umask(1, 0)
+        if (ee) ubar(nx + 1, 0, kn) = gamma2 * ubar(nx + 1, 1, kn) * umask(nx + 1, 0)
+      endif
+      if (en .and. .not. on) then
+        if (ew) ubar(1, ny + 1, kn) = gamma2 * ubar(1, ny, kn) * umask(1, ny + 1)
+        if (ee) ubar(nx + 1, ny + 1, kn) = gamma2 * ubar(nx + 1, ny, kn) * umask(nx + 1, ny + 1)
+      endif
       if (sw) ubar(1, 0, kn) = 0.5_rp * (ubar(2, 0, kn) + ubar(1, 1, kn))
       if (se) ubar(nx + 1, 0, kn) = 0.5_rp * (ubar(nx, 0, kn) + ubar(nx + 1, 1, kn))
       if (nw) ubar(1, ny + 1, kn) = 0.5_rp * (ubar(2, ny + 1, kn) + ubar(1, ny, kn))
       if (ne) ubar(nx + 1, ny + 1, kn) = 0.5_rp * (ubar(nx, ny + 1, kn) + ubar(nx + 1, ny, kn))
+      if (ew .and. .not. ow) then
+        if (es) vbar(0, 1, kn) = gamma2 * vbar(1, 1, kn) * vmask(0, 1)
+        if (en) vbar(0, ny + 1, kn) = gamma2 * vbar(1, ny + 1, kn) * vmask(0, ny + 1)
+      endif
+      if (ee .and. .not. oe) then
+        if (es) vbar(nx + 1, 1, kn) = gamma2 * vbar(nx, 1, kn) * vmask(nx + 1, 1)
+        if (en) vbar(nx + 1, ny + 1, kn) = gamma2 * vbar(nx, ny + 1, kn) * vmask(nx + 1, ny + 1)
+      endif
       if (sw) vbar(0, 1, kn) = 0.5_rp * (vbar(0, 2, kn) + vbar(1, 1, kn))
       if (se) vbar(nx + 1, 1, kn) = 0.5_rp * (vbar(nx + 1, 2, kn) + vbar(nx, 1, kn))
       if (nw) vbar(0, ny + 1, kn) = 0.5_rp * (vbar(0, ny, kn) + vbar(1, ny + 1, kn))
@@ -539,18 +579,19 @@ contains
   subroutine u3dbc()
     ! CPU u3dbc_tile: normal u by Orlanski radiation with tangential
     ! upstream term (pmask gradients) and inflow nudging; tangential u on
-    ! S/N by upstream radiation nudged to u_south/u_north; corner means.
-    integer(ip) :: i, j, k, nx, ny, nz, i0, ns, nn, nr, ilo, ihi, jlo, jhi
+    ! S/N by upstream radiation nudged to u_south/u_north; closed edges as
+    ! the CPU (normal 0, wall copy); corner means between two open edges.
+    integer(ip) :: i, j, k, nx, ny, nz, i0, ns, nn, nr, iu1
     real(rp) :: dft, dfx, dfy, cff, cx, cy, cext, dtw, ub
     real(rp) :: g0c, g0p, g1c, g1p, g0m, g1m
     logical :: sw, se, nw, ne
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     ns = nstp; nn = nnew; nr = nrhs; ub = ubind
-    ilo = lbound(u, 1); ihi = ubound(u, 1)
-    jlo = lbound(u, 2); jhi = ubound(u, 2)
     dtw = dtfwd()
     i0 = 1
     if (decomp%edge_w) i0 = 2
+    iu1 = nx                        ! CPU iendR
+    if (decomp%edge_e) iu1 = nx + 1
 
     ! Normal W/E: g0(j) = (u(edge,j) - u(edge,j-1)) * pmask(edge,j), g1
     ! likewise one face inside; the stencil uses g(j) and g(j+1).
@@ -591,7 +632,7 @@ contains
     elseif (decomp%edge_w) then
       CUF_DO2
       do k = 1, nz
-        do j = jlo, jhi
+        do j = 1, ny
           u(1, j, k, nn) = 0.0_rp
         enddo
       enddo
@@ -635,7 +676,7 @@ contains
     elseif (decomp%edge_e) then
       CUF_DO2
       do k = 1, nz
-        do j = jlo, jhi
+        do j = 1, ny
           u(nx + 1, j, k, nn) = 0.0_rp
         enddo
       enddo
@@ -669,8 +710,8 @@ contains
     elseif (decomp%edge_s) then
       CUF_DO2
       do k = 1, nz
-        do i = ilo, ihi
-          u(i, 0, k, nn) = u(i, 1, k, nn)
+        do i = 1, iu1
+          u(i, 0, k, nn) = gamma2 * u(i, 1, k, nn) * umask(i, 0)
         enddo
       enddo
     endif
@@ -702,14 +743,17 @@ contains
     elseif (decomp%edge_n) then
       CUF_DO2
       do k = 1, nz
-        do i = ilo, ihi
-          u(i, ny + 1, k, nn) = u(i, ny, k, nn)
+        do i = 1, iu1
+          u(i, ny + 1, k, nn) = gamma2 * u(i, ny, k, nn) * umask(i, ny + 1)
         enddo
       enddo
     endif
 
-    sw = decomp%edge_s .and. decomp%edge_w; se = decomp%edge_s .and. decomp%edge_e
-    nw = decomp%edge_n .and. decomp%edge_w; ne = decomp%edge_n .and. decomp%edge_e
+    ! Corner means only between two open edges (CPU u3dbc_tile).
+    sw = decomp%edge_s .and. decomp%edge_w .and. obc_south .and. obc_west
+    se = decomp%edge_s .and. decomp%edge_e .and. obc_south .and. obc_east
+    nw = decomp%edge_n .and. decomp%edge_w .and. obc_north .and. obc_west
+    ne = decomp%edge_n .and. decomp%edge_e .and. obc_north .and. obc_east
     if (.not. (sw .or. se .or. nw .or. ne)) return
     CUF_DO1
     do k = 1, nz
@@ -724,7 +768,7 @@ contains
     ! CPU v3dbc_tile: transpose of u3dbc (normal v on S/N, tangential v
     ! on W/E nudged to v_west/v_east).
     integer, parameter :: npi = 4, npk = 4
-    integer(ip) :: i, j, k, nx, ny, nz, j0, ns, nn, nr, ilo, ihi, jlo, jhi
+    integer(ip) :: i, j, k, nx, ny, nz, j0, ns, nn, nr, jv1
     integer(ip) :: ip0, kk, ii
     real(rp) :: dft, dfx, dfy, cff, cx, cy, cext, dtw, ub
     real(rp) :: g0c, g0p, g1c, g1p, g0m, g1m
@@ -733,11 +777,11 @@ contains
     logical :: sw, se, nw, ne, probe_n
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     ns = nstp; nn = nnew; nr = nrhs; ub = ubind
-    ilo = lbound(v, 1); ihi = ubound(v, 1)
-    jlo = lbound(v, 2); jhi = ubound(v, 2)
     dtw = dtfwd()
     j0 = 1
     if (decomp%edge_s) j0 = 2
+    jv1 = ny                        ! CPU jendR
+    if (decomp%edge_n) jv1 = ny + 1
 
     if (decomp%edge_s .and. obc_south) then
       CUF_DO2
@@ -776,7 +820,7 @@ contains
     elseif (decomp%edge_s) then
       CUF_DO2
       do k = 1, nz
-        do i = ilo, ihi
+        do i = 1, nx
           v(i, 1, k, nn) = 0.0_rp
         enddo
       enddo
@@ -880,7 +924,7 @@ contains
     elseif (decomp%edge_n) then
       CUF_DO2
       do k = 1, nz
-        do i = ilo, ihi
+        do i = 1, nx
           v(i, ny + 1, k, nn) = 0.0_rp
         enddo
       enddo
@@ -912,8 +956,8 @@ contains
     elseif (decomp%edge_w) then
       CUF_DO2
       do k = 1, nz
-        do j = jlo, jhi
-          v(0, j, k, nn) = v(1, j, k, nn)
+        do j = 1, jv1
+          v(0, j, k, nn) = gamma2 * v(1, j, k, nn) * vmask(0, j)
         enddo
       enddo
     endif
@@ -945,14 +989,17 @@ contains
     elseif (decomp%edge_e) then
       CUF_DO2
       do k = 1, nz
-        do j = jlo, jhi
-          v(nx + 1, j, k, nn) = v(nx, j, k, nn)
+        do j = 1, jv1
+          v(nx + 1, j, k, nn) = gamma2 * v(nx, j, k, nn) * vmask(nx + 1, j)
         enddo
       enddo
     endif
 
-    sw = decomp%edge_s .and. decomp%edge_w; se = decomp%edge_s .and. decomp%edge_e
-    nw = decomp%edge_n .and. decomp%edge_w; ne = decomp%edge_n .and. decomp%edge_e
+    ! Corner means only between two open edges (CPU v3dbc_tile).
+    sw = decomp%edge_s .and. decomp%edge_w .and. obc_south .and. obc_west
+    se = decomp%edge_s .and. decomp%edge_e .and. obc_south .and. obc_east
+    nw = decomp%edge_n .and. decomp%edge_w .and. obc_north .and. obc_west
+    ne = decomp%edge_n .and. decomp%edge_e .and. obc_north .and. obc_east
     if (.not. (sw .or. se .or. nw .or. ne)) return
     CUF_DO1
     do k = 1, nz
@@ -970,14 +1017,12 @@ contains
     ! g0(j) = (t(edge,j) - t(edge,j-1)) * mask(edge,j), g1 one row inside;
     ! the stencil uses g(j) and g(j+1).
     integer(ip), intent(in) :: itrc
-    integer(ip) :: i, j, k, nx, ny, nz, ns, nn, nr, it, ilo, ihi, jlo, jhi
+    integer(ip) :: i, j, k, nx, ny, nz, ns, nn, nr, it
     real(rp) :: cx, cy, cext, dtw, cff
     real(rp) :: g0c, g0p, g1c, g1p
     logical :: sw, se, nw, ne
     nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
     ns = nstp; nn = nnew; nr = nrhs; it = itrc
-    ilo = lbound(t, 1); ihi = ubound(t, 1)
-    jlo = lbound(t, 2); jhi = ubound(t, 2)
     dtw = dtfwd()
 
     if (decomp%edge_w) then
@@ -1004,10 +1049,11 @@ contains
           enddo
         enddo
       else
+        ! Closed (CPU t3dbc_tile, j = jstr..jend): gradient, masked.
         CUF_DO2
         do k = 1, nz
-          do j = jlo, jhi
-            t(0, j, k, nn, it) = t(1, j, k, nn, it)
+          do j = 1, ny
+            t(0, j, k, nn, it) = t(1, j, k, nn, it) * rmask(0, j)
           enddo
         enddo
       endif
@@ -1039,8 +1085,8 @@ contains
       else
         CUF_DO2
         do k = 1, nz
-          do j = jlo, jhi
-            t(nx + 1, j, k, nn, it) = t(nx, j, k, nn, it)
+          do j = 1, ny
+            t(nx + 1, j, k, nn, it) = t(nx, j, k, nn, it) * rmask(nx + 1, j)
           enddo
         enddo
       endif
@@ -1070,10 +1116,11 @@ contains
           enddo
         enddo
       else
+        ! Closed (CPU, i = istr..iend); the corners are set below.
         CUF_DO2
         do k = 1, nz
-          do i = ilo, ihi
-            t(i, 0, k, nn, it) = t(i, 1, k, nn, it)
+          do i = 1, nx
+            t(i, 0, k, nn, it) = t(i, 1, k, nn, it) * rmask(i, 0)
           enddo
         enddo
       endif
@@ -1105,14 +1152,15 @@ contains
       else
         CUF_DO2
         do k = 1, nz
-          do i = ilo, ihi
-            t(i, ny + 1, k, nn, it) = t(i, ny, k, nn, it)
+          do i = 1, nx
+            t(i, ny + 1, k, nn, it) = t(i, ny, k, nn, it) * rmask(i, ny + 1)
           enddo
         enddo
       endif
     endif
 
-    ! Corners: mask-weighted mean of the two edge neighbours (CPU corner rule).
+    ! Corners: mask-weighted mean of the two edge neighbours (CPU corner rule,
+    ! applied at every physical corner, open or closed).
     sw = decomp%edge_s .and. decomp%edge_w; se = decomp%edge_s .and. decomp%edge_e
     nw = decomp%edge_n .and. decomp%edge_w; ne = decomp%edge_n .and. decomp%edge_e
     if (.not. (sw .or. se .or. nw .or. ne)) return
