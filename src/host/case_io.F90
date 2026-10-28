@@ -582,6 +582,7 @@ contains
     call pad_physical_halo()
     call fill_static_halos()
     call setup_metrics()
+    call fill_metric_halos()
     call build_wet_list()
     call build_dry_map()
     ! The passives are stored over wet columns (and the boundary rows) only,
@@ -1000,12 +1001,12 @@ contains
   end subroutine mask_loaded_velocities
 
   subroutine fill_masked_velocity_halos()
-    ! Refill the tile halos of what mask_loaded_velocities changed. It masks the
-    ! halos too, but umask/vmask are not defined on a tile's outermost halo
-    ! column/row (geom sets them from is+1/js+1; the default there is 1), so a
-    ! land face there kept the file's velocity: on CCS the Nass river faces at
+    ! Refill the tile halos of what mask_loaded_velocities changed. Before
+    ! fill_metric_halos, umask/vmask were 1 on a tile's outermost halo column/row,
+    ! so a land face there kept the file's velocity: on CCS the Nass river faces at
     ! the 2x4 tile cut kept the CPU's river velocity while their owner zeroed
-    ! it, and the predictor's UP3 stencil read the stale copy.
+    ! it, and the predictor's UP3 stencil read the stale copy. With the masks
+    ! filled this refill changes nothing; it is kept as a guard.
     integer(ip) :: n
     call halo_fill_2d_s(ubar, STAGGER_U, 1_ip)
     call halo_fill_2d_s(vbar, STAGGER_V, 1_ip)
@@ -1249,6 +1250,22 @@ contains
     call halo_fill_2d(latr, STAGGER_RHO)
     call halo_fill_2d(angler, STAGGER_RHO)
   end subroutine fill_static_halos
+
+  subroutine fill_metric_halos()
+    ! setup_metrics sets the u-point fields from is+1 and the v-point fields from
+    ! js+1, so on a tile's outermost halo column (u) or row (v) they kept their
+    ! defaults (masks 1). Take them from the neighbor tile, as for the grid fields,
+    ! before anything reads them. The p-point fields (pmask, dm_p, dn_p) have the
+    ! same gap, but no kernel reads them on the outermost halo. No-op on a single tile.
+    call halo_fill_2d(umask, STAGGER_U)
+    call halo_fill_2d(dm_u, STAGGER_U)
+    call halo_fill_2d(dn_u, STAGGER_U)
+    call halo_fill_2d(pmon_u, STAGGER_U)
+    call halo_fill_2d(vmask, STAGGER_V)
+    call halo_fill_2d(dm_v, STAGGER_V)
+    call halo_fill_2d(dn_v, STAGGER_V)
+    call halo_fill_2d(pnom_v, STAGGER_V)
+  end subroutine fill_metric_halos
 
   subroutine fill_loaded_halos()
     ! Tile halos of every state field read from the initial/restart file
