@@ -640,6 +640,8 @@ contains
     call wall_stamp('boundary init')
     call init_tides()
     call wall_stamp('tide init')
+    ! the closed sides are known from here on (obc_*)
+    call zero_closed_wall_velocities()
     ! the sponge follows the open sides (obc_*), known from here on
     call apply_sponge()
     call build_mix_map()
@@ -944,6 +946,82 @@ contains
       nxi = int(decomp%nx); neta = int(decomp%ny)
     endif
   end subroutine infer_layout
+
+  subroutine zero_closed_wall_velocities()
+    ! CPU get_init (get_init_mod.F90:695-730): on a closed, non-periodic side the
+    ! normal velocity on the boundary face is set to zero, for an initial file
+    ! that was not made for a closed side: u and ubar on the west (i = 1) and
+    ! east (i = nx+1) faces, v and vbar on the south (j = 1) and north (j = ny+1)
+    ! faces. Here after init_bry/init_tides, which set obc_*, so every slot the
+    ! load and copy_initial_slots filled is zeroed, and the cold-start barotropic
+    ! fluxes are recomputed. A closed side whose boundary faces are land (CCS
+    ! east) is already zero.
+    ! The zeroing is per tile; the halo refill after it is collective, so every
+    ! rank takes part whenever the domain has a closed side.
+    integer(ip) :: j, k, m, nx, ny, nz, is, ie, js, je
+    logical :: cw, ce, cs, cn, zw, ze, zs, zn
+    nx = decomp%nx; ny = decomp%ny; nz = decomp%nz
+    is = decomp%is; ie = decomp%ie; js = decomp%js; je = decomp%je
+    cw = .not. obc_west .and. .not. case_periodic_x
+    ce = .not. obc_east .and. .not. case_periodic_x
+    cs = .not. obc_south .and. .not. case_periodic_y
+    cn = .not. obc_north .and. .not. case_periodic_y
+    if (.not. (cw .or. ce .or. cs .or. cn)) return
+    zw = decomp%edge_w .and. cw; ze = decomp%edge_e .and. ce
+    zs = decomp%edge_s .and. cs; zn = decomp%edge_n .and. cn
+    if (zw .or. ze) then
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do k = 1, nz
+        do j = js, je
+          if (zw) then
+            u(1, j, k, 1) = 0.0_rp; u(1, j, k, 2) = 0.0_rp
+          endif
+          if (ze) then
+            u(nx + 1, j, k, 1) = 0.0_rp; u(nx + 1, j, k, 2) = 0.0_rp
+          endif
+        enddo
+      enddo
+#ifdef USE_CUDA
+      !$cuf kernel do(1) <<<*,*>>>
+#endif
+      do j = js, je
+        do m = 1, 4
+          if (zw) ubar(1, j, m) = 0.0_rp
+          if (ze) ubar(nx + 1, j, m) = 0.0_rp
+        enddo
+      enddo
+    endif
+    if (zs .or. zn) then
+#ifdef USE_CUDA
+      !$cuf kernel do(2) <<<*,*>>>
+#endif
+      do k = 1, nz
+        do j = is, ie
+          if (zs) then
+            v(j, 1, k, 1) = 0.0_rp; v(j, 1, k, 2) = 0.0_rp
+          endif
+          if (zn) then
+            v(j, ny + 1, k, 1) = 0.0_rp; v(j, ny + 1, k, 2) = 0.0_rp
+          endif
+        enddo
+      enddo
+#ifdef USE_CUDA
+      !$cuf kernel do(1) <<<*,*>>>
+#endif
+      do j = is, ie
+        do m = 1, 4
+          if (zs) vbar(j, 1, m) = 0.0_rp
+          if (zn) vbar(j, ny + 1, m) = 0.0_rp
+        enddo
+      enddo
+    endif
+    call fill_masked_velocity_halos()
+    if (.not. case_exact_restart) call init_barotropic_fluxes()
+    if (comm_rank() == 0) write(*,'(a,4l2)') 'closed sides W E S N: boundary-face velocity set to 0:', &
+         cw, ce, cs, cn
+  end subroutine zero_closed_wall_velocities
 
   subroutine init_barotropic_fluxes()
     ! CPU set_depth with iic == 0, which main.F90 calls after get_init on
