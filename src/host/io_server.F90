@@ -672,13 +672,17 @@ contains
       endif
     enddo
     nr = pend(idx)%nvars
+    ! the open command and the times are filled once, before any send: every writer's
+    ! Isend reads the same buffers, which must not change until the sends complete
+    pend(idx)%ohdr = 0
+    pend(idx)%ohdr(1) = CMD_OPEN
+    pend(idx)%ohdr(2) = pend(idx)%fkind
+    pend(idx)%tmsg = (/real(pend(idx)%time, 8), real(pend(idx)%tavg(1), 8), real(pend(idx)%tavg(2), 8), &
+                       real(pend(idx)%tforce, 8)/)
     ! every writer of the group gets the (optional) open command and the header
     do w = 0, wgroup_size - 1
       dest = base + w
       if (len_trim(pend(idx)%open_path) > 0) then
-        pend(idx)%ohdr = 0
-        pend(idx)%ohdr(1) = CMD_OPEN
-        pend(idx)%ohdr(2) = pend(idx)%fkind
         nr = nr + 1
         call MPI_Isend(pend(idx)%ohdr, NHDR, MPI_INTEGER, dest, TAG_CMD, comm, pend(idx)%reqs(nr), ierr)
         nr = nr + 1
@@ -689,8 +693,6 @@ contains
       nr = nr + 1
       call MPI_Isend(pend(idx)%namebuf, NAMELEN * MAXV, MPI_CHARACTER, dest, TAG_STR, comm, pend(idx)%reqs(nr), ierr)
       nr = nr + 1
-      pend(idx)%tmsg = (/real(pend(idx)%time, 8), real(pend(idx)%tavg(1), 8), real(pend(idx)%tavg(2), 8), &
-                         real(pend(idx)%tforce, 8)/)
       call MPI_Isend(pend(idx)%tmsg, 4, MPI_DOUBLE_PRECISION, dest, TAG_TIME, comm, pend(idx)%reqs(nr), ierr)
     enddo
     pend(idx)%nreq = nr
