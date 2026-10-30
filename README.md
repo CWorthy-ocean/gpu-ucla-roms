@@ -27,7 +27,7 @@ The repository is private for now; ask for access. MARBL is a git
 submodule:
 
 ```
-git clone --recurse-submodules https://github.com/sdbachman/gpu-ucla-roms.git roms_gpu
+git clone --recurse-submodules https://github.com/CWorthy-ocean/gpu-ucla-roms.git roms_gpu
 cd roms_gpu
 # or, in an existing clone:  git submodule update --init
 ```
