@@ -6,40 +6,7 @@ step follows CPU UCLA ROMS routine for routine, and the model reads the same
 namelists and input files.
 
 **Status:** beta (v0.1.1-beta, October 2026), checked against CPU UCLA ROMS
-0.11.0 (see Validation); MARBL_GPU_PORT.md has the validation history.
-
-## Validation
-
-The GPU and CPU models cannot agree bit for bit, because their compilers round
-differently: the CPU build uses fused multiply-adds and fast math, the GPU build
-does not. The checks therefore measure GPU minus CPU against the CPU model's own
-sensitivity to round-off. Two write-ups give the details.
-
-**Round-off parity**
-([write-up](https://claude.ai/artifact/L9DhKx8bF8GYHC5nmihigA?sk=S49zsDcg3FBMrz6KxxGe_Q)). On the CCS
-4 km domain (rivers, a CDR release, a closed side), GPU minus CPU after one
-step is about the same size as the difference between two CPU builds that
-differ only in floating-point mode, everywhere in the domain. It stays within
-a factor of 3 of that yardstick at every stage of a time step and over the
-first eight steps.
-
-![Surface-temperature difference after one time step on CCS 4 km: GPU minus CPU beside CPU strict minus CPU standard floating point. Both maps show the same speckle at 1e-15 to 1e-12 degC.](docs/validation_roundoff.png)
-
-**CDR ensemble**
-([write-up](https://claude.ai/artifact/WeN45y6JaCR9RrBV6z7BL6?sk=HILCkrP4cspW3vROunPr1Q)). 20 CPU
-and 20 GPU runs of a 120-day alkalinity release from ten coastal sites on
-CCS 4 km, each from an initial state perturbed by 1e-6 degC. The GPU's mean
-CO2 uptake efficiency is shown to be within 1% of the CPU's in 31 of 33
-cases (each site and all sites together, at three times); for all sites
-together on the last day the two differ by 0.15%. Rank, distribution and map
-tests find no difference between the two codes.
-
-![Depth-integrated alkalinity plumes on 30 April from four of the ten sites, for a CPU run and a GPU run from the same initial state and a CPU run started 1e-6 degC away. The three plumes at each site share their large eddies and differ in detail.](docs/validation_plumes.png)
-
-The plumes on 30 April, after 88 days of release: CPU and GPU runs from the
-same initial state (top two rows) and a CPU run started 1e-6 degC away (bottom
-row). The GPU run differs from the CPU run by no more than a second CPU run
-does.
+0.11.0 (see Validation below); MARBL_GPU_PORT.md has the validation history.
 
 ## Getting started
 
@@ -145,6 +112,39 @@ not included; its README lists the files.
 - UPSTREAM_TS horizontal (`UPSTREAM_TS_LAND_CURV` always on)
 - LMD94 interior Ri + KPP/BKPP/nonlocal (SMOOTH_RIG, INT_AT_RHO_POINTS, SMOOTH_HBL, Jwt=1)
 - no NHMG, no isoneutral, no splines, no LMD_DDMIX / LMD_CONVEC
+
+## Validation
+
+The GPU and CPU models cannot agree bit for bit, because their compilers round
+differently: the CPU build uses fused multiply-adds and fast math, the GPU build
+does not. The checks therefore measure GPU minus CPU against the CPU model's own
+sensitivity to round-off. Two write-ups give the details.
+
+**Round-off parity**
+([write-up](https://claude.ai/artifact/L9DhKx8bF8GYHC5nmihigA?sk=S49zsDcg3FBMrz6KxxGe_Q)). On the CCS
+4 km domain (rivers, a CDR release, a closed side), GPU minus CPU after one
+step is about the same size as the difference between two CPU builds that
+differ only in floating-point mode, everywhere in the domain. It stays within
+a factor of 3 of that yardstick at every stage of a time step and over the
+first eight steps.
+
+![Surface-temperature difference after one time step on CCS 4 km: GPU minus CPU beside CPU strict minus CPU standard floating point. Both maps show the same speckle at 1e-15 to 1e-12 degC.](docs/validation_roundoff.png)
+
+**CDR ensemble**
+([write-up](https://claude.ai/artifact/WeN45y6JaCR9RrBV6z7BL6?sk=HILCkrP4cspW3vROunPr1Q)). 20 CPU
+and 20 GPU runs of a 120-day alkalinity release from ten coastal sites on
+CCS 4 km, each from an initial state perturbed by 1e-6 degC. The GPU's mean
+CO2 uptake efficiency is shown to be within 1% of the CPU's in 31 of 33
+cases (each site and all sites together, at three times); for all sites
+together on the last day the two differ by 0.15%. Rank, distribution and map
+tests find no difference between the two codes.
+
+![Depth-integrated alkalinity plumes on 30 April from four of the ten sites, for a CPU run and a GPU run from the same initial state and a CPU run started 1e-6 degC away. The three plumes at each site share their large eddies and differ in detail.](docs/validation_plumes.png)
+
+The plumes on 30 April, after 88 days of release: CPU and GPU runs from the
+same initial state (top two rows) and a CPU run started 1e-6 degC away (bottom
+row). The GPU run differs from the CPU run by no more than a second CPU run
+does.
 
 ## License
 
