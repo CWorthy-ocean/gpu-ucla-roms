@@ -23,8 +23,7 @@ namelists and input files.
 
 ### Get the code
 
-The repository is private for now; ask for access. MARBL is a git
-submodule:
+MARBL is a git submodule:
 
 ```
 git clone --recurse-submodules https://github.com/CWorthy-ocean/gpu-ucla-roms.git roms_gpu
