@@ -6,53 +6,40 @@ step follows CPU UCLA ROMS routine for routine, and the model reads the same
 namelists and input files.
 
 **Status:** beta (v0.1.1-beta, October 2026), checked against CPU UCLA ROMS
-0.11.0 on the cases below; MARBL_GPU_PORT.md has the validation history.
+0.11.0 (see Validation); MARBL_GPU_PORT.md has the validation history.
 
-- **On the GPU:** the whole baroclinic and barotropic time step (dynamics,
-  KPP mixing, tracer advection and mixing, tides, bulk surface forcing,
-  rivers, open boundaries), MARBL's surface fluxes and interior ecosystem, generic
-  passive tracers (with or without MARBL), the CDR_LITE tracers (transport, inputs, air-sea gas
-  exchange with file or online carbonate sensitivities, surface fluxes),
-  every CDR forcing mode (cdr_frc point and Gaussian releases of tracer or
-  of water with cdr_volume, depth profiles, 3-D forcing), and the CDR
-  outputs (cdr, cdr_lite, cdr_gas_exch, and the upscaling transects with
-  their open-boundary flux term). Output: history, restarts, averaged
-  history and BGC averages, the true vertical velocity w, child-grid
-  boundary files (extract_data), and the random output, which on the GPU
-  writes the surface field of every generic passive tracer. Model fields stay in GPU memory for the
-  whole run.
-- **Many GPUs:** one MPI rank per GPU, tiles balanced by ocean cells and
-  memory, halo exchanges GPU to GPU with a CUDA-aware MPI. Separate writer
-  ranks write history and restart files while the GPUs keep stepping.
-  Restart files hold two records, so restarts are exact.
-- **Checked:** step by step, GPU minus CPU is at most one float32 unit in
-  every physics field and MARBL tracer (Iceland0 with and without rivers,
-  MiniPac). After 3 days it is within the CPU model's own sensitivity to a
-  1e-6 degC initial temperature perturbation, apart from local events (one
-  column, open-boundary inflow switches) that do not recur from a common
-  state. On CCS 4 km (rivers, a CDR release, a closed side), GPU minus CPU
-  stays within 0.2-3x of the CPU's own round-off (strict minus default
-  floating point) in every region over the first 8 steps, and over 120
-  days it is about as large as the CPU's difference from its own perturbed
-  twins. Every optimization was checked to reproduce the previous version
-  bit for bit.
-- **Speed (Derecho):** Pacific domain with MARBL, 2 nodes of each kind: 21x
-  faster per time step than CPU ROMS-MARBL (8 A100s vs 256 AMD cores).
-- **Closed sides:** a side is closed (the CPU's undefined OBC_<side>) when
-  the boundary files hold no data for it. Boundary tides with no boundary
-  files at all open every side. Closed walls are free-slip (gamma2 = 1);
-  any other gamma2 stops the run.
-- **Rivers:** the river records must cover the run's dates (climatologies
-  are not cycled; the run stops otherwise). A large river into one small
-  cell can drive the salinity there below zero, and MARBL's carbonate
-  solver then stops the run, as on the CPU: spread such a river over
-  several cells. With v0.1.0-beta, results near a river mouth on a tile
-  edge depended on the tile layout; fixed in v0.1.1-beta.
-- **Not yet on the GPU:** pipes (point sources), monthly CDR
-  averages, averaged BGC diagnostics (_bgc_dia_avg), no-slip walls and
-  monthly restarts. A
-  namelist that switches on a feature the GPU lacks stops the run at
-  start-up with a list of the switches.
+## Validation
+
+The GPU and CPU models cannot agree bit for bit, because their compilers round
+differently: the CPU build uses fused multiply-adds and fast math, the GPU build
+does not. The checks therefore measure GPU minus CPU against the CPU model's own
+sensitivity to round-off. Two write-ups give the details.
+
+**Round-off parity**
+([write-up](https://claude.ai/artifact/L9DhKx8bF8GYHC5nmihigA?sk=S49zsDcg3FBMrz6KxxGe_Q)). On the CCS
+4 km domain (rivers, a CDR release, a closed side), GPU minus CPU after one
+step is about the same size as the difference between two CPU builds that
+differ only in floating-point mode, everywhere in the domain. It stays within
+a factor of 3 of that yardstick at every stage of a time step and over the
+first eight steps.
+
+![Surface-temperature difference after one time step on CCS 4 km: GPU minus CPU beside CPU strict minus CPU standard floating point. Both maps show the same speckle at 1e-15 to 1e-12 degC.](docs/validation_roundoff.png)
+
+**CDR ensemble**
+([write-up](https://claude.ai/artifact/WeN45y6JaCR9RrBV6z7BL6?sk=HILCkrP4cspW3vROunPr1Q)). 20 CPU
+and 20 GPU runs of a 120-day alkalinity release from ten coastal sites on
+CCS 4 km, each from an initial state perturbed by 1e-6 degC. The GPU's mean
+CO2 uptake efficiency is shown to be within 1% of the CPU's in 31 of 33
+cases (each site and all sites together, at three times); for all sites
+together on the last day the two differ by 0.15%. Rank, distribution and map
+tests find no difference between the two codes.
+
+![Depth-integrated alkalinity plumes on 30 April from four of the ten sites, for a CPU run and a GPU run from the same initial state and a CPU run started 1e-6 degC away. The three plumes at each site share their large eddies and differ in detail.](docs/validation_plumes.png)
+
+The plumes on 30 April, after 88 days of release: CPU and GPU runs from the
+same initial state (top two rows) and a CPU run started 1e-6 degC away (bottom
+row). The GPU run differs from the CPU run by no more than a second CPU run
+does.
 
 ## Getting started
 
@@ -149,40 +136,6 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
 script): 3 days of MiniPac with MARBL on one 4-GPU node. The input data are
 not included; its README lists the files.
 
-### Check the results
-
-- **Same GPU and compiler as a reference run:** expect bit-for-bit
-  agreement. `tools/cmp_nc.py A.nc B.nc [--last]` compares two files variable
-  by variable.
-- **New hardware or compiler:** compare with CPU ROMS against the CPU model's
-  own noise floor: run CPU ROMS twice, once with the initial temperature
-  perturbed by 1e-6 degC, and use `tools/marbl_noise_floor_eval.py` (MARBL
-  tracers and diagnostics) or `tools/noise_floor_eval.py` (physics). GPU
-  minus CPU should be no larger than perturbed minus unperturbed CPU.
-- **Tools:** scripts that need file locations have a settings block at the
-  top; most can also be set with environment variables (`ROMS_GPU_CASES`,
-  `ROMS_GPU_OUTPUT`, `ROMS_GPU_GRID`, `ROMS_GPU_PREFIX`).
-- **Tests:** `tests/test_marbl_sflux.F90` and `tests/test_marbl_interior.F90`
-  check the GPU MARBL kernels column by column against unchanged MARBL
-  (`make build_gpu/test_marbl_sflux build_gpu/test_marbl_interior` with the
-  same flags as `make gpu`). The other tests exercise individual routines on
-  the CPU backend (`make tests`, gfortran); they date from the single-GPU
-  development phase and have not been kept up to date.
-
-## Layout
-
-```
-src/shared    kinds, decomposition, MPI layer, formulas (host + device), timers
-src/device    GPU state and kernels: halos, geometry, step2d, prsgrd, advection,
-              KPP, step3d, tracers, passive tracers, bulk forcing, MARBL kernels
-src/host      main, time loop (step_driver), namelist and NetCDF I/O, forcing
-              read-ahead, output writer ranks (io_server), MARBL driver
-tests         unit tests and the MARBL column tests
-tools         launcher, rank layout, NUMA binding, comparison and profiling scripts
-examples      a small runnable case (MiniPac with MARBL)
-MARBL         MARBL submodule
-```
-
 ## Numerics
 
 - SM09 s-coordinate, Shchepetkin PGF
@@ -192,24 +145,6 @@ MARBL         MARBL submodule
 - UPSTREAM_TS horizontal (`UPSTREAM_TS_LAND_CURV` always on)
 - LMD94 interior Ri + KPP/BKPP/nonlocal (SMOOTH_RIG, INT_AT_RHO_POINTS, SMOOTH_HBL, Jwt=1)
 - no NHMG, no isoneutral, no splines, no LMD_DDMIX / LMD_CONVEC
-
-## MARBL
-
-MARBL (git submodule `MARBL`, CWorthy-ocean/MARBL @ 6e6b2f7 = marbl0.45.0,
-the version the CPU model uses) runs on the GPU: MARBL's own sources are
-compiled as host code for settings and initialisation
-(`src/host/marbl_host.F90`), and the surface flux and interior tendency paths
-are CUDA Fortran kernels (`src/device/marbl_sflux.F90`,
-`src/device/marbl_interior.F90`), driven from `src/host/marbl_step.F90`. The
-32 MARBL tracers lead the passive tracers in MARBL mode, followed by the
-generic passive tracers (`nt_passive`) and the CDR_LITE tracers. Design, validation
-and lessons: `MARBL_GPU_PORT.md`.
-
-## Development builds
-
-`make` builds the CPU backend (`gfortran`, `./build/roms_gpu`) and the unit
-tests, from the single-GPU development phase; `./build/roms_gpu geom | baro |
-prsgrd | advect | step | lmd` run single components on an ideal box.
 
 ## License
 
