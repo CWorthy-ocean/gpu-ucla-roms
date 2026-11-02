@@ -1,12 +1,42 @@
-# roms_gpu
+# roms_gpu: UCLA ROMS on NVIDIA GPUs
 
-A GPU version of the UCLA ROMS ocean model coupled to the MARBL
-biogeochemistry library, written in CUDA Fortran for NVIDIA GPUs. The time
-step follows CPU UCLA ROMS routine for routine, and the model reads the same
-namelists and input files.
+roms_gpu is a GPU version of the [UCLA ROMS](https://github.com/CWorthy-ocean/ucla-roms)
+regional ocean model, coupled to the [MARBL](https://github.com/marbl-ecosys/MARBL)
+ocean biogeochemistry library and to the CDR tracers that UCLA ROMS uses to
+model marine carbon dioxide removal, such as ocean alkalinity enhancement. It
+is written in CUDA Fortran for NVIDIA GPUs. Each time step follows the CPU
+model routine for routine, and the GPU model reads the same namelists and
+input files as UCLA ROMS 0.11.0.
 
-**Status:** beta (v0.1.1-beta, October 2026), checked against CPU UCLA ROMS
-0.11.0 (see Validation below); MARBL_GPU_PORT.md has the validation history.
+> **Experimental.** This is a beta release (v0.1.1-beta, October 2026). It
+> has been checked carefully against the CPU model (see Validation below),
+> but it has had few users so far. It is not yet part of
+> [C-Star](https://github.com/CWorthy-ocean/C-Star), so it cannot yet be
+> set up from a C-Star blueprint or run from a C-Star workplan; it is built
+> and run by hand, as described below. C-Star support is planned for late
+> 2026.
+
+## How this code was written
+
+Nearly all of the code and documentation in this repository was written by
+Claude Code, Anthropic's AI coding assistant, in October 2026, working under
+the direction of Scott Bachman ([C]Worthy). Scott set the goals, the design
+choices and the tests each stage had to pass, and checked the results
+against CPU UCLA ROMS; he did not review every line of code. Confidence in
+the code therefore rests on the validation below: the GPU model is compared
+with the CPU model field by field and step by step, and in long runs against
+the CPU model's own run-to-run variability. Please report anything that
+looks wrong as an issue.
+
+## What it covers
+
+The GPU model runs the full ROMS time step (dynamics, vertical mixing,
+tracer advection and mixing, tides, surface forcing, rivers and open
+boundaries), MARBL, passive tracers, and the CDR_LITE alkalinity and DIC
+tracers with all CDR release types, on one GPU or on many GPUs across
+nodes. It writes the same output files as the CPU model. A namelist that
+switches on a CPU feature the GPU model does not have yet stops the run at
+start-up and lists the switches.
 
 ## Getting started
 
@@ -33,7 +63,7 @@ cd roms_gpu
 
 ### Build
 
-`make gpu` compiles MARBL's Fortran from the submodule together with the
+`make gpu` compiles MARBL's Fortran source from the submodule together with the
 model and writes `build_gpu/roms_gpu_cuda`. The general form:
 
 ```
@@ -47,12 +77,12 @@ make gpu FC_GPU=nvfortran \
   H100 and H200, `cc100` for B200.
 - `-DPASSIVE_FP64` stores the MARBL and passive tracers in double
   precision. This is the validated configuration for MARBL runs: with MARBL,
-  single precision moves the carbonate saturation depths far outside the
-  CPU noise floor.
+  single precision moves the carbonate saturation depths by far more than
+  the CPU model's own run-to-run variability.
 - Without the flag, the passive tracers are stored in float32. This suits
   CDR_LITE runs without MARBL:
   - it halves the tracer memory;
-  - over 325 days on Pac, it changed the domain-integrated CDR DIC uptake
+  - over 325 days on a Pacific domain, it changed the domain-integrated CDR DIC uptake
     by at most 2e-6 relative (MARBL_GPU_PORT.md);
   - the CDR_LITE output fields are then written as float; with the flag
     they are double, as on the CPU.
@@ -99,51 +129,97 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   relative to the namelist file.
 
 `examples/minipac/` is a complete small case (namelist, MARBL settings, PBS
-script): 3 days of MiniPac with MARBL on one 4-GPU node. The input data are
+script): 3 days of MiniPac, a small coarse Pacific test domain, with MARBL on one 4-GPU node. The input data are
 not included; its README lists the files.
 
 ## Numerics
 
-- SM09 s-coordinate, Shchepetkin PGF
-- LF-AM3 predictor / corrector
-- Split-explicit FB AB3-AM4 + `weight(1:2,1:nfast)`
-- Thickness-aware C4 predictor / U3 corrector
-- UPSTREAM_TS horizontal (`UPSTREAM_TS_LAND_CURV` always on)
-- LMD94 interior Ri + KPP/BKPP/nonlocal (SMOOTH_RIG, INT_AT_RHO_POINTS, SMOOTH_HBL, Jwt=1)
-- no NHMG, no isoneutral, no splines, no LMD_DDMIX / LMD_CONVEC
+The GPU model implements one configuration of UCLA ROMS, the one in common
+use with MARBL; other CPU options are not available. In ROMS terms:
+
+- SM09 s-coordinate, Shchepetkin pressure-gradient scheme
+- LF-AM3 predictor / corrector time stepping
+- Split-explicit barotropic mode (FB AB3-AM4) with the `weight(1:2,1:nfast)` filter
+- Thickness-aware C4 predictor / U3 corrector vertical advection
+- UPSTREAM_TS horizontal tracer advection (`UPSTREAM_TS_LAND_CURV` always on)
+- LMD94 interior mixing and KPP surface and bottom boundary layers (SMOOTH_RIG, INT_AT_RHO_POINTS, SMOOTH_HBL, Jwt=1)
+- Not available: NHMG, isoneutral mixing, splines, LMD_DDMIX, LMD_CONVEC
 
 ## Validation
 
-The GPU and CPU models cannot agree bit for bit, because their compilers round
-differently: the CPU build uses fused multiply-adds and fast math, the GPU build
-does not. The checks therefore measure GPU minus CPU against the CPU model's own
-sensitivity to round-off. Two write-ups give the details.
+A GPU model and a CPU model cannot produce bit-for-bit identical results: the
+compilers round arithmetic differently (the CPU build, for example, fuses
+multiplies and adds into one rounding step), so the two models differ in the
+last digit from the first time step. The question is whether the differences
+are only rounding, or whether the GPU model solves slightly different
+equations. All the tests below were run on the California Current System
+(CCS) at 4 km resolution, 672 x 1344 x 100 grid cells, with rivers, a closed
+boundary and coastal alkalinity releases, against UCLA ROMS 0.11.0.
 
-**Round-off parity**
-([write-up](https://claude.ai/artifact/L9DhKx8bF8GYHC5nmihigA?sk=S49zsDcg3FBMrz6KxxGe_Q)). On the CCS
-4 km domain (rivers, a CDR release, a closed side), GPU minus CPU after one
-step is about the same size as the difference between two CPU builds that
-differ only in floating-point mode, everywhere in the domain. It stays within
-a factor of 3 of that yardstick at every stage of a time step and over the
-first eight steps.
+**After one time step the differences are rounding.** As a yardstick, we
+built the CPU model twice, once with its usual fast floating-point settings
+and once with strict ones; the two CPU builds differ only by rounding. GPU
+minus CPU is the same size as that difference, everywhere in the domain
+(maps below). It stays within a factor of 3 of the yardstick over the first eight
+steps, and at every stage inside the time step (checked on a smaller
+Iceland domain), in physics, MARBL and
+the CDR tracers, including near river mouths and the alkalinity releases. A
+line-by-line comparison of the two source codes found the same discrete
+equations; the few small differences it found were fixed in v0.1.1-beta.
 
-![Surface-temperature difference after one time step on CCS 4 km: GPU minus CPU beside CPU strict minus CPU standard floating point. Both maps show the same speckle at 1e-15 to 1e-12 degC.](docs/validation_roundoff.png)
+![Two maps of the CCS domain coloured by the size of the surface-temperature difference after one 450-second time step: GPU minus CPU (left) and CPU strict minus CPU standard floating point (right). Both show the same speckle at 1e-15 to 1e-12 degC.](docs/validation_roundoff.png)
 
-**CDR ensemble**
-([write-up](https://claude.ai/artifact/WeN45y6JaCR9RrBV6z7BL6?sk=HILCkrP4cspW3vROunPr1Q)). 20 CPU
-and 20 GPU runs of a 120-day alkalinity release from ten coastal sites on
-CCS 4 km, each from an initial state perturbed by 1e-6 degC. The GPU's mean
-CO2 uptake efficiency is shown to be within 1% of the CPU's in 31 of 33
-cases (each site and all sites together, at three times); for all sites
-together on the last day the two differ by 0.15%. Rank, distribution and map
-tests find no difference between the two codes.
+**Over months, the GPU model gives the same CDR outcomes as the CPU model.**
+Ocean eddies are chaotic: a rounding-sized difference grows within weeks
+into a visibly different eddy field, so after a few weeks any two runs
+differ in detail, whichever model made them. We therefore ran each model 20
+times, each run starting from the same 1 January 2013 ocean state plus its
+own random 1e-6 degC temperature noise, and asked whether the 20 GPU runs
+and the 20 CPU runs are drawn from the same distribution of outcomes. Each
+run released alkalinity at ten coastal sites from Sitka, Alaska, to Baja California
+from 1 February to 1 May.
 
-![Depth-integrated alkalinity plumes on 30 April from four of the ten sites, for a CPU run and a GPU run from the same initial state and a CPU run started 1e-6 degC away. The three plumes at each site share their large eddies and differ in detail.](docs/validation_plumes.png)
+- The fraction of released alkalinity that becomes CO2 uptake (the uptake
+  efficiency a CDR study reports) agrees: for all ten sites together, the
+  GPU and CPU means differ by 0.15% on 1 May. At single sites the means
+  were shown to be within 1% of each other in 31 of 33 site and date
+  combinations; at the other two, the run-to-run spread at those sites is
+  too large for 20 runs to settle a 1% question either way. Splitting the
+  40 runs into two random groups of 20 gives such cases about as often.
+- On 264 measures of uptake, plume size, position and depth, and physics,
+  the GPU runs fall among the CPU runs the way further CPU runs would, with
+  no sign of a bias or of a different amount of variability.
+- Maps of the plumes, sea-surface temperature and sea level show no region
+  where the GPU runs depart from the CPU runs.
 
-The plumes on 30 April, after 88 days of release: CPU and GPU runs from the
-same initial state (top two rows) and a CPU run started 1e-6 degC away (bottom
-row). The GPU run differs from the CPU run by no more than a second CPU run
-does.
+![Depth-integrated alkalinity plumes on 30 April from four of the ten release sites. Rows: a CPU run and a GPU run from the same initial state, and a CPU run started 1e-6 degC away. At each site the three plumes share their large eddies and differ in detail.](docs/validation_plumes.png)
+
+The plumes on 30 April, 88 days into the release, at four of the ten sites.
+The top two rows are a CPU run and a GPU run from exactly the same initial
+state; the bottom row is a CPU run started 1e-6 degC away. The GPU run
+differs from the CPU run by no more than the second CPU run does.
+
+## Performance
+
+The CCS 4 km runs above, 120 days each, on NCAR's Derecho. The CPU model
+ran on 512 AMD EPYC cores (4 CPU nodes); the GPU model on 8 NVIDIA A100
+GPUs (40 GB) on 2 GPU nodes. "MARBL" is the full biogeochemistry with the CDR
+tracers; "CDR_LITE" is the CDR tracers alone, without MARBL. Times are for
+the whole job, including start-up and all output.
+
+| | CPU, MARBL | GPU, MARBL | CPU, CDR_LITE | GPU, CDR_LITE |
+|---|---:|---:|---:|---:|
+| Hardware | 512 cores | 8 A100 | 512 cores | 8 A100 |
+| Nodes | 4 | 2 | 4 | 2 |
+| Seconds per time step | 1.010 | 0.177 | 0.355 | 0.078 |
+| Wall-clock time for 120 days | 6.49 h | 1.14 h | 2.28 h | 0.51 h |
+| Node-hours for 120 days | 26.0 | 2.3 | 9.1 | 1.0 |
+| Simulated years per day | 1.2 | 6.9 | 3.5 | 15.6 |
+| GPU memory used | | 14-18 of 40 GB | | 6-8 of 40 GB |
+
+Per time step the GPU model is 5.7 times faster with MARBL and 4.6 times
+faster without, on half as many nodes; per node, 11 and 9 times. The run
+uses each GPU's memory less than half, so it would also fit on fewer GPUs.
 
 ## License
 
