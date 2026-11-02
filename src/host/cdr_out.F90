@@ -1,7 +1,7 @@
 #include "mem_attr.inc"
 module cdr_out
   ! CDR output (CPU cdr_output.F90, the C-Star fields): &cdr_output_settings;
-  ! files <root>_cdr.nc, <root>_cdr_0002.nc, ... (the GPU's naming) of
+  ! files <root>_cdr.<date>.nc (the CPU naming, his_io output_fname) of
   ! nrpf_cdr records every output_period_cdr, in double, with the CPU's
   ! variables and attributes: zeta, T, S, ALK, DIC, their ALT_CO2 twins,
   ! PO4, SiO3, the ALK/DIC vertical integrals, 3-D pH, the air-sea CO2
@@ -15,6 +15,7 @@ module cdr_out
   ! each MARBL step and at the write; at the write sum/navg. Not on the GPU
   ! yet: cdr_monthly_averages (stops at start-up).
   use kinds
+  use his_io, only: output_fname, refdatestr
   use decomp_mod
   use gpu_state
   use time_state
@@ -469,7 +470,7 @@ contains
     if (record >= nrpf_cdr) then
       nfile = nfile + 1
       record = 0
-      call make_fname(nfile, fname)
+      call output_fname(root, 'cdr', tnow, fname)
       if (comm_rank() == 0) call create_file(fname)
       call compute_barrier()
       open_path = fname
@@ -565,16 +566,6 @@ contains
     end subroutine inst_src
   end subroutine write_record
 
-  subroutine make_fname(n, path)
-    integer, intent(in) :: n
-    character(len=*), intent(out) :: path
-    if (n <= 1) then
-      path = trim(root)//'_cdr.nc'
-    else
-      write(path, '(a,"_cdr_",i4.4,a)') trim(root), n, '.nc'
-    endif
-  end subroutine make_fname
-
   subroutine create_file(path)
     ! The CPU's dimensions, variables (double), attributes and order.
     character(len=*), intent(in) :: path
@@ -591,7 +582,7 @@ contains
     d_s = nc_def_dim(ncid, 's_rho', decomp%nz)
     d3 = (/d_xi, d_eta, d_s, d_t/); d2 = (/d_xi, d_eta, d_t/)
     id = nc_def_var(ncid, 'ocean_time', (/d_t/))
-    call nc_put_att_text(ncid, 'ocean_time', 'long_name', 'Time since 2000/01/01')
+    call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
     call def1('avg_begin_time', (/d_t/), 'Time at beginning of averaging period', 'seconds')
     call def1('avg_end_time', (/d_t/), 'Time at end of averaging period', 'seconds')

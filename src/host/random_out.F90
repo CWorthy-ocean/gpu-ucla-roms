@@ -5,11 +5,12 @@ module random_out
   ! surface (top-level) field of every generic passive tracer
   ! (passive_tracer<n>, param_settings nt_passive). Every
   ! output_period_random seconds after the step (the CPU's wrt_random) one
-  ! record is written to <root>_rnd.nc, <root>_rnd_0002.nc, ...
+  ! record is written to <root>_rnd.<date>.nc (his_io output_fname)
   ! (nrpf_random records per file). The fields are written in the passive
   ! storage precision (double with -DPASSIVE_FP64, float otherwise); the
   ! time stays double.
   use kinds
+  use his_io, only: output_fname, refdatestr
   use decomp_mod, only: decomp
   use gpu_state
   use time_state
@@ -107,7 +108,7 @@ contains
     if (record >= nrpf_random) then
       nfile = nfile + 1
       record = 0
-      call make_fname(nfile, fname)
+      call output_fname(root, 'rnd', tnow, fname)
       if (comm_rank() == 0) call create_file(fname)
       call compute_barrier()
       open_path = fname
@@ -142,16 +143,6 @@ contains
     enddo
   end subroutine gather_surface
 
-  subroutine make_fname(n, path)
-    integer, intent(in) :: n
-    character(len=*), intent(out) :: path
-    if (n <= 1) then
-      path = trim(root)//'_rnd.nc'
-    else
-      write(path, '(a,"_rnd_",i4.4,a)') trim(root), n, '.nc'
-    endif
-  end subroutine make_fname
-
   subroutine create_file(path)
     character(len=*), intent(in) :: path
     integer :: ncid, d_t, d_xi, d_eta, id, n
@@ -164,7 +155,7 @@ contains
     d_xi = nc_def_dim(ncid, 'xi_rho', gxi)
     d_eta = nc_def_dim(ncid, 'eta_rho', geta)
     id = nc_def_var(ncid, 'ocean_time', (/d_t/))
-    call nc_put_att_text(ncid, 'ocean_time', 'long_name', 'Time since 2000/01/01')
+    call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
     do m = 1, n_generic
       name = passive_name(n_marbl + m)

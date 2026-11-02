@@ -10,9 +10,10 @@ module avg_out
   !    nstp (time n, the CPU's choice); rho = rho1 - qp1*z_r; omega from
   !    We + Wi (times pm*pn at the write); the true vertical velocity w
   !    (wvlcty); Akv, Akt, AKs, hbls, hbbl;
-  !  - <root>_avg.nc: a record every output_period_avg, nrpf_avg per file,
+  !  - <root>_avg.<date>.nc (his_io output_fname, the date of the first
+  !    write): a record every output_period_avg, nrpf_avg per file,
   !    stamped with the running mean of the model time;
-  !  - <root>_bgc_avg.nc: the MARBL tracers, a record every
+  !  - <root>_bgc_avg.<date>.nc: the MARBL tracers, a record every
   !    output_period_bgc_avg, stamped with the time at the write.
   ! The tracers averaged are those the CPU flags (wrt_t_avg): with MARBL,
   ! the tracers named in marbl_tracers_to_write, or every tracer when the
@@ -25,6 +26,7 @@ module avg_out
   ! (its record counter is reset at every call); here nrpf_bgc_avg records
   ! go in each file.
   use kinds
+  use his_io, only: output_fname, refdatestr
   use decomp_mod
   use gpu_state
   use time_state
@@ -377,7 +379,7 @@ contains
       if (rec == nrpf_avg) then
         nfile = nfile + 1
         rec = 0
-        call make_fname('avg', nfile, fname)
+        call output_fname(root, 'avg', tnow, fname)
         if (comm_rank() == 0) call create_avg_file(fname)
         call compute_barrier()
         call stage_avg(fname)
@@ -531,7 +533,7 @@ contains
       if (brec == nrpf_bgc_avg) then
         bnfile = bnfile + 1
         brec = 0
-        call make_fname('bgc_avg', bnfile, bname)
+        call output_fname(root, 'bgc_avg', tnow, bname)
         if (comm_rank() == 0) call create_bgc_avg_file(bname)
         call compute_barrier()
         call stage_bgc(bname, tnow)
@@ -558,17 +560,6 @@ contains
          '  file ', bnfile
   end subroutine stage_bgc
 
-  subroutine make_fname(tag, n, path)
-    character(len=*), intent(in) :: tag
-    integer, intent(in) :: n
-    character(len=*), intent(out) :: path
-    if (n <= 1) then
-      path = trim(root)//'_'//tag//'.nc'
-    else
-      write(path, '(a,"_",a,"_",i4.4,a)') trim(root), tag, n, '.nc'
-    endif
-  end subroutine make_fname
-
   subroutine open_file(path, ncid, d_t, d_xi, d_xiu, d_eta, d_etav, d_s, d_w)
     character(len=*), intent(in) :: path
     integer, intent(out) :: ncid, d_t, d_xi, d_xiu, d_eta, d_etav, d_s, d_w
@@ -584,7 +575,7 @@ contains
     d_s = nc_def_dim(ncid, 's_rho', decomp%nz)
     d_w = nc_def_dim(ncid, 's_w', decomp%nz + 1)
     id = nc_def_var(ncid, 'ocean_time', (/d_t/))
-    call nc_put_att_text(ncid, 'ocean_time', 'long_name', 'Time since 2000/01/01')
+    call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
   end subroutine open_file
 

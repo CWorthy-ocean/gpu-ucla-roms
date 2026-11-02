@@ -19,10 +19,11 @@ module upscale_out
   !  - records as the CPU's wrt_upscale: one at the first step, then every
   !    output_period_uscl, nrpf_uscl per file, at the time of the step's
   !    start; main's final call adds the last step's fluxes once more and
-  !    writes when the period is due. Files <root>_uscl.nc,
-  !    <root>_uscl_0002.nc, ... (double), written by compute rank 0 from a
+  !    writes when the period is due. Files <root>_uscl.<date>.nc
+  !    (his_io output_fname; double), written by compute rank 0 from a
   !    sum over the ranks of the boundary lines.
   use kinds
+  use his_io, only: output_fname, refdatestr
   use decomp_mod
   use gpu_state
   use time_state
@@ -413,7 +414,7 @@ contains
     if (record == nrpf_uscl .and. otime >= output_period_uscl) then
       nfile = nfile + 1
       record = 0
-      call make_fname(nfile, fname)
+      call output_fname(root, 'uscl', tnow, fname)
       call create_file(fname)
     endif
     if (otime >= output_period_uscl) then
@@ -522,16 +523,6 @@ contains
     endif
   end function var_name
 
-  subroutine make_fname(n, path)
-    integer, intent(in) :: n
-    character(len=*), intent(out) :: path
-    if (n <= 1) then
-      path = trim(root)//'_uscl.nc'
-    else
-      write(path, '(a,"_uscl_",i4.4,a)') trim(root), n, '.nc'
-    endif
-  end subroutine make_fname
-
   subroutine create_file(path)
     ! The CPU's dimensions, variables (double), attributes and order (sides
     ! north, south, east, west), then the boundary coordinates.
@@ -560,7 +551,7 @@ contains
     d_etav = nc_def_dim(ncid, 'eta_v', nline(SE) - 1)
     d_s = nc_def_dim(ncid, 's_rho', nz)
     id = nc_def_var(ncid, 'ocean_time', (/d_t/))
-    call nc_put_att_text(ncid, 'ocean_time', 'long_name', 'Time since 2000/01/01')
+    call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
     do s = 1, 4
       if (.not. side_on(s)) cycle

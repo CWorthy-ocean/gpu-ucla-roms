@@ -2259,6 +2259,39 @@ every few hours.
     extraction, old binary against new.
   - The no-MARBL CDR_LITE runs nm1 and nm2.
 
+## C-Star compatibility (2026-11-02)
+
+C-Star drives UCLA ROMS through its namelist, its output file names and
+the rank layout of the job. These changes make the GPU model look like
+UCLA ROMS at those points (C-Star's handoff: claude-docs
+`plans/gpu-ucla-roms-pr0-handoff.md`).
+
+- **Unreadable namelist groups stop the run.** A key the GPU does not
+  declare makes a namelist read fail part way (nvfortran iostat 239, the
+  keys after it keep their defaults). Most optional groups ignored the
+  status; now every group stops when present but unreadable and keeps its
+  defaults only when absent. Every group the GPU reads declares all of
+  UCLA ROMS 0.11.0's keys for it, so 0.11.0 namelists read as before; a
+  0.13 key such as `wrt_rstflx` stops the run instead of silently
+  dropping the rest of `&basic_output_settings`.
+- **Output names and time metadata as UCLA ROMS.** Files are
+  `<root>_<stream>.<YYYYMMDDHHMMSS>.nc` (no `_0002` counter), with the
+  date from the CPU's `sec2date` and `&reference_date_settings` (read in
+  `his_io`, default 2000/1/1; checked against Python's datetime for
+  1970-2099). The date is the CPU's model time when it creates the file:
+  every stream writes after the step, at time n+1, except the upscaling
+  means (time n, inside the step); the restart is named at its second
+  record's time (`EXACT_RESTART`: time + dt). So the history, `cdr`,
+  `cdrtrc`, `cdrgas`, `rnd`, `uscl` and `bry` stamps equal the first
+  record's time, the average files carry the end of their first window
+  (the records are stamped mid-window), and restarts the time of the
+  later of their two records, as in the CPU output. `ocean_time` has
+  `long_name = refdatestr` in every stream (before: units only in
+  history and restart, a fixed "Time since 2000/01/01" elsewhere), and
+  the history and restart record dimension is `time` (was `ocean_time`).
+  The reference date does not enter the arithmetic: model time comes from
+  the initial file, as on the CPU.
+
 ## Toolchain lessons (nvfortran 25.9)
 
 - A by-value derived type as a global-kernel argument does not compile;

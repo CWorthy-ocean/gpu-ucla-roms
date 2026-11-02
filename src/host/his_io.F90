@@ -45,11 +45,22 @@ module his_io
   logical  :: output_ready = .false.
   real(rp), WORK_ATTR allocatable :: wvl(:,:,:)     ! true vertical velocity (wrt_W)
 
+  ! Calendar, as the CPU's roms_read_write: model time is in seconds since
+  ! &reference_date_settings reference_date (default 2000/1/1). Output files
+  ! are named <root>_<stream>.<YYYYMMDDHHMMSS>.nc, the model date at which
+  ! the CPU creates the file (output_fname), and ocean_time carries
+  ! long_name = refdatestr.
+  integer :: reference_date(3) = (/2000, 1, 1/)
+  integer(8) :: ref_offset = 946684800_8           ! seconds from 1970/1/1 to reference_date
+  character(len=21), public :: refdatestr = 'Time since 2000/01/01'
+
   integer :: ir0, ir1, jr0, jr1, iu0, iu1, jv0, jv1
   integer :: nxi, neta, nxi_u, neta_v           ! this tile's written extents
   integer :: gxi, geta, gxi_u, geta_v           ! global file dimensions
 
   public :: read_output_namelist
+  public :: read_refdate_namelist
+  public :: output_fname
   public :: set_output_root
   public :: init_output
   public :: wrt_his
@@ -220,7 +231,7 @@ contains
     if (rec_his == 0 .or. rec_his >= nrpf_his) then
       nfile_his = nfile_his + 1
       rec_his = 0
-      call make_fname(output_root, 'his', nfile_his, fname_his)
+      call output_fname(output_root, 'his', twrite, fname_his)
       if (comm_rank() == 0) call create_his_file(fname_his)
       call compute_barrier()       ! the file exists before any tile announces it
       open_path = fname_his
@@ -276,7 +287,8 @@ contains
     if (rec_rst == 0 .or. rec_rst >= nrpf_rst) then
       nfile_rst = nfile_rst + 1
       rec_rst = 0
-      call make_fname(output_root, 'rst', nfile_rst, fname_rst)
+      ! the CPU names the file at the time of its second record (EXACT_RESTART: time + dt)
+      call output_fname(output_root, 'rst', twrite + dt, fname_rst)
       if (comm_rank() == 0) call create_rst_file(fname_rst)
       call compute_barrier()
       open_rst = fname_rst
@@ -364,7 +376,7 @@ contains
     integer :: itp, ncid, d_t, d_xi, d_eta, d_xiu, d_etav, d_s, d_w, id
     call ensure_parent(path)
     call nc_create(trim(path), ncid)
-    d_t = nc_def_dim(ncid, 'ocean_time', 0)
+    d_t = nc_def_dim(ncid, 'time', 0)
     d_xi = nc_def_dim(ncid, 'xi_rho', gxi)
     d_eta = nc_def_dim(ncid, 'eta_rho', geta)
     d_xiu = nc_def_dim(ncid, 'xi_u', gxi_u)
@@ -395,6 +407,7 @@ contains
     if (marbl_on) call marbl_gpu_define_his(ncid, d_xi, d_eta, d_s, d_t)
     call nc_put_att_text(ncid, '', 'title', output_title)
     call nc_put_att_text(ncid, '', 'history_precision', 'float32 (staged on the GPU)')
+    call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
     call nc_enddef(ncid)
     call nc_close(ncid)
@@ -406,7 +419,7 @@ contains
     integer :: itp, ncid, d_t, d_xi, d_eta, d_xiu, d_etav, d_s, d_aux, id
     call ensure_parent(path)
     call nc_create(trim(path), ncid)
-    d_t = nc_def_dim(ncid, 'ocean_time', 0)
+    d_t = nc_def_dim(ncid, 'time', 0)
     d_xi = nc_def_dim(ncid, 'xi_rho', gxi)
     d_eta = nc_def_dim(ncid, 'eta_rho', geta)
     d_xiu = nc_def_dim(ncid, 'xi_u', gxi_u)
@@ -445,6 +458,7 @@ contains
       id = nc_def_var(ncid, 'riv_vmask', (/d_xi, d_etav, d_t/))
     endif
     call nc_put_att_text(ncid, '', 'title', output_title)
+    call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
     call nc_enddef(ncid)
     call nc_close(ncid)
@@ -620,16 +634,69 @@ contains
     deallocate(tmp)
   end subroutine put_omega
 
-  subroutine make_fname(root, tag, nfile, path)
-    character(len=*), intent(in)  :: root, tag
-    integer,          intent(in)  :: nfile
-    character(len=*), intent(out) :: path
-    if (nfile <= 1) then
-      path = trim(root)//'_'//trim(tag)//'.nc'
-    else
-      write(path, '(a,"_",a,"_",i4.4,a)') trim(root), trim(tag), nfile, '.nc'
+  subroutine read_refdate_namelist(unit)
+    ! &reference_date_settings reference_date = y, m, d (the CPU's
+    ! roms_read_write; absent: 2000/1/1). Names and attributes only: model
+    ! time comes from the initial file's ocean_time, as on the CPU.
+    integer, intent(in) :: unit
+    integer :: ios
+    character(len=512) :: msg
+    namelist /reference_date_settings/ reference_date
+    rewind(unit)
+    read(unit, nml=reference_date_settings, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'REFERENCE_DATE_SETTINGS: ', trim(msg)
+      error stop 'read_refdate_namelist'
     endif
-  end subroutine make_fname
+    ! the CPU's init_refdate
+    ref_offset = 86400_8 * int(julian_day(reference_date(1), reference_date(2), reference_date(3)) - &
+                               julian_day(1970, 1, 1), 8)
+    write(refdatestr, '(A,I4,A,I0.2,A,I0.2)') 'Time since ', reference_date(1), '/', &
+         reference_date(2), '/', reference_date(3)
+  end subroutine read_refdate_namelist
+
+  integer function julian_day(y, m, d)
+    ! the CPU's init_refdate (integer arithmetic, as written there)
+    integer, intent(in) :: y, m, d
+    julian_day = d - 32075 + 1461*(y + 4800 + (m - 14)/12)/4 + &
+                 367*(m - 2 - ((m - 14)/12)*12)/12 - &
+                 3*((y + 4900 + (m - 14)/12)/100)/4
+  end function julian_day
+
+  subroutine sec2date(t, date)
+    ! The CPU's sec2date: model time t (seconds since reference_date) to
+    ! year, month, day, hour, minute, second. Correct for dates from 1970
+    ! to 2099 (checked against Python's datetime); earlier dates come out
+    ! wrong, on the CPU too. The CPU keeps the seconds since 1970 in a
+    ! 4-byte integer, which overflows in 2038; here 8 bytes.
+    real(rp), intent(in) :: t
+    integer, intent(out) :: date(6)
+    integer(8) :: utime, mjday, nsecs
+    real(8) :: day
+    utime = int(real(t, 8) + real(ref_offset, 8), 8)
+    mjday   = int(utime/86400 + 40587, 8)
+    date(1) = 1858 + int((mjday + 321.51_8) / 365.25_8)
+    day     = aint(mod(mjday + 262.25_8, 365.25_8)) + 0.5_8
+    date(2) = 1 + int(mod(day / 30.6_8 + 2.0_8, 12.0_8))
+    date(3) = 1 + int(mod(day, 30.6_8))
+    nsecs   = mod(utime, 86400_8)
+    date(6) = int(mod(nsecs, 60_8))
+    nsecs   = nsecs / 60
+    date(5) = int(mod(nsecs, 60_8))
+    date(4) = int(nsecs / 60)
+  end subroutine sec2date
+
+  subroutine output_fname(root, stream, t, path)
+    ! The CPU's create_file + append_date_node for joined files (PARALLEL_IO,
+    ! dt_format = 0): <root>_<stream>.<YYYYMMDDHHMMSS>.nc, the date of
+    ! model time t, which is the CPU's time when it creates the file.
+    character(len=*), intent(in)  :: root, stream
+    real(rp),         intent(in)  :: t
+    character(len=*), intent(out) :: path
+    integer :: date(6)
+    call sec2date(t, date)
+    write(path, '(A,"_",A,".",I4,5I0.2,".nc")') trim(root), trim(stream), date
+  end subroutine output_fname
 
   subroutine ensure_parent(path)
     character(len=*), intent(in) :: path

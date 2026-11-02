@@ -26,13 +26,14 @@ module extract_out
   ! at slot nstp (time n). A record every output_period_extract (after the
   ! step), nrpf_extract per file, bry_time in days (time n+1).
   !
-  ! File <extract_root_name>_bry.nc, _bry_0002.nc, ... (the CPU appends a
-  ! date), in double, the CPU's dimensions and variables: for each child
+  ! Files <extract_root_name>_bry.<date>.nc (the CPU naming, his_io
+  ! output_fname), in double, the CPU's dimensions and variables: for each child
   ! side present, zeta, ubar, vbar, every tracer, u and v; only the fields
   ! an object asks for are written. The interpolation runs on the device;
   ! rotation and remap on the host of the tile; compute rank 0 writes the
   ! sum over the ranks of the boundary lines.
   use kinds
+  use his_io, only: output_fname, refdatestr
   use decomp_mod
   use gpu_state
   use time_state
@@ -562,7 +563,7 @@ contains
     if (record == nrpf_extract) then
       nfile = nfile + 1
       record = 0
-      call make_fname(nfile, fname)
+      call output_fname(extract_root_name, 'bry', start_time + dt * real(iic - ntstart + 1, rp), fname)
       if (comm_rank() == 0) call create_file(fname)
     endif
     record = record + 1
@@ -786,15 +787,6 @@ contains
   end subroutine child_thickness
 
   ! ---------------------------------------------------------------- the file
-  subroutine make_fname(n, path)
-    integer, intent(in) :: n
-    character(len=*), intent(out) :: path
-    if (n <= 1) then
-      path = trim(extract_root_name)//'_bry.nc'
-    else
-      write(path, '(a,"_bry_",i4.4,a)') trim(extract_root_name), n, '.nc'
-    endif
-  end subroutine make_fname
 
   subroutine create_file(path)
     ! The CPU's create_edata_file (PARALLEL_IO): dimensions time, xi_rho,
@@ -813,7 +805,7 @@ contains
     d4 = nc_def_dim(ncid, 'eta_v', MMm_chd - 1)
     d5 = nc_def_dim(ncid, 's_rho', N_chd)
     id = nc_def_var(ncid, 'bry_time', (/d0/))
-    call nc_put_att_text(ncid, 'bry_time', 'long_name', 'Time since 2000/01/01')
+    call nc_put_att_text(ncid, 'bry_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'bry_time', 'units', 'days')
     dt_ = (/d1, d1, d3, d3/); du_ = (/d2, d2, d3, d3/); dv_ = (/d1, d1, d4, d4/)
     do s = 1, 4

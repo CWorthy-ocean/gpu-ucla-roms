@@ -4,8 +4,8 @@ module cdr_gas_out
   ! carbonate sensitivities ddic_dco2 (beta) and ddic_dalk (eta) of the
   ! ALT_CO2 carbon system, written in the form the CDR_LITE forcing reads
   ! (variables and their ddic_*_time axes), so the files can force a later
-  ! run. &cdr_gas_exch_output_settings; files <root>_cdrgas.nc,
-  ! <root>_cdrgas_0002.nc, ... (the GPU's naming), double.
+  ! run. &cdr_gas_exch_output_settings; files
+  ! <root>_cdrgas.<date>.nc (the CPU naming, his_io output_fname), double.
   !  - an instantaneous "bracket" record at the start of the run and,
   !    unless the last record already sits there, at its end; bracket
   !    records do not count toward nrpf_cdr_gas;
@@ -18,6 +18,7 @@ module cdr_gas_out
   !    ddic_dco2_time = ddic_dalk_time (the record's forcing time, days).
   ! Not on the GPU yet: cdr_gas_monthly_averages (stops at start-up).
   use kinds
+  use his_io, only: output_fname, refdatestr
   use decomp_mod
   use gpu_state
   use time_state
@@ -213,7 +214,7 @@ contains
     open_path = ''
     if (new_file) then
       nfile = nfile + 1
-      call make_fname(nfile, fname)
+      call output_fname(root, 'cdrgas', tnow, fname)
       if (comm_rank() == 0) call create_file(fname)
       call compute_barrier()
       open_path = fname
@@ -244,16 +245,6 @@ contains
          tnow * sec2day, ' days  rec = ', record, '  file ', nfile
   end subroutine write_record
 
-  subroutine make_fname(n, path)
-    integer, intent(in) :: n
-    character(len=*), intent(out) :: path
-    if (n <= 1) then
-      path = trim(root)//'_cdrgas.nc'
-    else
-      write(path, '(a,"_cdrgas_",i4.4,a)') trim(root), n, '.nc'
-    endif
-  end subroutine make_fname
-
   subroutine create_file(path)
     ! The CPU's dimensions, variables (double) and attributes.
     character(len=*), intent(in) :: path
@@ -268,7 +259,7 @@ contains
     d_etav = nc_def_dim(ncid, 'eta_v', geta_v)
     d_s = nc_def_dim(ncid, 's_rho', decomp%nz)
     id = nc_def_var(ncid, 'ocean_time', (/d_t/))
-    call nc_put_att_text(ncid, 'ocean_time', 'long_name', 'Time since 2000/01/01')
+    call nc_put_att_text(ncid, 'ocean_time', 'long_name', refdatestr)
     call nc_put_att_text(ncid, 'ocean_time', 'units', 'second')
     call def1('avg_begin_time', (/d_t/), 'Time at beginning of averaging period', 'seconds')
     call def1('avg_end_time', (/d_t/), 'Time at end of averaging period', 'seconds')

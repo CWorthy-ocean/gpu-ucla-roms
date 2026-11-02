@@ -108,6 +108,10 @@
     title = 'roms_gpu example: MiniPac 3 days with MARBL, 2x2 tiles on 4 GPUs'
 /
 
+&reference_date_settings
+    reference_date = 2000, 1, 1
+/
+
 &basic_output_settings
     monthly_restarts = .false.
     nrpf_avg = 1

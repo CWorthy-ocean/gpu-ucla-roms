@@ -37,6 +37,8 @@ The namelist uses the same groups and keys as UCLA ROMS, plus `np_xi` and
 tools/submit_gpu.sh examples/minipac/run_minipac.pbs
 ```
 
-Output goes to `output/`: `minipac_marbl_his.nc` (6-hourly history, single
-precision) and `minipac_marbl_rst.nc` (double precision, two records at
-day 3 for an exact restart). To restart, set `inifile` to the restart file.
+Output goes to `output/`: `minipac_marbl_his.20100330000000.nc` (6-hourly
+history, single precision) and `minipac_marbl_rst.20100402000000.nc`
+(double precision, two records at day 3 for an exact restart). As in UCLA
+ROMS, each file is named by the model date at which it is started, counted
+from `reference_date`. To restart, set `inifile` to the restart file.

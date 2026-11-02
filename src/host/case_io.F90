@@ -20,7 +20,7 @@ module case_io
   use cdr_gas_out, only: read_cdr_gas_output_namelist, set_cdr_gas_output_root, init_cdr_gas_output
   use cdr_out, only: read_cdr_output_namelist, set_cdr_output_root, init_cdr_output
   use upscale_out, only: read_upscale_namelist, set_upscale_root, init_upscale_output
-  use his_io, only: read_output_namelist, set_output_root, init_output
+  use his_io, only: read_output_namelist, read_refdate_namelist, set_output_root, init_output
   use avg_out, only: read_avg_namelist, set_avg_root, init_avg_output
   use extract_out, only: read_extract_namelist, init_extract
   use comm_mod, only: comm_rank, comm_size, comm_min_real
@@ -158,6 +158,7 @@ contains
     case_v_sponge = v_sponge
     call read_forcing_namelist(unit, nml_dir)
     call read_tide_namelist(unit)
+    call read_refdate_namelist(unit)
     call read_output_namelist(unit)
     call read_avg_namelist(unit)
     call read_extract_namelist(unit)

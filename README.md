@@ -126,7 +126,15 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   exchange (CUDA-aware MPI required); leave it unset otherwise.
 - **Namelist:** the same groups and keys as UCLA ROMS, plus `np_xi` and
   `np_eta` (GPU tiles), `nt_bgc` (32 with MARBL) and `nt_passive`. Paths are
-  relative to the namelist file.
+  relative to the namelist file. A group with a key the GPU model does not
+  know stops the run at start-up, naming the group.
+- **Output files** are named as UCLA ROMS names them,
+  `<output_root_name>_<stream>.<YYYYMMDDHHMMSS>.nc` (streams `his`, `rst`,
+  `avg`, `bgc_avg`, `cdr`, `cdrtrc`, `cdrgas`, `rnd`, `uscl`, and
+  `<extract_root_name>_bry`), where the date is the model date at which the
+  file is started, counted from `&reference_date_settings reference_date`
+  (default 2000/1/1). `ocean_time` is in seconds, with `long_name = "Time
+  since YYYY/MM/DD"`. Files are whole (not split by rank) NetCDF-4.
 
 `examples/minipac/` is a complete small case (namelist, MARBL settings, PBS
 script): 3 days of MiniPac, a small coarse Pacific test domain, with MARBL on one 4-GPU node. The input data are
