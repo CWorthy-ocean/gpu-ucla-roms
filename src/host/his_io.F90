@@ -61,6 +61,7 @@ contains
   subroutine read_output_namelist(unit)
     integer, intent(in) :: unit
     integer :: ios
+    character(len=512) :: msg
     real(rp) :: output_period_his, output_period_rst, output_period_avg
     integer :: nrpf_his, nrpf_avg
     logical :: wrt_file_his, wrt_file_rst, wrt_file_avg, monthly_restarts
@@ -102,9 +103,17 @@ contains
     wrt_temp_dia = .false.; wrt_salt_dia = .false.
 
     rewind(unit)
-    read(unit, nml=basic_output_settings, iostat=ios)
+    read(unit, nml=basic_output_settings, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'BASIC_OUTPUT_SETTINGS: ', trim(msg)
+      error stop 'read_output_namelist'
+    endif
     rewind(unit)
-    read(unit, nml=ts_output_settings, iostat=ios)
+    read(unit, nml=ts_output_settings, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'TS_OUTPUT_SETTINGS: ', trim(msg)
+      error stop 'read_output_namelist'
+    endif
     call apply_output_flags(output_period_his, output_period_rst, nrpf_his, &
          wrt_file_his, wrt_file_rst, monthly_restarts, wrt_Z, wrt_Ub, wrt_Vb, &
          wrt_U, wrt_V, wrt_R, wrt_O, wrt_W, wrt_Akv, wrt_Akt, wrt_Aks, &

@@ -32,8 +32,13 @@ contains
   subroutine read_cdr_lite_namelist(unit)
     integer, intent(in) :: unit
     integer :: ios
+    character(len=512) :: msg
     rewind(unit)
-    read(unit, nml=cdr_lite_settings, iostat=ios)
+    read(unit, nml=cdr_lite_settings, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'CDR_LITE_SETTINGS: ', trim(msg)
+      error stop 'read_cdr_lite_namelist'
+    endif
     if (ios /= 0) cdr_online_carbonate_sensitivity = .false.
   end subroutine read_cdr_lite_namelist
 

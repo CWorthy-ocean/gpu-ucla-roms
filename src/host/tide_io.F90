@@ -46,6 +46,7 @@ contains
   subroutine read_tide_namelist(unit)
     integer, intent(in) :: unit
     integer :: ios
+    character(len=512) :: msg
     integer :: ntides
     logical :: pot_tides, bry_tides, ana_tides
     namelist /tides_settings/ ntides, pot_tides, bry_tides, ana_tides
@@ -55,10 +56,14 @@ contains
     bry_tides = .false.
     ana_tides = .false.
     rewind(unit)
-    read(unit, nml=tides_settings, iostat=ios)
-    if (ios /= 0) then
+    read(unit, nml=tides_settings, iostat=ios, iomsg=msg)
+    if (ios < 0) then
       rewind(unit)
-      read(unit, nml=tidal_frc_settings, iostat=ios)
+      read(unit, nml=tidal_frc_settings, iostat=ios, iomsg=msg)
+    endif
+    if (ios > 0) then
+      write(*,*) 'TIDES_SETTINGS / TIDAL_FRC_SETTINGS: ', trim(msg)
+      error stop 'read_tide_namelist'
     endif
     call apply_tide_flags(ntides, pot_tides, bry_tides, ana_tides)
   end subroutine read_tide_namelist

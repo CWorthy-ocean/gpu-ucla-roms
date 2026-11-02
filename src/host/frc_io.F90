@@ -142,6 +142,7 @@ contains
     integer,          intent(in) :: unit
     character(len=*), intent(in) :: nml_dir
     integer :: ios, i
+    character(len=512) :: msg
     character(len=512) :: frcfiles(max_frc), frcfile(max_frc)
     logical :: interp_bulk_frc, check_bulk_frc_units
     namelist /forcing_files/ frcfiles, frcfile
@@ -156,22 +157,46 @@ contains
     interp_bulk_frc = .false.; check_bulk_frc_units = .false.
     interp_flux_frc = .false.
     rewind(unit)
-    read(unit, nml=forcing_files, iostat=ios)
+    read(unit, nml=forcing_files, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'FORCING_FILES: ', trim(msg)
+      error stop 'read_forcing_namelist'
+    endif
     rewind(unit)
-    read(unit, nml=surf_frc_settings, iostat=ios)
+    read(unit, nml=surf_frc_settings, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'SURF_FRC_SETTINGS: ', trim(msg)
+      error stop 'read_forcing_namelist'
+    endif
     rewind(unit)
-    read(unit, nml=flux_frc_settings, iostat=ios)
+    read(unit, nml=flux_frc_settings, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'FLUX_FRC_SETTINGS: ', trim(msg)
+      error stop 'read_forcing_namelist'
+    endif
     rewind(unit)
-    read(unit, nml=bulk_frc_settings, iostat=ios)
+    read(unit, nml=bulk_frc_settings, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'BULK_FRC_SETTINGS: ', trim(msg)
+      error stop 'read_forcing_namelist'
+    endif
     rewind(unit)
-    read(unit, nml=sss_correction, iostat=ios)
+    read(unit, nml=sss_correction, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'SSS_CORRECTION: ', trim(msg)
+      error stop 'read_forcing_namelist'
+    endif
     ! In single precision, as the CPU (surf_flux.F90: default-real dSSSdt, read from the
     ! namelist, then dSSSdt / (100.*86400.)): about -3.6e-8 relative to the double value.
     dsssdt_ms = real(real(dsssdt, 4) / (100.0_4 * 86400.0_4), rp)
     ! Closed walls: the GPU has free slip only (obc.F90 gamma2 = 1, as the CPU default).
     gamma2 = 1.0_rp
     rewind(unit)
-    read(unit, nml=gamma2_settings, iostat=ios)
+    read(unit, nml=gamma2_settings, iostat=ios, iomsg=msg)
+    if (ios > 0) then
+      write(*,*) 'GAMMA2_SETTINGS: ', trim(msg)
+      error stop 'read_forcing_namelist'
+    endif
     if (gamma2 /= 1.0_rp) error stop 'gamma2_settings: only gamma2 = 1 (free slip) is supported'
 
     case_nfrc = 0

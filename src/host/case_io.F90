@@ -149,9 +149,11 @@ contains
     ninfo_steps = max(ninfo, 1)
     call read_optional_scalars(unit, zob_in, rdrg_in, rdrg2_in, visc2_in, &
                                akv_bak_in, akt_bak_in, rho0_in)
-    rewind(unit); read(unit, nml=ubind_settings, iostat=ios)
+    rewind(unit); read(unit, nml=ubind_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'UBIND_SETTINGS')
     v_sponge = 0.0_rp
-    rewind(unit); read(unit, nml=v_sponge_settings, iostat=ios)
+    rewind(unit); read(unit, nml=v_sponge_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'V_SPONGE_SETTINGS')
     if (ios /= 0) v_sponge = 0.0_rp
     case_v_sponge = v_sponge
     call read_forcing_namelist(unit, nml_dir)
@@ -171,7 +173,8 @@ contains
     call read_upscale_namelist(unit)
     case_ntp_est = nt_bgc + ntp + ncdr        ! MARBL + generic + CDR_LITE (ntp = nt_passive here)
 
-    rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios)
+    rewind(unit); read(unit, nml=simulation_name_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'SIMULATION_NAME_SETTINGS')
     call read_tile_settings(unit)   ! optional group; before the unit is closed
     close(unit)
 
@@ -217,6 +220,7 @@ contains
     ! Optional &tile_settings group (absent = 'wet' balance, land weight 0.25).
     integer, intent(in) :: unit
     integer :: ios
+    character(len=512) :: msg
     character(len=16) :: tile_balance
     real(rp) :: tile_land_weight, tile_max_cells_ratio, tile_max_mem_gb, tile_mem_cell_kb, tile_mem_wet_kb
     integer(ip) :: tile_xcut(64), tile_ycut(64)
@@ -228,7 +232,8 @@ contains
     tile_mem_cell_kb = case_tile_mem_cell_kb; tile_mem_wet_kb = case_tile_mem_wet_kb
     tile_xcut = 0; tile_ycut = 0
     rewind(unit)
-    read(unit, nml=tile_settings, iostat=ios)
+    read(unit, nml=tile_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'TILE_SETTINGS')
     if (ios == 0) then
       case_tile_balance = tile_balance
       case_tile_land_weight = tile_land_weight
@@ -458,11 +463,13 @@ contains
     integer, intent(in) :: unit
     real(rp), intent(inout) :: theta_s_in, theta_b_in, hc_in
     integer :: ios
+    character(len=512) :: msg
     real(rp) :: theta_s, theta_b, hc
     namelist /s_coord/ theta_s, theta_b, hc
     theta_s = theta_s_in; theta_b = theta_b_in; hc = hc_in
     rewind(unit)
-    read(unit, nml=s_coord, iostat=ios)
+    read(unit, nml=s_coord, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'S_COORD')
     if (ios == 0) then
       theta_s_in = theta_s
       theta_b_in = theta_b
@@ -475,14 +482,15 @@ contains
     real(rp), intent(inout) :: dt_in
     integer(ip), intent(inout) :: ndtfast_in, ntimes_in, ninfo
     integer :: ios
+    character(len=512) :: msg
     real(rp) :: dt
     integer(ip) :: ndtfast, ntimes
     namelist /time_stepping/ dt, ndtfast, ntimes, ninfo
     dt = dt_in; ndtfast = ndtfast_in; ntimes = ntimes_in
     rewind(unit)
-    read(unit, nml=time_stepping, iostat=ios)
+    read(unit, nml=time_stepping, iostat=ios, iomsg=msg)
     if (ios /= 0) then
-      write(*,*) 'TIME_STEPPING missing or invalid'
+      write(*,*) 'TIME_STEPPING missing or invalid: ', trim(msg)
       error stop 'read_namelist'
     endif
     dt_in = dt
@@ -496,6 +504,7 @@ contains
     real(rp), intent(inout) :: zob_in, rdrg_in, rdrg2_in, visc2_in, akv_bak_in
     real(rp), intent(inout) :: akt_bak_in(2), rho0_in
     integer :: ios
+    character(len=512) :: msg
     real(rp) :: rdrg, rdrg2, zob, visc2, akv_bak, akt_bak(2), tnu2(64), rho0
     namelist /bottom_drag_settings/ rdrg, rdrg2, zob
     namelist /vertical_mixing_settings/ akv_bak, akt_bak
@@ -505,11 +514,16 @@ contains
     rdrg = rdrg_in; rdrg2 = rdrg2_in; zob = zob_in
     visc2 = visc2_in; akv_bak = akv_bak_in; akt_bak = akt_bak_in
     tnu2 = 0.0_rp; rho0 = rho0_in
-    rewind(unit); read(unit, nml=bottom_drag_settings, iostat=ios)
-    rewind(unit); read(unit, nml=vertical_mixing_settings, iostat=ios)
-    rewind(unit); read(unit, nml=lateral_visc_settings, iostat=ios)
-    rewind(unit); read(unit, nml=tracer_diff2, iostat=ios)
-    rewind(unit); read(unit, nml=rho0_settings, iostat=ios)
+    rewind(unit); read(unit, nml=bottom_drag_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'BOTTOM_DRAG_SETTINGS')
+    rewind(unit); read(unit, nml=vertical_mixing_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'VERTICAL_MIXING_SETTINGS')
+    rewind(unit); read(unit, nml=lateral_visc_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'LATERAL_VISC_SETTINGS')
+    rewind(unit); read(unit, nml=tracer_diff2, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'TRACER_DIFF2')
+    rewind(unit); read(unit, nml=rho0_settings, iostat=ios, iomsg=msg)
+    call nml_stop(ios, msg, 'RHO0_SETTINGS')
     zob_in = zob; rdrg_in = rdrg; rdrg2_in = rdrg2; visc2_in = visc2
     akv_bak_in = akv_bak; akt_bak_in = akt_bak
     rho0_in = rho0
@@ -1579,5 +1593,16 @@ contains
       out = trim(dir)//'/'//trim(path)
     endif
   end function resolve_path
+
+  subroutine nml_stop(ios, msg, group)
+    ! After an optional group's read: absent (end of file, ios < 0) is fine;
+    ! present but unreadable (ios > 0, e.g. a key the GPU does not know)
+    ! stops, since the rest of the group would silently keep its defaults.
+    integer, intent(in) :: ios
+    character(len=*), intent(in) :: msg, group
+    if (ios <= 0) return
+    write(*,*) group, ': ', trim(msg)
+    error stop 'read_namelist: unreadable namelist group (see above)'
+  end subroutine nml_stop
 
 end module case_io
