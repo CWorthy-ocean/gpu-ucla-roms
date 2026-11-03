@@ -72,7 +72,7 @@ contains
     rewind(unit)
     read(unit, nml=upscale_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'UPSCALE_SETTINGS: ', trim(msg)
+      write(*,*) 'UPSCALE_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_upscale_namelist'
     endif
     if (ios < 0) do_upscale = .false.

@@ -61,7 +61,7 @@ contains
     rewind(unit)
     read(unit, nml=cdr_gas_exch_output_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'CDR_GAS_EXCH_OUTPUT_SETTINGS: ', trim(msg)
+      write(*,*) 'CDR_GAS_EXCH_OUTPUT_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_cdr_gas_output_namelist'
     endif
     if (ios < 0) do_cdr_gas_exch_output = .false.

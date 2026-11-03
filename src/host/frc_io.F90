@@ -159,31 +159,31 @@ contains
     rewind(unit)
     read(unit, nml=forcing_files, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'FORCING_FILES: ', trim(msg)
+      write(*,*) 'FORCING_FILES: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
     rewind(unit)
     read(unit, nml=surf_frc_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'SURF_FRC_SETTINGS: ', trim(msg)
+      write(*,*) 'SURF_FRC_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
     rewind(unit)
     read(unit, nml=flux_frc_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'FLUX_FRC_SETTINGS: ', trim(msg)
+      write(*,*) 'FLUX_FRC_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
     rewind(unit)
     read(unit, nml=bulk_frc_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'BULK_FRC_SETTINGS: ', trim(msg)
+      write(*,*) 'BULK_FRC_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
     rewind(unit)
     read(unit, nml=sss_correction, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'SSS_CORRECTION: ', trim(msg)
+      write(*,*) 'SSS_CORRECTION: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
     ! In single precision, as the CPU (surf_flux.F90: default-real dSSSdt, read from the
@@ -194,7 +194,7 @@ contains
     rewind(unit)
     read(unit, nml=gamma2_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'GAMMA2_SETTINGS: ', trim(msg)
+      write(*,*) 'GAMMA2_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_forcing_namelist'
     endif
     if (gamma2 /= 1.0_rp) error stop 'gamma2_settings: only gamma2 = 1 (free slip) is supported'

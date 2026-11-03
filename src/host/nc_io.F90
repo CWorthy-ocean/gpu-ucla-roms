@@ -8,6 +8,7 @@ module nc_io
 #endif
   private
 
+  public :: iomsg_text
   public :: nc_open_read
   public :: nc_open_write
   public :: nc_open_write_par, nc_set_par_access
@@ -45,6 +46,19 @@ module nc_io
   public :: nc_check
 
 contains
+
+  function iomsg_text(msg) result(s)
+    ! An iomsg as text: nvfortran fills the rest of the buffer with NULs and
+    ! starts some messages with a newline, which make the log binary to grep.
+    character(len=*), intent(in) :: msg
+    character(len=len(msg)) :: s
+    integer :: i
+    s = msg
+    do i = 1, len(s)
+      if (iachar(s(i:i)) < 32) s(i:i) = ' '
+    enddo
+    s = adjustl(s)
+  end function iomsg_text
 
   subroutine nc_check(ierr, where)
     integer, intent(in) :: ierr

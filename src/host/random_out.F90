@@ -48,7 +48,7 @@ contains
     rewind(unit)
     read(unit, nml=random_output_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'RANDOM_OUTPUT_SETTINGS: ', trim(msg)
+      write(*,*) 'RANDOM_OUTPUT_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_random_namelist'
     endif
     if (ios < 0) do_random = .false.

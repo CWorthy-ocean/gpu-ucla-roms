@@ -116,13 +116,13 @@ contains
     rewind(unit)
     read(unit, nml=basic_output_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'BASIC_OUTPUT_SETTINGS: ', trim(msg)
+      write(*,*) 'BASIC_OUTPUT_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_output_namelist'
     endif
     rewind(unit)
     read(unit, nml=ts_output_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'TS_OUTPUT_SETTINGS: ', trim(msg)
+      write(*,*) 'TS_OUTPUT_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_output_namelist'
     endif
     call apply_output_flags(output_period_his, output_period_rst, nrpf_his, &
@@ -645,7 +645,7 @@ contains
     rewind(unit)
     read(unit, nml=reference_date_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'REFERENCE_DATE_SETTINGS: ', trim(msg)
+      write(*,*) 'REFERENCE_DATE_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_refdate_namelist'
     endif
     ! the CPU's init_refdate

@@ -121,26 +121,26 @@ contains
 
     open(newunit=unit, file=trim(path), status='old', action='read', iostat=ios, iomsg=msg)
     if (ios /= 0) then
-      write(*,*) 'cannot open namelist ', trim(path), ': ', trim(msg)
+      write(*,*) 'cannot open namelist ', trim(path), ': ', trim(iomsg_text(msg))
       error stop 'read_namelist'
     endif
 
     rewind(unit); read(unit, nml=param_settings, iostat=ios, iomsg=msg)
     if (ios /= 0) then
-      write(*,*) 'PARAM_SETTINGS: ', trim(msg)
+      write(*,*) 'PARAM_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_namelist'
     endif
     call set_cdr_lite(nt_cdr_oae, nt_cdr_dor)
 
     rewind(unit); read(unit, nml=grid_settings, iostat=ios, iomsg=msg)
     if (ios /= 0) then
-      write(*,*) 'GRID_SETTINGS: ', trim(msg)
+      write(*,*) 'GRID_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_namelist'
     endif
 
     rewind(unit); read(unit, nml=initial_conditions, iostat=ios, iomsg=msg)
     if (ios /= 0) then
-      write(*,*) 'INITIAL_CONDITIONS: ', trim(msg)
+      write(*,*) 'INITIAL_CONDITIONS: ', trim(iomsg_text(msg))
       error stop 'read_namelist'
     endif
 
@@ -491,7 +491,7 @@ contains
     rewind(unit)
     read(unit, nml=time_stepping, iostat=ios, iomsg=msg)
     if (ios /= 0) then
-      write(*,*) 'TIME_STEPPING missing or invalid: ', trim(msg)
+      write(*,*) 'TIME_STEPPING missing or invalid: ', trim(iomsg_text(msg))
       error stop 'read_namelist'
     endif
     dt_in = dt
@@ -1602,7 +1602,7 @@ contains
     integer, intent(in) :: ios
     character(len=*), intent(in) :: msg, group
     if (ios <= 0) return
-    write(*,*) group, ': ', trim(msg)
+    write(*,*) group, ': ', trim(iomsg_text(msg))
     error stop 'read_namelist: unreadable namelist group (see above)'
   end subroutine nml_stop
 

@@ -58,7 +58,7 @@ contains
     rewind(unit)
     read(unit, nml=river_frc_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'RIVER_FRC_SETTINGS: ', trim(msg)
+      write(*,*) 'RIVER_FRC_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_river_namelist'
     endif
     if (ios < 0) then

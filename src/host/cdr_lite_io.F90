@@ -10,6 +10,7 @@ module cdr_lite_io
   ! set_online_carbonate_sensitivity) instead of read; the ddic files are
   ! then not needed.
   use kinds
+  use nc_io, only: iomsg_text
   use decomp_mod, only: decomp
   use gpu_state
   use time_state
@@ -36,7 +37,7 @@ contains
     rewind(unit)
     read(unit, nml=cdr_lite_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'CDR_LITE_SETTINGS: ', trim(msg)
+      write(*,*) 'CDR_LITE_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_cdr_lite_namelist'
     endif
     if (ios /= 0) cdr_online_carbonate_sensitivity = .false.

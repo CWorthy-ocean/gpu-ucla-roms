@@ -69,7 +69,7 @@ contains
     rewind(unit)
     read(unit, nml=cdr_lite_output_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'CDR_LITE_OUTPUT_SETTINGS: ', trim(msg)
+      write(*,*) 'CDR_LITE_OUTPUT_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_cdr_lite_output_namelist'
     endif
     if (ios < 0) do_cdr_lite_output = .false.

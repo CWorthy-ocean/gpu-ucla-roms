@@ -45,6 +45,7 @@ module cdr_io
   ! records are bracketed and weighted as the CPU's set_frc_data at the
   ! corrector's forcing time (n+1/2), the only one the tracer source uses.
   use kinds
+  use nc_io, only: iomsg_text
   use decomp_mod, only: decomp
   use gpu_state
   use time_state
@@ -106,7 +107,7 @@ contains
     rewind(unit)
     read(unit, nml=cdr_frc_settings, iostat=ios, iomsg=msg)
     if (ios > 0) then
-      write(*,*) 'CDR_FRC_SETTINGS: ', trim(msg)
+      write(*,*) 'CDR_FRC_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_cdr_namelist'
     endif
     if (ios < 0) cdr_source = .false.

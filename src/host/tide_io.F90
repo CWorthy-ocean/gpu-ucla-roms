@@ -62,7 +62,7 @@ contains
       read(unit, nml=tidal_frc_settings, iostat=ios, iomsg=msg)
     endif
     if (ios > 0) then
-      write(*,*) 'TIDES_SETTINGS / TIDAL_FRC_SETTINGS: ', trim(msg)
+      write(*,*) 'TIDES_SETTINGS / TIDAL_FRC_SETTINGS: ', trim(iomsg_text(msg))
       error stop 'read_tide_namelist'
     endif
     call apply_tide_flags(ntides, pot_tides, bry_tides, ana_tides)
