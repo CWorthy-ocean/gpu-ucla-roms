@@ -2317,6 +2317,20 @@ UCLA ROMS at those points (C-Star's handoff: claude-docs
   (MARBL, `kinds_pre`, `marbl_host`) were built with; a change rebuilds
   them (before, a precision or architecture change left them stale unless
   one ran `make clean`). The model itself is recompiled on every `make gpu`.
+- **Checked.** MiniPac (2x2 and 4x2 tiles, 6 h, split history, averages, a
+  restart) and CCS 4 km with MARBL, CDR and a 2010/06/15 reference date
+  (24 steps, every stream). Output contents are bit-identical to the
+  previous binary in both. The per-node layouts (one and two writers per
+  node, with and without `tools/numa_bind.sh`) are bit-identical to the
+  old layout; on CCS their files are byte-identical. The CCS file names
+  and `ocean_time` values equal the CPU's for history, restart, averages,
+  `cdrtrc` and `cdrgas` (averages within 6e-8 s, as before these
+  changes). A namelist with an undeclared key stops on every rank with
+  the group and nvfortran's message, and a job whose ranks do not fit
+  the layout stops at start-up. Two stream differences remain: the GPU
+  writes the MARBL tracers to `_his` and has no `_bgc` stream, and the
+  CPU writes one `_bgc_avg` record per file whatever `nrpf_bgc_avg` says
+  (the GPU honours it).
 
 ## Toolchain lessons (nvfortran 25.9)
 
