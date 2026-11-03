@@ -1,19 +1,25 @@
 #!/bin/bash
 # numa_bind.sh <cmd...>: run <cmd> on the CPU cores of the NUMA domain that
 # holds this rank's GPU. Launch with "mpiexec --cpu-bind none ... numa_bind.sh exe args".
-# GPU = world rank mod the number of GPUs, as roms_gpu's select_device does for
-# compute ranks. CUDA ordinals are put in PCI bus order, so ordinal g is
+# GPU = the rank's node-local rank mod the number of GPUs, as roms_gpu's
+# select_device does for compute ranks (the world rank where the launcher gives
+# no local rank). CUDA ordinals are put in PCI bus order, so ordinal g is
 # nvidia-smi index g. Everything is read from the node (nvidia-smi, /sys), so no
 # node layout is assumed. If any lookup fails, the command runs unbound.
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-r=${PALS_RANKID:-${PMI_RANK:-0}}
-# Only the first NUMA_BIND_NRANKS ranks (the GPU compute ranks; submit_gpu.sh
-# passes their count) are bound; the writer ranks after them run unbound
-# (binding them next to the GPU ranks slowed their file writes ~20%).
-if [ -n "$NUMA_BIND_NRANKS" ] && [ "$r" -ge "$NUMA_BIND_NRANKS" ]; then exec "$@"; fi
+r=${PALS_RANKID:-${PMI_RANK:-${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-0}}}}
+lr=${PALS_LOCAL_RANKID:-${SLURM_LOCALID:-${OMPI_COMM_WORLD_LOCAL_RANK:-${MPI_LOCALRANKID:-}}}}
+ls=${PALS_LOCAL_SIZE:-${OMPI_COMM_WORLD_LOCAL_SIZE:-${MPI_LOCALNRANKS:-${SLURM_NTASKS_PER_NODE:-}}}}
+# Writer ranks run unbound (binding them next to the GPU ranks slowed their
+# file writes ~20%). With ROMS_GPU_NWRITERS=w they are the last w ranks of each
+# node; otherwise every world rank from NUMA_BIND_NRANKS on (the GPU compute
+# rank count; submit_gpu.sh passes it).
+if [ -n "$ROMS_GPU_NWRITERS" ]; then
+  if [ -n "$lr" ] && [[ "$ls" =~ ^[0-9]+$ ]] && [ "$lr" -ge $(( ls - ROMS_GPU_NWRITERS )) ]; then exec "$@"; fi
+elif [ -n "$NUMA_BIND_NRANKS" ] && [ "$r" -ge "$NUMA_BIND_NRANKS" ]; then exec "$@"; fi
 ng=$(nvidia-smi -L 2>/dev/null | wc -l)
 if [ "$ng" -ge 1 ]; then
-  g=$(( r % ng ))
+  g=$(( ${lr:-$r} % ng ))
   bus=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i "$g" 2>/dev/null | tr 'A-Z' 'a-z')
   dev=${bus:4}                      # 00000000:03:00.0 -> 0000:03:00.0 (sysfs form)
   node=$(cat "/sys/bus/pci/devices/$dev/numa_node" 2>/dev/null)

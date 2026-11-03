@@ -2291,6 +2291,22 @@ UCLA ROMS at those points (C-Star's handoff: claude-docs
   the history and restart record dimension is `time` (was `ocean_time`).
   The reference date does not enter the arithmetic: model time comes from
   the initial file, as on the CPU.
+- **Rank roles by node (`ROMS_GPU_NWRITERS`).** SLURM gives every node the
+  same number of tasks, which the old rule (writers = the world ranks after
+  np_xi x np_eta, so all on the last node) cannot use. With
+  `ROMS_GPU_NWRITERS=w` the last w ranks of every node are writers
+  (`MPI_Comm_split_type` gives the node-local rank); compute ranks keep
+  world order, so the tiles are the same. A layout whose compute ranks do
+  not number np_xi x np_eta stops at start-up with the layout it expected
+  (before: a mis-sized job ran with a different writer count). The io_server
+  addresses writers and indexes tile buffers through tables of world ranks
+  (`comm_writer_world`, `comm_compute_index`) instead of assuming
+  contiguous ranks, and a compute rank takes GPU (node rank mod visible
+  GPUs) instead of (compute rank mod visible GPUs), the same on every
+  layout used so far. Without the variable the old rule applies unchanged.
+  Writer groups are consecutive writers, so with w writers per node and
+  group size w each node writes its own files (two files from two nodes
+  ran at 1.23 GB/s against 1.00 from one, "Per-run round").
 
 ## Toolchain lessons (nvfortran 25.9)
 

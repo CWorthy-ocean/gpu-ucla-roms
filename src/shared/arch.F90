@@ -55,7 +55,8 @@ contains
   end subroutine init_arch
 
   subroutine select_device(rank)
-    ! One GPU per compute rank: device = rank modulo the visible device count.
+    ! One GPU per compute rank: device = rank (the compute rank's rank on its
+    ! node, comm_node_rank) modulo the visible device count.
     integer, intent(in) :: rank
 #ifdef USE_CUDA
     integer :: ierr, ndev, dev
@@ -65,6 +66,8 @@ contains
     ierr = cudaSetDevice(dev)
     if (ierr /= 0) error stop 'select_device: cudaSetDevice'
     write(*,'(a,i0,a,i0,a,i0)') 'arch: rank ', rank, ' -> GPU ', dev, ' of ', ndev
+    if (rank >= ndev) write(*,'(a,i0,a,i0,a)') 'arch: WARNING node rank ', rank, ' shares a GPU (', ndev, &
+         ' visible): more compute ranks than GPUs on this node'
 #endif
   end subroutine select_device
 

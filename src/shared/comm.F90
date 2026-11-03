@@ -1,7 +1,17 @@
 module comm_mod
   ! MPI wrapper for halo deliver and the optional I/O server.
-  ! World = compute ranks plus, when the job has >= 2 ranks and
-  ! ROMS_GPU_IO_SERVER is not '0', one I/O server on the last world rank.
+  ! World = compute ranks plus writer (I/O server) ranks. Roles, two ways:
+  !  - ROMS_GPU_NWRITERS = w (writers per node): on every node the last w
+  !    ranks are writers and the others compute ranks, so a job with a
+  !    uniform ranks-per-node count (SLURM --ntasks-per-node) works; the
+  !    compute ranks must number np_xi x np_eta or the run stops naming the
+  !    layout it expected. w = 0: no writers.
+  !  - unset (as before): when the job has >= 2 ranks and ROMS_GPU_IO_SERVER
+  !    is not '0', every world rank after the first np_xi x np_eta is a
+  !    writer (ROMS_GPU_IO_SERVERS overrides their number).
+  ! Compute ranks are numbered in world order (node by node), so the tile
+  ! decomposition is the same either way; writer_world and compute_of_world
+  ! translate between writer, compute and world ranks.
   ! Compute ranks exchange halos on compute_comm (comm_rank/comm_size
   ! refer to it); the server only receives staged output records over
   ! the world communicator (see io_server). One compute rank is a no-op
@@ -23,8 +33,11 @@ module comm_mod
   ! to MPI_Sendrecv when MPICH_GPU_SUPPORT_ENABLED=1 is set for the job.
   logical :: comm_gpu_direct = .false.
   integer :: io_rank_w = -1          ! world rank of the first I/O server rank, -1 = none
-  integer :: io_nserv = 0            ! number of I/O server (writer) ranks, the last world ranks
+  integer :: io_nserv = 0            ! number of I/O server (writer) ranks
   logical :: io_rank_flag = .false.
+  integer :: node_rank = 0, node_size = 1     ! rank and rank count on this node
+  integer, allocatable :: writer_world(:)     ! (0:io_nserv-1) world rank of each writer
+  integer, allocatable :: compute_of_world(:) ! (0:world_size-1) compute rank, -1 on writers
   logical :: ready = .false.
 
   public :: init_comm
@@ -45,6 +58,7 @@ module comm_mod
   public :: is_io_rank
   public :: io_server_rank
   public :: io_server_count, io_server_index, comm_writers
+  public :: comm_writer_world, comm_compute_index, comm_node_rank
   public :: comm_world
   public :: comm_world_rank
   public :: comm_world_size
@@ -55,9 +69,10 @@ contains
 
   subroutine init_comm()
 #ifdef USE_MPI
-    integer :: ierr, color, stat, r, n
+    integer :: ierr, color, stat, r, n, nw, nwpn, node_comm, mine
     logical :: flag
     character(len=8) :: val
+    integer, allocatable :: role(:)
     call MPI_Initialized(flag, ierr)
     if (.not. flag) then
       call MPI_Init(ierr)
@@ -66,9 +81,29 @@ contains
     world_comm = MPI_COMM_WORLD
     call MPI_Comm_rank(world_comm, world_rank, ierr)
     call MPI_Comm_size(world_comm, world_size, ierr)
+    call MPI_Comm_split_type(world_comm, MPI_COMM_TYPE_SHARED, world_rank, MPI_INFO_NULL, node_comm, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'init_comm: MPI_Comm_split_type'
+    call MPI_Comm_rank(node_comm, node_rank, ierr)
+    call MPI_Comm_size(node_comm, node_size, ierr)
+    call MPI_Comm_free(node_comm, ierr)
     io_rank_w = -1
     io_nserv = 0
-    if (world_size >= 2) then
+    io_rank_flag = .false.
+    nwpn = -1
+    val = ''
+    call get_environment_variable('ROMS_GPU_NWRITERS', val, status=stat)
+    if (stat == 0 .and. len_trim(val) > 0) then
+      read(val, *, iostat=stat) nwpn
+      if (stat /= 0 .or. nwpn < 0) then
+        if (world_rank == 0) write(*,'(3a)') 'init_comm: ROMS_GPU_NWRITERS = "', trim(val), &
+             '" is not a number of writers per node (0 or more)'
+        error stop 'init_comm: bad ROMS_GPU_NWRITERS'
+      endif
+    endif
+    if (nwpn >= 0) then
+      io_rank_flag = (node_rank >= node_size - nwpn)
+      call check_node_layout(nwpn)
+    elseif (world_size >= 2) then
       call get_environment_variable('ROMS_GPU_IO_SERVER', val, status=stat)
       if (.not. (stat == 0 .and. len_trim(val) > 0 .and. val(1:1) == '0')) then
         ! ROMS_GPU_IO_SERVERS = number of writer ranks (default 1); they are
@@ -86,8 +121,31 @@ contains
         endif
         io_rank_w = world_size - io_nserv
       endif
+      io_rank_flag = (world_rank >= io_rank_w .and. io_rank_w >= 0)
     endif
-    io_rank_flag = (world_rank >= io_rank_w .and. io_rank_w >= 0)
+    ! the role of every world rank: writer and compute rank tables
+    allocate(role(0:world_size - 1), compute_of_world(0:world_size - 1))
+    mine = merge(1, 0, io_rank_flag)
+    call MPI_Allgather(mine, 1, MPI_INTEGER, role, 1, MPI_INTEGER, world_comm, ierr)
+    if (ierr /= MPI_SUCCESS) error stop 'init_comm: MPI_Allgather roles'
+    io_nserv = count(role == 1)
+    allocate(writer_world(0:max(io_nserv, 1) - 1))
+    writer_world = -1
+    n = 0
+    nw = 0
+    do r = 0, world_size - 1
+      if (role(r) == 1) then
+        writer_world(nw) = r
+        nw = nw + 1
+        compute_of_world(r) = -1
+      else
+        compute_of_world(r) = n
+        n = n + 1
+      endif
+    enddo
+    deallocate(role)
+    io_rank_w = -1
+    if (io_nserv > 0) io_rank_w = writer_world(0)
     if (io_rank_w >= 0) then
       color = merge(1, 0, io_rank_flag)
       call MPI_Comm_split(world_comm, color, world_rank, compute_comm, ierr)
@@ -106,6 +164,52 @@ contains
 #endif
     ready = .true.
   end subroutine init_comm
+
+  subroutine check_node_layout(nwpn)
+    ! ROMS_GPU_NWRITERS = nwpn: every node needs at least one compute rank,
+    ! and the compute ranks must number np_xi x np_eta. Every rank runs the
+    ! same check on the same gathered numbers, so all stop together.
+    integer, intent(in) :: nwpn
+#ifdef USE_MPI
+    integer :: ierr, nodes, ncomp, ntile, r, lo, hi
+    integer, allocatable :: nr(:), ns(:)
+    character(len=24) :: sz
+    allocate(nr(0:world_size - 1), ns(0:world_size - 1))
+    call MPI_Allgather(node_rank, 1, MPI_INTEGER, nr, 1, MPI_INTEGER, world_comm, ierr)
+    call MPI_Allgather(node_size, 1, MPI_INTEGER, ns, 1, MPI_INTEGER, world_comm, ierr)
+    nodes = count(nr == 0)
+    lo = minval(ns); hi = maxval(ns)
+    ncomp = 0
+    do r = 0, world_size - 1
+      if (nr(r) < ns(r) - nwpn) ncomp = ncomp + 1
+    enddo
+    ntile = namelist_tiles()
+    if (lo == hi) then
+      write(sz, '(i0)') lo
+    else
+      write(sz, '(i0,a,i0)') lo, '-', hi
+    endif
+    if (world_rank == 0) write(*,'(a,i0,a,i0,a,a,a,i0,a,i0,a)') 'comm: ', nodes, ' node(s), ', world_size, &
+         ' ranks (', trim(sz), ' per node), ', ncomp, ' compute + ', world_size - ncomp, &
+         ' writer ranks (ROMS_GPU_NWRITERS, writers per node)'
+    if (lo <= nwpn .or. (ntile >= 1 .and. ncomp /= ntile)) then
+      if (world_rank == 0) then
+        write(*,'(a,i0,a,i0,a,a,a)') 'init_comm: ROMS_GPU_NWRITERS = ', nwpn, ' writers per node, but the job has ', &
+             nodes, ' node(s) with ', trim(sz), ' ranks each'
+        if (lo <= nwpn) write(*,'(a)') 'init_comm: a node has no rank left for computing'
+        if (ntile >= 1 .and. ncomp /= ntile) then
+          write(*,'(a,i0,a,i0,a)') 'init_comm: that leaves ', ncomp, ' compute ranks; the namelist has np_xi x np_eta = ', &
+               ntile, ' tiles'
+          if (mod(ntile, nodes) == 0) write(*,'(a,i0,a,i0,a,i0,a,i0,a)') 'init_comm: expected ', nodes, &
+               ' node(s) x (', ntile / nodes, ' + ', nwpn, ') = ', nodes * (ntile / nodes + nwpn), ' ranks'
+        endif
+        flush(6)
+      endif
+      error stop 'init_comm: rank layout does not match ROMS_GPU_NWRITERS and the namelist tiles'
+    endif
+    deallocate(nr, ns)
+#endif
+  end subroutine check_node_layout
 
   integer function namelist_tiles() result(ntile)
     ! np_xi * np_eta from the namelist named on the command line (argument
@@ -219,10 +323,28 @@ contains
   end function io_server_count
 
   integer function io_server_index()
-    ! 0 .. nserv-1 on a writer rank, -1 elsewhere
+    ! 0 .. nserv-1 on a writer rank (its rank among the writers), -1 elsewhere
     io_server_index = -1
-    if (io_rank_flag) io_server_index = world_rank - io_rank_w
+    if (io_rank_flag) io_server_index = int(my_rank)
   end function io_server_index
+
+  integer function comm_writer_world(w)
+    ! world rank of writer w (0 .. nserv-1)
+    integer, intent(in) :: w
+    comm_writer_world = writer_world(w)
+  end function comm_writer_world
+
+  integer function comm_compute_index(r)
+    ! compute rank of world rank r (-1 for a writer)
+    integer, intent(in) :: r
+    comm_compute_index = r
+    if (allocated(compute_of_world)) comm_compute_index = compute_of_world(r)
+  end function comm_compute_index
+
+  integer function comm_node_rank()
+    ! this rank's rank on its node (compute ranks come first on every node)
+    comm_node_rank = node_rank
+  end function comm_node_rank
 
   integer function comm_writers()
     ! The writer ranks' own communicator (the split gives it to colour 1).

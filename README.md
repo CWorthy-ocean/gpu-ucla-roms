@@ -112,16 +112,26 @@ make gpu FC_GPU=nvfortran \
 mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
 ```
 
-- **Ranks:** the first `np_xi x np_eta` ranks (from the namelist) each drive
-  one GPU; every extra rank is a writer. `python3 tools/gpu_layout.py
-  namelist.nml` prints the suggested numbers (compute ranks, writers, total,
-  and a PBS select line); `tools/submit_gpu.sh <job script>` does the same
-  and submits a PBS job with them.
-- **GPUs:** compute rank r uses GPU (r mod the number of visible GPUs), so
-  place ranks node by node and make all of a node's GPUs visible to every
-  rank. `tools/numa_bind.sh` (launch with `mpiexec --cpu-bind none ...
-  tools/numa_bind.sh <exe> run <namelist>`) pins each GPU rank to the CPU
-  cores next to its GPU.
+- **Ranks:** `np_xi x np_eta` compute ranks (from the namelist), each
+  driving one GPU, plus writer ranks that write the output files. Two ways
+  to lay them out:
+  - `ROMS_GPU_NWRITERS=w` (writers per node): on every node the last `w`
+    ranks are writers and the others compute ranks, so every node gets the
+    same number of ranks (SLURM `--nodes=N --ntasks-per-node=g+w
+    --gpus-per-node=g`, PBS `select=N:...:mpiprocs=g+w:ngpus=g`) and the
+    writers are spread over the nodes. If the compute ranks do not number
+    `np_xi x np_eta` the run stops and prints the layout it expected.
+  - `ROMS_GPU_NWRITERS` unset: the first `np_xi x np_eta` ranks compute and
+    every extra rank is a writer, so the writers sit on the last node.
+  `python3 tools/gpu_layout.py namelist.nml [--per-node]` prints the
+  suggested numbers (compute ranks, writers, total, a PBS select line, and
+  with `--per-node` the writers per node); `tools/submit_gpu.sh <job script>
+  [PERNODE=1]` does the same and submits a PBS job with them.
+- **GPUs:** a compute rank uses GPU (its rank on the node mod the number of
+  visible GPUs), so place ranks node by node and make all of a node's GPUs
+  visible to every rank. `tools/numa_bind.sh` (launch with `mpiexec
+  --cpu-bind none ... tools/numa_bind.sh <exe> run <namelist>`) pins each
+  GPU rank to the CPU cores next to its GPU.
 - **Environment:** set `MPICH_GPU_SUPPORT_ENABLED=1` to use GPU-to-GPU halo
   exchange (CUDA-aware MPI required); leave it unset otherwise.
 - **Namelist:** the same groups and keys as UCLA ROMS, plus `np_xi` and

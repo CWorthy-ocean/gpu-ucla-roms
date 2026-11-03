@@ -525,7 +525,7 @@ contains
       hdr = 0
       hdr(1) = CMD_QUIT
       do w = 0, io_server_count() - 1
-        call MPI_Send(hdr, NHDR, MPI_INTEGER, io_server_rank() + w, TAG_CMD, comm_world(), ierr)
+        call MPI_Send(hdr, NHDR, MPI_INTEGER, comm_writer_world(w), TAG_CMD, comm_world(), ierr)
       enddo
       quit_sent = .true.
     endif
@@ -644,8 +644,8 @@ contains
     nw = io_server_count()
     if (nw > MAXW) error stop 'io: too many writer ranks (raise MAXW)'
     if (wgroup_size == 0) call writer_groups(nw, wgroup_size, wgroups)
-    ! the writers of this file's group
-    base = io_server_rank() + file_group(pend(idx)%fkind, pend(idx)%nfile) * wgroup_size
+    ! the writers of this file's group: writers base .. base + wgroup_size - 1
+    base = file_group(pend(idx)%fkind, pend(idx)%nfile) * wgroup_size
     call pack_hdr(pend(idx), pend(idx)%hdr)
     pend(idx)%namebuf = ''
     do iv = 1, pend(idx)%nvars
@@ -653,7 +653,7 @@ contains
     enddo
     ! data first (variable iv to the group's writer mod(iv-1, size)), all non-blocking
     do iv = 1, pend(idx)%nvars
-      dest = base + mod(iv - 1, wgroup_size)
+      dest = comm_writer_world(base + mod(iv - 1, wgroup_size))
       n = pend(idx)%n1(iv) * pend(idx)%n2(iv) * pend(idx)%n3(iv)
       if (pend(idx)%dbl) then
         if (idx == 1) then
@@ -681,7 +681,7 @@ contains
                        real(pend(idx)%tforce, 8)/)
     ! every writer of the group gets the (optional) open command and the header
     do w = 0, wgroup_size - 1
-      dest = base + w
+      dest = comm_writer_world(base + w)
       if (len_trim(pend(idx)%open_path) > 0) then
         nr = nr + 1
         call MPI_Isend(pend(idx)%ohdr, NHDR, MPI_INTEGER, dest, TAG_CMD, comm, pend(idx)%reqs(nr), ierr)
@@ -1053,7 +1053,7 @@ contains
   subroutine io_server_run()
     ! I/O rank main loop. Returns after CMD_QUIT.
 #ifdef USE_MPI
-    integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), src, comm, iv, off, n, b, k, ntot, nquit, ncompute, isl
+    integer :: hdr(NHDR), ierr, stat(MPI_STATUS_SIZE), src, sc, comm, iv, off, n, b, k, ntot, nquit, ncompute, isl
     real :: trecv(NSLOT)
     real(8) :: c_start, c_end
     character(len=PATHLEN) :: open_name(NKIND)
@@ -1083,6 +1083,7 @@ contains
       call MPI_Recv(hdr, NHDR, MPI_INTEGER, MPI_ANY_SOURCE, TAG_CMD, comm, stat, ierr)
       if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv cmd'
       src = stat(MPI_SOURCE)       ! the rest of this message comes from the same rank
+      sc = comm_compute_index(src) ! its compute rank: the tile buffers' index
       select case (hdr(1))
       case (CMD_OPEN)
         call MPI_Recv(path, PATHLEN, MPI_CHARACTER, src, TAG_STR, comm, stat, ierr)
@@ -1157,34 +1158,34 @@ contains
         r%dbl = (hdr(7) == 1)
         c0 = wall_time()
         if (r%dbl) then
-          if (allocated(tbuf(src, isl)%b8)) then
-            if (size(tbuf(src, isl)%b8) < ntot) deallocate(tbuf(src, isl)%b8)
+          if (allocated(tbuf(sc, isl)%b8)) then
+            if (size(tbuf(sc, isl)%b8) < ntot) deallocate(tbuf(sc, isl)%b8)
           endif
-          if (.not. allocated(tbuf(src, isl)%b8)) allocate(tbuf(src, isl)%b8(ntot))
+          if (.not. allocated(tbuf(sc, isl)%b8)) allocate(tbuf(sc, isl)%b8(ntot))
           do iv = 1, r%nvars
             if (.not. mine(iv)) cycle
             off = r%off(iv)
             n = r%n1(iv) * r%n2(iv) * r%n3(iv)
-            call MPI_Recv(tbuf(src, isl)%b8(off), n, MPI_REAL8, src, TAG_DATA + iv, comm, stat, ierr)
+            call MPI_Recv(tbuf(sc, isl)%b8(off), n, MPI_REAL8, src, TAG_DATA + iv, comm, stat, ierr)
             if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv data (double)'
           enddo
         else
-          if (allocated(tbuf(src, isl)%b)) then
-            if (size(tbuf(src, isl)%b) < ntot) deallocate(tbuf(src, isl)%b)
+          if (allocated(tbuf(sc, isl)%b)) then
+            if (size(tbuf(sc, isl)%b) < ntot) deallocate(tbuf(sc, isl)%b)
           endif
-          if (.not. allocated(tbuf(src, isl)%b)) allocate(tbuf(src, isl)%b(ntot))
+          if (.not. allocated(tbuf(sc, isl)%b)) allocate(tbuf(sc, isl)%b(ntot))
           do iv = 1, r%nvars
             if (.not. mine(iv)) cycle
             off = r%off(iv)
             n = r%n1(iv) * r%n2(iv) * r%n3(iv)
-            call MPI_Recv(tbuf(src, isl)%b(off), n, MPI_REAL4, src, TAG_DATA + iv, comm, stat, ierr)
+            call MPI_Recv(tbuf(sc, isl)%b(off), n, MPI_REAL4, src, TAG_DATA + iv, comm, stat, ierr)
             if (ierr /= MPI_SUCCESS) error stop 'io_server: MPI_Recv data'
           enddo
         endif
         c1 = wall_time()
-        tmeta(src, isl) = r
-        if (.not. tfill(src, isl)) slot_n(isl) = slot_n(isl) + 1
-        tfill(src, isl) = .true.
+        tmeta(sc, isl) = r
+        if (.not. tfill(sc, isl)) slot_n(isl) = slot_n(isl) + 1
+        tfill(sc, isl) = .true.
         trecv(isl) = trecv(isl) + (c1 - c0)
         if (slot_n(isl) == ncompute) then
           k = r%fkind
