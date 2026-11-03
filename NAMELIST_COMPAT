@@ -1,0 +1,22 @@
+# Which UCLA ROMS namelist vocabulary each roms_gpu release reads.
+#
+# A release reads the namelist groups and keys of the UCLA ROMS release named
+# here, plus its own optional groups below. Groups it does not read are
+# ignored; a CPU feature switch it does not have stops the run at start-up
+# (src/host/feature_guard.F90). From v0.1.2-beta, a key it does not know in a
+# group it reads stops the run at start-up, naming the group (before, the rest
+# of that group silently kept its defaults).
+#
+# Keys added in later UCLA ROMS releases that roms_gpu does not read (the run
+# stops if they are present):
+#   0.12.0  &cdr_lite_settings  cdr_carbonate_sensitivity_time_interpolation
+#   0.13.0  &v_sponge_settings  v_sponge_trc
+#
+# GPU-only additions: the optional group &tile_settings (tile balancing),
+# &passive_tracers (n_passive, init_mode, write_passive), and in
+# &param_settings the keys n, nsub_x, nsub_e and ntrc_bio.
+#
+# roms_gpu      UCLA ROMS namelist
+v0.1.0-beta     0.11.0
+v0.1.1-beta     0.11.0
+v0.1.2-beta     0.11.0

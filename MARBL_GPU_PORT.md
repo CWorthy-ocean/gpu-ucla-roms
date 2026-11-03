@@ -2271,9 +2271,13 @@ UCLA ROMS at those points (C-Star's handoff: claude-docs
   keys after it keep their defaults). Most optional groups ignored the
   status; now every group stops when present but unreadable and keeps its
   defaults only when absent. Every group the GPU reads declares all of
-  UCLA ROMS 0.11.0's keys for it, so 0.11.0 namelists read as before; a
-  0.13 key such as `wrt_rstflx` stops the run instead of silently
-  dropping the rest of `&basic_output_settings`.
+  UCLA ROMS 0.11.0's keys for it, so 0.11.0 namelists read as before (none
+  of 225 GPU and 174 CPU namelists of the validation runs changes). The
+  keys added since (0.12.0 `cdr_carbonate_sensitivity_time_interpolation`
+  in `&cdr_lite_settings`, 0.13.0 `v_sponge_trc` in `&v_sponge_settings`)
+  stop the run instead of silently resetting the rest of their group (with
+  `v_sponge_trc` first, the sponge itself). `NAMELIST_COMPAT` lists the
+  vocabulary per release.
 - **Output names and time metadata as UCLA ROMS.** Files are
   `<root>_<stream>.<YYYYMMDDHHMMSS>.nc` (no `_0002` counter), with the
   date from the CPU's `sec2date` and `&reference_date_settings` (read in
@@ -2307,6 +2311,12 @@ UCLA ROMS at those points (C-Star's handoff: claude-docs
   Writer groups are consecutive writers, so with w writers per node and
   group size w each node writes its own files (two files from two nodes
   ran at 1.23 GB/s against 1.00 from one, "Per-run round").
+- **Version line and stale objects.** The model prints `roms_gpu version
+  <git describe>` at start-up (passed to the main compile command only).
+  `build_gpu/flags.txt` records the compiler and flags the cached objects
+  (MARBL, `kinds_pre`, `marbl_host`) were built with; a change rebuilds
+  them (before, a precision or architecture change left them stale unless
+  one ran `make clean`). The model itself is recompiled on every `make gpu`.
 
 ## Toolchain lessons (nvfortran 25.9)
 

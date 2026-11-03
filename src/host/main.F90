@@ -14,7 +14,7 @@ program roms_gpu
   use extract_out, only: wrt_extract
   use upscale_out, only: wrt_upscale_final
   use arch_mod, only: init_arch, arch_name, select_device
-  use comm_mod, only: init_comm, finalize_comm, comm_rank, comm_size, is_io_rank, comm_node_rank
+  use comm_mod, only: init_comm, finalize_comm, comm_rank, comm_size, is_io_rank, comm_node_rank, comm_world_rank
   use io_server, only: io_server_run, io_finalize
   use passive_mod, only: passive_exchange_finish
   use halo_mod, only: hg_audit_report
@@ -23,6 +23,9 @@ program roms_gpu
   use run_timers, only: rt_tic, rt_toc, rt_report, rt_nsteps, RT_LOOP, RT_OUTPUT, RT_FINAL, RT_INIT, &
                         rt_steps_init, rt_step_begin, rt_step_end
   implicit none
+#ifndef ROMS_GPU_VERSION
+#define ROMS_GPU_VERSION "unknown"
+#endif
 
   integer(ip) :: gnx, gny, nz, halo, npx, npy, rank
   integer(ip) :: ndtfast_in, ntimes_in, nt_in, istep
@@ -33,6 +36,7 @@ program roms_gpu
   mode = 'geom'
   if (command_argument_count() >= 1) call get_command_argument(1, mode)
   call init_comm()
+  if (comm_world_rank() == 0) write(*,'(2a)') 'roms_gpu version ', ROMS_GPU_VERSION
   if (trim(mode) == 'load' .or. trim(mode) == 'run') then
     ! Every rank, writers included, so that all stop together.
     nml_path = 'namelist.nml'

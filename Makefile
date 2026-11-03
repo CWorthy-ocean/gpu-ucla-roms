@@ -35,6 +35,11 @@ override FFLAGS_HOST += $(FFLAGS_MPI) $(NETCDF_FFLAGS)
 override FFLAGS_GPU  += $(FFLAGS_MPI) $(NETCDF_FFLAGS)
 LIBS        ?= $(NETCDF_FLIBS)
 
+# Version printed at start-up: git describe of this checkout. It is passed to
+# the main command only, so a new commit does not rebuild MARBL.
+ROMS_GPU_VERSION ?= $(shell git -C $(CURDIR) describe --tags --always --dirty 2>/dev/null || echo unknown)
+VERSION_DEF = -DROMS_GPU_VERSION=\"$(ROMS_GPU_VERSION)\"
+
 SRC_SHARED = src/shared/kinds.F90 src/shared/decomp.F90 src/shared/tile_balance.F90 src/shared/arch.F90 \
              src/shared/comm.F90 src/shared/formulas.F90 src/shared/time_state.F90 \
              src/shared/run_timers.F90
@@ -186,6 +191,18 @@ $(foreach i,$(shell seq 2 $(words $(MARBL_NAMES))),\
 .PHONY: marbl
 marbl: $(MARBL_OBJS)
 
+# The cached objects (MARBL, kinds_pre, marbl_host) do not depend on the
+# flags by themselves: build_gpu/flags.txt holds the compiler and flags they
+# were built with, and a change rewrites it, which rebuilds them.
+GPU_FLAGS = $(GPUDIR)/flags.txt
+ifneq ($(filter gpu $(GPUDIR)/%,$(MAKECMDGOALS)),)
+  $(shell mkdir -p $(GPUDIR); printf '%s\n' '$(FC_GPU) $(FFLAGS_GPU)' | cmp -s - $(GPU_FLAGS) || \
+    printf '%s\n' '$(FC_GPU) $(FFLAGS_GPU)' > $(GPU_FLAGS))
+endif
+$(MARBL_OBJS) $(GPUDIR)/kinds_pre.o: $(GPU_FLAGS)
+$(GPU_FLAGS):
+	mkdir -p $(GPUDIR); printf '%s\n' '$(FC_GPU) $(FFLAGS_GPU)' > $@
+
 $(GPUDIR)/kinds_pre.o: src/shared/kinds.F90 | $(GPUDIR)
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/shared/kinds.F90 -o $(GPUDIR)/kinds_pre.o
 $(GPUDIR)/marbl_host.o: $(SRC_MARBL_HOST) $(GPUDIR)/kinds_pre.o $(MARBL_OBJS)
@@ -193,7 +210,7 @@ $(GPUDIR)/marbl_host.o: $(SRC_MARBL_HOST) $(GPUDIR)/kinds_pre.o $(MARBL_OBJS)
 
 gpu: $(GPUDIR)/kinds_pre.o $(GPUDIR)/marbl_host.o | $(GPUDIR)
 	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -c src/shared/comm.F90 -o $(GPUDIR)/comm.o
-	$(FC_GPU) $(FFLAGS_GPU) -module $(GPUDIR) -o $(GPUDIR)/roms_gpu_cuda \
+	$(FC_GPU) $(FFLAGS_GPU) $(VERSION_DEF) -module $(GPUDIR) -o $(GPUDIR)/roms_gpu_cuda \
 	  $(SRC_SHARED_NOCOMM) $(SRC_DEV) $(SRC_MARBL_DEV) $(SRC_IO) $(SRC_HOST) src/host/main.F90 \
 	  $(GPUDIR)/comm.o $(GPUDIR)/marbl_host.o $(MARBL_OBJS) $(LIBS)
 

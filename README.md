@@ -88,8 +88,10 @@ make gpu FC_GPU=nvfortran \
     they are double, as on the CPU.
 - `-Mnofma` turns off fused multiply-add, for reproducible rounding; it
   costs no measurable speed.
-- Run one `make` at a time. After changing flags, start from a clean
-  `build_gpu/` (`make clean`): the objects do not depend on the flags.
+- Run one `make` at a time. `make gpu` recompiles the model every time; a
+  change of compiler or flags also rebuilds the cached MARBL objects
+  (`build_gpu/flags.txt` records the ones they were built with). The model
+  prints its version (`git describe`) at start-up.
 
 On NCAR's Derecho (Cray MPICH, which needs `libmpi_gtl_cuda` for GPU-to-GPU
 halo exchange):
@@ -138,6 +140,15 @@ mpiexec -n <ranks> build_gpu/roms_gpu_cuda run namelist.nml
   `np_eta` (GPU tiles), `nt_bgc` (32 with MARBL) and `nt_passive`. Paths are
   relative to the namelist file. A group with a key the GPU model does not
   know stops the run at start-up, naming the group.
+- **MARBL output:** with `nt_bgc = 32` the history file carries every
+  MARBL tracer, the surface diagnostics PH, pCO2SURF, DpCO2, FG_CO2 and
+  their ALT_CO2 twins (PH_ALT_CO2, pCO2SURF_ALT_CO2, FG_ALT_CO2), the
+  saturation depths zsatcalc and zsatarag, and the 3-D CO3, CO3_ALT_CO2,
+  co3_sat_calc and co3_sat_arag; `_bgc_avg` averages the tracers named in
+  `marbl_tracers_to_write`. There is no separate `_bgc` or `_bgc_dia`
+  stream.
+- **Namelist versions:** `NAMELIST_COMPAT` gives the UCLA ROMS namelist
+  each release reads (0.11.0 so far) and the later keys it does not.
 - **Output files** are named as UCLA ROMS names them,
   `<output_root_name>_<stream>.<YYYYMMDDHHMMSS>.nc` (streams `his`, `rst`,
   `avg`, `bgc_avg`, `cdr`, `cdrtrc`, `cdrgas`, `rnd`, `uscl`, and
