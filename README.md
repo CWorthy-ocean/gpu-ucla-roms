@@ -6,7 +6,8 @@ ocean biogeochemistry library and to the CDR tracers that UCLA ROMS uses to
 model marine carbon dioxide removal, such as ocean alkalinity enhancement. It
 is written in CUDA Fortran for NVIDIA GPUs. Each time step follows the CPU
 model routine for routine, and the GPU model reads the same namelists and
-input files as UCLA ROMS 0.11.0.
+input files as UCLA ROMS 0.11.0. It is suitable for any standard application
+of the ROMS modeling system, as well as for the CDR applications.
 
 > **Experimental.** This is a beta release (v0.1.1-beta, October 2026). It
 > has been checked carefully against the CPU model (see Validation below),
@@ -184,6 +185,7 @@ are only rounding, or whether the GPU model solves slightly different
 equations. All the tests below were run on the California Current System
 (CCS) at 4 km resolution, 672 x 1344 x 100 grid cells, with rivers, a closed
 boundary and coastal alkalinity releases, against UCLA ROMS 0.11.0.
+Detailed results of the comparisons are available on request.
 
 **After one time step the differences are rounding.** As a yardstick, we
 built the CPU model twice, once with its usual fast floating-point settings
@@ -250,9 +252,19 @@ Per time step the GPU model is 5.7 times faster with MARBL and 4.6 times
 faster without, on half as many nodes; per node, 11 and 9 times. The run
 uses each GPU's memory less than half, so it would also fit on fewer GPUs.
 
+## Acknowledgements
+
+roms_gpu is derived from the ROMS model developed by the CESR-lab group at
+UCLA ([CESR-lab/ucla-roms](https://github.com/CESR-lab/ucla-roms)). We thank
+them for their collaboration and their contributions to this work.
+
 ## License
 
 roms_gpu is derived from UCLA ROMS (https://github.com/CWorthy-ocean/ucla-roms)
 and is distributed under the GNU General Public License, version 3 (see
 `LICENSE`). MARBL is distributed under its own license
 (`MARBL/LICENSE.txt`).
+
+## Contact
+
+For questions or help, contact scott@cworthy.org.
