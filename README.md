@@ -1,12 +1,12 @@
-# roms_gpu: UCLA ROMS on NVIDIA GPUs
+# roms-marbl-gpu: UCLA ROMS with MARBL on NVIDIA GPUs
 
-roms_gpu is a GPU version of the [UCLA ROMS](https://github.com/CWorthy-ocean/ucla-roms)
+roms-marbl-gpu is a GPU version of the [C]Worthy fork of the [UCLA ROMS](https://github.com/CWorthy-ocean/ucla-roms)
 regional ocean model, coupled to the [MARBL](https://github.com/marbl-ecosys/MARBL)
-ocean biogeochemistry library and to the CDR tracers that UCLA ROMS uses to
+ocean biogeochemistry library and to the CDR tracers that [C]Worthy uses to
 model marine carbon dioxide removal, such as ocean alkalinity enhancement. It
 is written in CUDA Fortran for NVIDIA GPUs. Each time step follows the CPU
-model routine for routine, and the GPU model reads the same namelists and
-input files as UCLA ROMS 0.11.0. It is suitable for any standard application
+model routine by routine, and the GPU model reads the same namelists and
+input files as [C]Worthy UCLA ROMS fork (v0.11.0). It is suitable for any standard application
 of the ROMS modeling system, as well as for the CDR applications.
 
 > **Experimental.** This is a beta release (v0.1.1-beta, October 2026). It
@@ -57,8 +57,8 @@ start-up and lists the switches.
 MARBL is a git submodule:
 
 ```
-git clone --recurse-submodules https://github.com/CWorthy-ocean/gpu-ucla-roms.git roms_gpu
-cd roms_gpu
+git clone --recurse-submodules https://github.com/CWorthy-ocean/gpu-ucla-roms.git roms-marbl-gpu
+cd roms-marbl-gpu
 # or, in an existing clone:  git submodule update --init
 ```
 
@@ -254,13 +254,13 @@ uses each GPU's memory less than half, so it would also fit on fewer GPUs.
 
 ## Acknowledgements
 
-roms_gpu is derived from the ROMS model developed by the CESR-lab group at
+roms-marbl-gpu is derived from the ROMS model developed by the CESR-lab group at
 UCLA ([CESR-lab/ucla-roms](https://github.com/CESR-lab/ucla-roms)). We thank
 them for their collaboration and their contributions to this work.
 
 ## License
 
-roms_gpu is derived from UCLA ROMS (https://github.com/CWorthy-ocean/ucla-roms)
+roms-marbl-gpu is derived from UCLA ROMS (https://github.com/CWorthy-ocean/ucla-roms)
 and is distributed under the GNU General Public License, version 3 (see
 `LICENSE`). MARBL is distributed under its own license
 (`MARBL/LICENSE.txt`).
